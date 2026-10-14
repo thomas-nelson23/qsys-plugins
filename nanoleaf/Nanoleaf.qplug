@@ -9,28 +9,232 @@
 
 PluginInfo = {
   Name = "Lighting~Nanoleaf Open API",
-  Version = "1.0",
-  BuildVersion = "1.0.0.0",
+  Version = "1.1",
+  BuildVersion = "1.1.0.0",
   Id = "8ad083e0-b14d-4387-8671-9b4053ac46a4",
   Author = "AV Programming",
   Description = "Control Nanoleaf lights (power, brightness, color, color temperature, effects, rhythm, per-panel color) over the local Nanoleaf Open API.",
   ShowDebug = true,
 }
 
--- Palette ---------------------------------------------------------------
-local C = {
-  bg      = {22, 24, 29},
-  panel   = {34, 37, 44},
-  stroke  = {58, 63, 74},
-  accent  = {62, 181, 74},    -- Nanoleaf green
-  accentD = {30, 80, 38},
-  text    = {232, 234, 238},
-  sub     = {150, 157, 170},
-  btn     = {52, 56, 66},
-  red     = {214, 69, 65},
-  amber   = {240, 165, 40},
-  blue    = {64, 140, 230},
+-- Palette: Console style guide kit + Nanoleaf brand accent ----------------
+local ACCENT = { 62, 181, 74 }  -- Nanoleaf green
+
+--[[ Console theme for Q-SYS plugins, v1.1 (2026-10-14): copied unchanged from the project style guide (qsys-plugin-style-guide/theme.lua). ]]
+local Theme = {}
+
+Theme.W = 640   -- page width; every page is 640 wide
+Theme.GRID = 8  -- positions and sizes snap to 8 (4 for fine alignment inside a row)
+
+-- Neutrals: shared by every plugin. Never brand-tint these.
+-- Violet "dusk" greys, lifted off black; text colors come from home-dash.
+Theme.N = {
+  bg      = { 24, 22, 40 },    -- chassis: page background
+  panel   = { 36, 33, 58 },    -- rack panel: sections
+  strip   = { 30, 28, 50 },    -- channel strip / tile inside a section
+  rowAlt  = { 41, 38, 66 },    -- alternate list row
+  well    = { 15, 14, 28 },    -- recessed display: readouts, fields, meters, hint bar
+  stroke  = { 66, 60, 100 },   -- 1 px outlines
+  btn     = { 54, 50, 86 },    -- button off state
+  btnOn   = { 84, 78, 126 },   -- utility button on state
+  ledOff  = { 52, 48, 80 },
+  text    = { 217, 238, 242 }, -- home-dash --text
+  sub     = { 156, 199, 207 }, -- home-dash --text-soft: labels, section titles
+  dim     = { 122, 128, 162 }, -- units, captions
 }
+
+-- Semantic colors (home-dash): same meaning in every plugin, never used as a brand accent.
+Theme.S = {
+  ok    = { 0, 240, 255 },   -- cyan: online, connected, healthy
+  warn  = { 255, 176, 32 },  -- amber: attention, identify
+  fault = { 255, 42, 79 },   -- hot red: offline, error, destructive actions
+}
+
+function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
+  return { math.floor(a[1] + (b[1] - a[1]) * t + 0.5),
+           math.floor(a[2] + (b[2] - a[2]) * t + 0.5),
+           math.floor(a[3] + (b[3] - a[3]) * t + 0.5) }
+end
+
+-- Derives the brand set from one accent RGB.
+function Theme.brand(accent)
+  return {
+    accent = accent,                              -- active state, fader fill, header outline
+    dim    = Theme.mix(accent, Theme.N.bg, 0.55),  -- secondary action off state
+    pad    = Theme.mix(accent, Theme.N.panel, 0.78), -- pad off state (lit-but-idle step button)
+    ink    = Theme.mix(accent, { 255, 255, 255 }, 0.35), -- accent-colored text on dark (page tab)
+  }
+end
+
+local FONT, MONO, DISPLAY = "Roboto", "Roboto Mono", "Montserrat"
+
+local function merge(t, extra)
+  for k, v in pairs(extra or {}) do t[k] = v end
+  return t
+end
+
+function Theme.kit(layout, graphics, accent)
+  local N, S, B = Theme.N, Theme.S, Theme.brand(accent)
+  local ui = { N = N, S = S, B = B }
+
+  local function g(t) table.insert(graphics, t) end
+
+  -- Static text. size: 10 hint, 11 label, 12 body, 13 emphasis
+  function ui.label(text, x, y, w, h, align, size, color, style)
+    g({ Type = "Label", Text = text, Font = FONT, FontStyle = style or "Regular", FontSize = size or 11,
+        HTextAlign = align or "Right", Color = color or N.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+
+  -- Page background. Call first so it sits behind everything.
+  function ui.page(h)
+    g({ Type = "GroupBox", Fill = N.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { Theme.W, h } })
+  end
+
+  -- Transport-bar header: wordmark, page tab, device name readout, Status, Online LED.
+  -- Sliced sun (home-dash brand mark): cyan to red bands, slices in the lower half.
+  -- s should be a multiple of 4; the gaps show whatever is drawn underneath.
+  function ui.sun(x, y, s)
+    local r, rows = s / 2, s / 2
+    for i = 0, rows - 1 do
+      local yy = i * 2
+      local lower = yy >= r
+      if not lower or ((yy - r) / 2) % 2 == 0 then
+        local dy = yy + 1 - r
+        local hw = math.floor(math.sqrt(math.max(r * r - dy * dy, 0)) + 0.5)
+        g({ Type = "GroupBox", Fill = Theme.mix(S.ok, S.fault, yy / (s - 2)), StrokeWidth = 0, CornerRadius = 0,
+            Position = { x + r - hw, y + yy }, Size = { hw * 2, 2 } })
+      end
+    end
+  end
+
+  function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl)
+    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = B.accent, StrokeWidth = 1, CornerRadius = 6,
+        Position = { 8, 8 }, Size = { 624, 48 } })
+    ui.sun(20, 18, 28)
+    g({ Type = "Label", Text = wordmark, Font = DISPLAY, FontStyle = "Bold", FontSize = 20, HTextAlign = "Left",
+        Color = N.text, Position = { 56, 16 }, Size = { 96, 32 } })
+    g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Bold", FontSize = 10,
+        HTextAlign = "Center", Color = B.ink, Fill = B.pad, CornerRadius = 10, StrokeWidth = 0,
+        Position = { 156, 22 }, Size = { 84, 20 } })
+    if nameCtl then ui.readout(nameCtl, nil, 248, 20, 196, 24) end
+    if statusCtl then
+      layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 452, 20 }, Size = { 140, 24 },
+        Font = FONT, FontSize = 11, CornerRadius = 3 }
+    end
+    if ledCtl then ui.led(ledCtl, "Online", 602, 22, 20, "ok") end
+  end
+
+  -- Rack panel with a color-tab title (uppercase, like a console channel label).
+  -- The tab is the house cyan/red, not the brand accent.
+  -- Content starts 32 px below y.
+  function ui.section(title, x, y, w, h)
+    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 6,
+        Position = { x, y }, Size = { w, h } })
+    if title and title ~= "" then
+      -- two-tone tab, cyan over red: the house sunset mark on every section
+      g({ Type = "GroupBox", Fill = S.ok, StrokeWidth = 0, CornerRadius = 0, Position = { x + 12, y + 10 }, Size = { 4, 6 } })
+      g({ Type = "GroupBox", Fill = S.fault, StrokeWidth = 0, CornerRadius = 0, Position = { x + 12, y + 16 }, Size = { 4, 6 } })
+      ui.label(string.upper(title), x + 22, y + 6, w - 34, 20, "Left", 11, N.sub, "Medium")
+    end
+  end
+
+  -- Channel strip / tile inside a section.
+  function ui.strip(x, y, w, h)
+    g({ Type = "GroupBox", Fill = N.strip, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 4,
+        Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Alternating list row background (i = row number).
+  function ui.row(x, y, w, h, i)
+    g({ Type = "GroupBox", Fill = (i % 2 == 0) and N.rowAlt or N.strip, StrokeWidth = 0, CornerRadius = 2,
+        Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Hint bar: one recessed line of help per page, bottom of the page.
+  function ui.hint(text, y)
+    g({ Type = "Label", Text = text, Font = FONT, FontSize = 10, HTextAlign = "Left", Color = N.sub, Fill = N.well,
+        CornerRadius = 4, StrokeWidth = 0, Margin = 0, Padding = 8, Position = { 8, y }, Size = { 624, 24 } })
+  end
+
+  -- Buttons. kind:
+  --   "primary" accent when on       "utility" neutral, lighter when on
+  --   "secondary" accent, dim off     "pad"     step-pad: tinted off, full accent on
+  --   "power" big primary, 16 bold   "warn" / "danger" / "ok" semantic
+  -- Pass ButtonStyle ("Toggle", "Momentary", "Trigger"...) in extra to match the control's ButtonType.
+  local KINDS = {
+    primary   = function() return B.accent, N.btn, 12, "Medium" end,
+    secondary = function() return B.accent, B.dim, 12, "Regular" end,
+    utility   = function() return N.btnOn, N.btn, 12, "Regular" end,
+    pad       = function() return B.accent, B.pad, 12, "Medium" end,
+    power     = function() return B.accent, N.btn, 16, "Bold" end,
+    warn      = function() return S.warn, Theme.mix(S.warn, N.panel, 0.7), 12, "Medium" end,
+    danger    = function() return S.fault, Theme.mix(S.fault, N.panel, 0.7), 12, "Medium" end,
+    ok        = function() return S.ok, Theme.mix(S.ok, N.panel, 0.7), 12, "Medium" end,
+  }
+  function ui.button(name, legend, x, y, w, h, kind, extra)
+    local on, off, size, style = (KINDS[kind or "primary"] or KINDS.primary)()
+    layout[name] = merge({ PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
+      Color = on, OffColor = off, UnlinkOffColor = true, TextColor = N.text, Font = FONT, FontStyle = style,
+      FontSize = size, CornerRadius = 4, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0, WordWrap = true }, extra)
+  end
+
+  -- Read-only readout: recessed well, mono digits, no outline.
+  function ui.readout(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = MONO, FontStyle = "Medium", FontSize = 12, HTextAlign = "Left",
+      CornerRadius = 3, StrokeWidth = 0, Padding = 4 }, extra)
+  end
+
+  -- Editable field: same well, plus a 1 px outline so it reads as typeable.
+  function ui.field(name, pretty, x, y, w, h, extra)
+    ui.readout(name, pretty, x, y, w, h, merge({ StrokeColor = N.stroke, StrokeWidth = 1 }, extra))
+  end
+
+  -- Plain value text on the panel (names, secondary info). No well.
+  function ui.value(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 20 },
+      Color = N.panel, TextColor = N.text, Font = FONT, FontSize = 12, HTextAlign = "Left", StrokeWidth = 0,
+      TextBoxStyle = "NoBackground" }, extra)
+  end
+
+  function ui.combo(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 12, StrokeColor = N.stroke, StrokeWidth = 1 }, extra)
+  end
+
+  -- Fader: horizontal when w > h, vertical (channel strip) when h > w.
+  function ui.fader(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Fader", Position = { x, y }, Size = { w, h },
+      Color = color or B.accent }, extra)
+  end
+
+  -- Knob: secondary parameters only (trim, fade time, step). 36 or 48 square.
+  function ui.knob(name, pretty, x, y, s, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Knob", Position = { x, y }, Size = { s or 36, s or 36 },
+      Color = color or B.accent }, extra)
+  end
+
+  -- LED. kind: "ok" | "warn" | "fault" | "accent" | an RGB table (e.g. a color swatch)
+  function ui.led(name, pretty, x, y, s, kind, extra)
+    local c = type(kind) == "table" and kind or (kind == "accent" and B.accent) or S[kind or "ok"] or S.ok
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Led", Position = { x, y }, Size = { s or 16, s or 16 },
+      Color = c, OffColor = N.ledOff, UnlinkOffColor = true, StrokeColor = N.stroke, StrokeWidth = 1, Margin = 2 }, extra)
+  end
+
+  -- Meter: bar on a recessed well, no built-in text box (put a readout next to it).
+  function ui.meter(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Meter", MeterStyle = "Standard", Position = { x, y },
+      Size = { w, h }, Color = color or B.accent, BackgroundColor = N.well, CornerRadius = 2, ShowTextbox = false,
+      StrokeWidth = 0 }, extra)
+  end
+
+  -- Hide a control but keep its pins.
+  function ui.hide(name, pretty)
+    layout[name] = { PrettyName = pretty or name, Style = "None", Position = { 0, 0 }, Size = { 0, 0 } }
+  end
+
+  return ui
+end
 
 local QuickColors = {
   {"Red",    {255, 0, 0}},     {"Orange", {255, 110, 0}},
@@ -42,7 +246,7 @@ local WhitePresets = { {"Candle", 1900}, {"Warm", 2700}, {"Neutral", 4000}, {"Da
 local EFFECT_BUTTONS = 12
 
 function GetColor(props)
-  return C.accent
+  return ACCENT
 end
 
 function GetPrettyName(props)
@@ -144,185 +348,152 @@ end
 function GetControlLayout(props)
   local layout, graphics = {}, {}
   local page = PageNames[props["page_index"].Value]
-  local W = 640
+  local ui = Theme.kit(layout, graphics, ACCENT)
+  local N, S = ui.N, ui.S
 
-  local function box(text, x, y, w, h)
-    table.insert(graphics, { Type = "GroupBox", Text = text, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold",
-      Color = C.accent, Fill = C.panel, StrokeColor = C.stroke, StrokeWidth = 1, CornerRadius = 8,
-      Position = { x, y }, Size = { w, h } })
+  local function lbl(text, x, y, w, align) ui.label(text, x, y, w, 20, align or "Right", 11) end
+  local function note(text, x, y, w) ui.label(text, x, y, w, 16, "Left", 10, N.dim) end
+  local function hdr()
+    ui.header("nanoleaf", page, "DeviceName", "Status", "Online")
+    layout["DeviceName"].PrettyName = "Device Name"
   end
-  local function label(text, x, y, w, h, align, size, color)
-    table.insert(graphics, { Type = "Label", Text = text, HTextAlign = align or "Right", FontSize = size or 12,
-      Color = color or C.sub, Position = { x, y }, Size = { w, h or 20 } })
-  end
-  local function button(name, legend, x, y, w, h, color, extra)
-    local b = { PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
-      Color = color or C.accent, OffColor = C.btn, UnlinkOffColor = true, FontSize = 12, FontColor = C.text,
-      CornerRadius = 6, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0 }
-    for k, v in pairs(extra or {}) do b[k] = v end
-    layout[name] = b
-  end
-  local function textbox(name, pretty, x, y, w, h, extra)
-    local t = { PrettyName = pretty, Style = "Text", Position = { x, y }, Size = { w, h or 22 }, FontSize = 12,
-      Color = { 20, 22, 26 }, TextColor = C.text, HTextAlign = "Center", CornerRadius = 4, StrokeColor = C.stroke, StrokeWidth = 1 }
-    for k, v in pairs(extra or {}) do t[k] = v end
-    layout[name] = t
-  end
-  local function combo(name, pretty, x, y, w, h)
-    layout[name] = { PrettyName = pretty, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 }, FontSize = 12,
-      Color = { 20, 22, 26 }, TextColor = C.text }
-  end
-  local function led(name, pretty, x, y, s, color)
-    layout[name] = { PrettyName = pretty, Style = "Led", Position = { x, y }, Size = { s, s }, Color = color or C.accent,
-      OffColor = { 60, 60, 60 }, UnlinkOffColor = true, StrokeWidth = 1, StrokeColor = C.stroke, Margin = 2 }
-  end
-
-  -- page background + header (all pages)
-  local H = ({ Control = 640, Effects = 520, Panels = 470, Setup = 440 })[page] or 600
-  table.insert(graphics, { Type = "GroupBox", Fill = C.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { W, H } })
-  table.insert(graphics, { Type = "GroupBox", Fill = C.panel, StrokeColor = C.accent, StrokeWidth = 1, CornerRadius = 8,
-    Position = { 8, 8 }, Size = { W - 16, 48 } })
-  label("nanoleaf", 20, 14, 140, 36, "Left", 24, C.accent)
-  label(page:upper(), 150, 22, 110, 20, "Left", 12, C.sub)
-  textbox("DeviceName", "Device Name", 262, 20, 170, 24, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", FontSize = 13 })
-  layout["Status"] = { PrettyName = "Status", Style = "Text", Position = { 438, 20 }, Size = { 150, 24 }, FontSize = 11, CornerRadius = 4 }
-  led("Online", "Online", 598, 20, 24)
 
   if page == "Control" then
+    ui.page(664)
+    hdr()
     -- Power
-    box("Power", 8, 64, 200, 160)
-    button("Power", "POWER", 24, 92, 168, 64, C.accent, { FontSize = 18, FontStyle = "Bold" })
-    button("PowerOn", "On", 24, 168, 80, 36, C.accentD)
-    button("PowerOff", "Off", 112, 168, 80, 36, C.accentD)
+    ui.section("Power", 8, 64, 200, 160)
+    ui.button("Power", "POWER", 24, 96, 168, 64, "power", { ButtonStyle = "Toggle" })
+    ui.button("PowerOn", "On", 24, 172, 80, 36, "secondary")
+    ui.button("PowerOff", "Off", 112, 172, 80, 36, "secondary")
 
     -- Brightness
-    box("Brightness", 216, 64, 416, 160)
-    layout["Brightness"] = { PrettyName = "Brightness~Level", Style = "Fader", Position = { 232, 96 }, Size = { 300, 28 }, Color = C.accent }
-    button("BrightnessDown", "-", 540, 96, 36, 28, C.accentD, { FontSize = 18 })
-    button("BrightnessUp", "+", 582, 96, 36, 28, C.accentD, { FontSize = 18 })
-    label("Step", 232, 140, 50, 20)
-    layout["BrightnessStep"] = { PrettyName = "Brightness~Step", Style = "Text", Position = { 288, 140 }, Size = { 56, 22 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
-    label("Fade Time (s)", 352, 140, 110, 20)
-    layout["FadeTime"] = { PrettyName = "Brightness~Fade Time", Style = "Text", Position = { 468, 140 }, Size = { 56, 22 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
-    label("Fade time applies to brightness changes (Nanoleaf 'duration').", 232, 184, 390, 20, "Left", 11)
+    ui.section("Brightness", 216, 64, 416, 160)
+    ui.fader("Brightness", "Brightness~Level", 232, 104, 296, 24)
+    ui.button("BrightnessDown", "-", 536, 100, 36, 32, "utility", { FontSize = 18 })
+    ui.button("BrightnessUp", "+", 580, 100, 36, 32, "utility", { FontSize = 18 })
+    lbl("Step", 232, 170, 40)
+    ui.field("BrightnessStep", "Brightness~Step", 280, 168, 64, 24, { HTextAlign = "Center" })
+    lbl("Fade Time (s)", 360, 170, 88)
+    ui.field("FadeTime", "Brightness~Fade Time", 456, 168, 64, 24, { HTextAlign = "Center" })
 
-    -- Color
-    box("Color", 8, 232, 624, 220)
-    local rows = { { "Hue", "Hue", { 230, 80, 200 } }, { "Saturation", "Saturation", C.blue },
-                   { "Red", "Red", C.red }, { "Green", "Green", { 60, 200, 80 } }, { "Blue", "Blue", { 60, 110, 240 } } }
+    -- Color (fader colors are content colors)
+    ui.section("Color", 8, 232, 624, 200)
+    local rows = { { "Hue", "Hue", { 230, 80, 200 } }, { "Saturation", "Saturation", { 64, 140, 230 } },
+                   { "Red", "Red", { 214, 69, 65 } }, { "Green", "Green", { 60, 200, 80 } }, { "Blue", "Blue", { 60, 110, 240 } } }
     for i, r in ipairs(rows) do
-      local y = 260 + (i - 1) * 34
-      label(r[2], 16, y + 2, 76, 20)
-      layout[r[1]] = { PrettyName = "Color~" .. r[2], Style = "Fader", Position = { 100, y }, Size = { 300, 24 }, Color = r[3] }
+      local y = 264 + (i - 1) * 32
+      lbl(r[2], 16, y + 2, 76)
+      ui.fader(r[1], "Color~" .. r[2], 100, y, 300, 24, r[3])
     end
-    led("ColorSwatch", "Color~Swatch", 432, 260, 112, { 255, 255, 255 })
-    layout["ColorSwatch"].Margin = 0
-    label("Hex", 552, 262, 70, 20, "Left")
-    textbox("HexColor", "Color~Hex", 552, 284, 72, 24)
-    label("Mode", 552, 320, 70, 20, "Left")
-    textbox("ColorMode", "Color~Mode", 552, 342, 72, 24, { Color = C.panel })
-    label("Hue / Sat change color only.", 432, 392, 194, 16, "Left", 10)
-    label("RGB and Hex also set brightness.", 432, 408, 194, 16, "Left", 10)
+    ui.led("ColorSwatch", "Color~Swatch", 424, 272, 112, { 255, 255, 255 }, { Margin = 0 })
+    lbl("HEX", 552, 264, 64, "Left")
+    ui.field("HexColor", "Color~Hex", 552, 284, 72, 24, { HTextAlign = "Center" })
+    lbl("MODE", 552, 320, 64, "Left")
+    ui.readout("ColorMode", "Color~Mode", 552, 340, 72, 24, { HTextAlign = "Center" })
 
-    -- White
-    box("White (Color Temperature)", 8, 460, 624, 92)
-    label("Kelvin", 16, 490, 76, 20)
-    layout["ColorTemp"] = { PrettyName = "White~Color Temp", Style = "Fader", Position = { 100, 488 }, Size = { 300, 24 }, Color = C.amber }
+    -- White (kelvin fader keeps its warm content color)
+    ui.section("White (Color Temperature)", 8, 440, 624, 104)
+    lbl("Kelvin", 16, 474, 76)
+    ui.fader("ColorTemp", "White~Color Temp", 100, 472, 300, 24, { 240, 165, 40 })
+    note("1200 K - 6500 K (device limits apply)", 412, 476, 208)
     for i, wp in ipairs(WhitePresets) do
-      local x = 100 + (i - 1) * 62
-      button("WhitePreset " .. i, wp[1], x, 518, 58, 24, C.amber, { Color = C.amber, OffColor = { 70, 60, 44 } })
+      ui.button("WhitePreset " .. i, wp[1], 100 + (i - 1) * 64, 504, 56, 28, "pad")
     end
-    label("1200 K - 6500 K (device limits apply)", 412, 490, 210, 20, "Left", 11)
 
-    -- Quick colors
-    box("Quick Colors", 8, 560, 624, 72)
+    -- Quick colors (content colors)
+    ui.section("Quick Colors", 8, 552, 624, 72)
     for i, qc in ipairs(QuickColors) do
-      local x = 20 + (i - 1) * 76
-      button("QuickColor " .. i, qc[1], x, 590, 70, 32, qc[2],
-        { OffColor = { math.floor(qc[2][1] * 0.75), math.floor(qc[2][2] * 0.75), math.floor(qc[2][3] * 0.75) },
-          FontColor = { 20, 20, 20 }, FontStyle = "Bold" })
+      local c = qc[2]
+      ui.button("QuickColor " .. i, qc[1], 20 + (i - 1) * 76, 584, 68, 28, "pad",
+        { Color = c, OffColor = { math.floor(c[1] * 0.75), math.floor(c[2] * 0.75), math.floor(c[3] * 0.75) },
+          TextColor = { 20, 20, 20 }, FontStyle = "Bold" })
     end
+    ui.hint("Fade applies to brightness. Hue/Sat change color only; RGB and Hex also set brightness.", 632)
 
   elseif page == "Effects" then
-    box("Scenes & Effects", 8, 64, 624, 104)
-    label("Select", 16, 92, 70, 20)
-    combo("EffectSelect", "Effects~Select", 92, 90, 330, 26)
-    button("EffectPrev", "< Prev", 430, 90, 64, 26, C.accentD)
-    button("EffectNext", "Next >", 500, 90, 64, 26, C.accentD)
-    button("EffectRefresh", "Refresh", 570, 90, 54, 26, C.btn)
-    label("Now Playing", 16, 128, 70, 20)
-    textbox("EffectCurrent", "Effects~Current", 92, 126, 330, 26, { Color = C.panel, TextColor = C.accent, FontSize = 14, FontStyle = "Bold" })
-    textbox("EffectCount", "Effects~Count", 430, 126, 194, 26, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
+    ui.page(544)
+    hdr()
+    ui.section("Scenes & Effects", 8, 64, 624, 104)
+    lbl("Select", 16, 98, 76)
+    ui.combo("EffectSelect", "Effects~Select", 100, 96, 324, 24)
+    ui.button("EffectPrev", "< Prev", 432, 94, 60, 28, "secondary")
+    ui.button("EffectNext", "Next >", 496, 94, 60, 28, "secondary")
+    ui.button("EffectRefresh", "Refresh", 560, 94, 60, 28, "utility")
+    lbl("Now Playing", 16, 130, 76)
+    ui.readout("EffectCurrent", "Effects~Current", 100, 128, 324, 24, { FontStyle = "Bold" })
+    ui.value("EffectCount", "Effects~Count", 432, 130, 188, 20, { TextColor = N.sub, FontSize = 11, HTextAlign = "Center" })
 
-    box("Effect Presets", 8, 176, 624, 236)
+    ui.section("Effect Presets", 8, 176, 624, 232)
     for i = 1, EFFECT_BUTTONS do
-      local col, row = (i - 1) % 4, math.floor((i - 1) / 4)
-      button("EffectButton " .. i, "", 20 + col * 152, 206 + row * 54, 144, 46, C.accent,
-        { FontSize = 12, WordWrap = true })
+      local c, r = (i - 1) % 4, math.floor((i - 1) / 4)
+      ui.button("EffectButton " .. i, "", 20 + c * 152, 208 + r * 52, 144, 44, "pad", { ButtonStyle = "Toggle" })
     end
-    button("EffectPageDown", "< Page", 20, 372, 80, 28, C.btn)
-    textbox("EffectPageLabel", "Effects~Page", 108, 374, 424, 24, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
-    button("EffectPageUp", "Page >", 540, 372, 80, 28, C.btn)
+    ui.button("EffectPageDown", "< Page", 20, 368, 80, 28, "utility")
+    ui.value("EffectPageLabel", "Effects~Page", 108, 372, 424, 20, { TextColor = N.sub, FontSize = 11, HTextAlign = "Center" })
+    ui.button("EffectPageUp", "Page >", 540, 368, 80, 28, "utility")
 
-    box("Rhythm (sound reactive)", 8, 420, 624, 92)
-    led("RhythmConnected", "Rhythm~Connected", 24, 452, 20)
-    label("Module / Mic Connected", 50, 452, 160, 20, "Left")
-    led("RhythmActive", "Rhythm~Active", 24, 480, 20, C.blue)
-    label("Rhythm Effect Active", 50, 480, 160, 20, "Left")
-    label("Input", 300, 466, 60, 20)
-    combo("RhythmMode", "Rhythm~Input", 366, 464, 160, 26)
-    label("Aurora Rhythm module only", 366, 492, 220, 16, "Left", 10)
+    ui.section("Rhythm (sound reactive)", 8, 416, 624, 88)
+    ui.led("RhythmConnected", "Rhythm~Connected", 24, 450, 16, "ok")
+    lbl("Module / Mic Connected", 48, 448, 180, "Left")
+    ui.led("RhythmActive", "Rhythm~Active", 24, 474, 16, "warn")
+    lbl("Rhythm Effect Active", 48, 472, 180, "Left")
+    lbl("Input", 296, 460, 64)
+    ui.combo("RhythmMode", "Rhythm~Input", 368, 458, 168, 24)
+    ui.hint("Pads play effects saved on the device. Rhythm input: Aurora Rhythm module only.", 512)
 
   elseif page == "Panels" then
-    box("Layout", 8, 64, 624, 100)
-    label("Panels", 16, 92, 70, 20)
-    textbox("PanelCount", "Panels~Count", 92, 90, 70, 24, { Color = C.panel })
-    label("Orientation", 170, 92, 90, 20)
-    layout["Orientation"] = { PrettyName = "Panels~Orientation", Style = "Text", Position = { 266, 90 }, Size = { 70, 24 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
-    label("deg", 340, 92, 30, 20, "Left")
-    button("Identify", "Identify (Flash)", 470, 88, 150, 30, C.amber, { Color = C.amber, OffColor = { 200, 135, 30 }, FontColor = { 20, 20, 20 }, FontStyle = "Bold" })
-    label("Orientation rotates how effects map onto the layout (0-360 degrees).", 16, 130, 600, 20, "Left", 11)
+    ui.page(440)
+    hdr()
+    ui.section("Layout", 8, 64, 624, 72)
+    lbl("Panels", 16, 98, 64)
+    ui.readout("PanelCount", "Panels~Count", 88, 96, 64, 24, { HTextAlign = "Center" })
+    lbl("Orientation", 168, 98, 88)
+    ui.field("Orientation", "Panels~Orientation", 264, 96, 64, 24, { HTextAlign = "Center" })
+    note("deg", 334, 100, 32)
+    ui.button("Identify", "Identify (Flash)", 480, 92, 140, 32, "warn")
 
-    box("Individual Panel Color", 8, 172, 624, 290)
-    label("Panel", 16, 202, 70, 20)
-    combo("PanelSelect", "Panels~Select", 92, 200, 220, 26)
-    textbox("PanelInfo", "Panels~Info", 320, 200, 300, 26, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", TextColor = C.sub })
-    local prow = { { "PanelRed", "Red", C.red }, { "PanelGreen", "Green", { 60, 200, 80 } }, { "PanelBlue", "Blue", { 60, 110, 240 } } }
+    ui.section("Individual Panel Color", 8, 144, 624, 256)
+    lbl("Panel", 16, 178, 64)
+    ui.combo("PanelSelect", "Panels~Select", 88, 176, 224, 24)
+    ui.value("PanelInfo", "Panels~Info", 320, 178, 300, 20, { TextColor = N.sub, FontSize = 11 })
+    local prow = { { "PanelRed", "Red", { 214, 69, 65 } }, { "PanelGreen", "Green", { 60, 200, 80 } }, { "PanelBlue", "Blue", { 60, 110, 240 } } }
     for i, r in ipairs(prow) do
-      local y = 244 + (i - 1) * 36
-      label(r[2], 16, y + 2, 70, 20)
-      layout[r[1]] = { PrettyName = "Panels~" .. r[2], Style = "Fader", Position = { 92, y }, Size = { 300, 24 }, Color = r[3] }
+      local y = 216 + (i - 1) * 32
+      lbl(r[2], 16, y + 2, 64)
+      ui.fader(r[1], "Panels~" .. r[2], 88, y, 304, 24, r[3])
     end
-    led("PanelSwatch", "Panels~Swatch", 420, 240, 96, { 255, 255, 255 })
-    layout["PanelSwatch"].Margin = 0
-    label("Transition (s)", 16, 356, 100, 20)
-    layout["PanelTransition"] = { PrettyName = "Panels~Transition", Style = "Text", Position = { 122, 354 }, Size = { 56, 24 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
-    button("PanelApply", "Apply to Panel", 92, 394, 180, 36, C.accent, { OffColor = { 46, 140, 56 }, FontStyle = "Bold" })
-    button("PanelApplyAll", "Apply to All Panels", 284, 394, 180, 36, C.accentD)
-    label("Per-panel colors are sent as a static custom effect; selecting any scene clears them.", 16, 436, 600, 20, "Left", 10)
+    ui.led("PanelSwatch", "Panels~Swatch", 424, 208, 96, { 255, 255, 255 }, { Margin = 0 })
+    lbl("Transition (s)", 16, 314, 96)
+    ui.field("PanelTransition", "Panels~Transition", 120, 312, 64, 24, { HTextAlign = "Center" })
+    ui.button("PanelApply", "Apply to Panel", 88, 352, 180, 32, "secondary", { FontStyle = "Bold" })
+    ui.button("PanelApplyAll", "Apply to All Panels", 280, 352, 180, 32, "secondary")
+    ui.hint("Orientation rotates effect mapping. Panel colors are a static effect; any scene clears them.", 408)
 
   elseif page == "Setup" then
-    box("Connection", 8, 64, 624, 176)
-    label("IP Address", 16, 94, 100, 20)
-    textbox("IPAddress", "Setup~IP Address", 122, 92, 200, 26, { HTextAlign = "Left" })
-    button("Connect", "Connect / Refresh", 340, 92, 150, 26, C.accentD)
-    label("Auth Token", 16, 130, 100, 20)
-    textbox("AuthToken", "Setup~Auth Token", 122, 128, 368, 26, { HTextAlign = "Left", FontSize = 11 })
-    button("Pair", "Pair", 500, 92, 120, 26, C.accent, { OffColor = { 46, 140, 56 }, FontStyle = "Bold" })
-    button("Unpair", "Unpair", 500, 128, 120, 26, C.red, { OffColor = { 120, 44, 42 } })
-    label("To pair: hold the controller power button 5-7 s until the LEDs flash, then press Pair within 30 s.", 16, 170, 600, 20, "Left", 11, C.text)
-    label("Last Error", 16, 202, 100, 20)
-    textbox("LastError", "Setup~Last Error", 122, 200, 498, 26, { Color = C.panel, HTextAlign = "Left", TextColor = C.amber })
+    ui.page(392)
+    hdr()
+    ui.section("Connection", 8, 64, 624, 128)
+    lbl("IP Address", 16, 98, 96)
+    ui.field("IPAddress", "Setup~IP Address", 120, 96, 208, 24)
+    ui.button("Connect", "Connect / Refresh", 336, 94, 152, 28, "secondary")
+    ui.button("Pair", "Pair", 496, 94, 124, 28, "ok")
+    lbl("Auth Token", 16, 130, 96)
+    ui.field("AuthToken", "Setup~Auth Token", 120, 128, 368, 24, { FontSize = 11 })
+    ui.button("Unpair", "Unpair", 496, 126, 124, 28, "danger")
+    lbl("Last Error", 16, 162, 96)
+    ui.readout("LastError", "Setup~Last Error", 120, 160, 500, 24, { TextColor = S.warn })
 
-    box("Device Information", 8, 248, 624, 182)
+    ui.section("Device Information", 8, 200, 624, 152)
     local info = { { "Model", "Model" }, { "SerialNumber", "Serial Number" }, { "Firmware", "Firmware" }, { "Manufacturer", "Manufacturer" } }
     for i, f in ipairs(info) do
-      local y = 278 + (i - 1) * 36
-      label(f[2], 16, y + 2, 100, 20)
-      textbox(f[1], "Setup~" .. f[2], 122, y, 300, 26, { Color = C.panel, HTextAlign = "Left" })
+      local y = 232 + (i - 1) * 28
+      lbl(f[2], 16, y + 2, 96)
+      ui.readout(f[1], "Setup~" .. f[2], 120, y, 300, 24)
     end
-    label("Port and poll interval are", 436, 282, 190, 16, "Left", 10)
-    label("set in the plugin Properties.", 436, 298, 190, 16, "Left", 10)
+    note("Port and poll interval are", 436, 236, 184)
+    note("set in the plugin Properties.", 436, 252, 184)
+    ui.hint("To pair, hold the power button 5-7 s until the LEDs flash, then press Pair within 30 s.", 360)
   end
 
   return layout, graphics

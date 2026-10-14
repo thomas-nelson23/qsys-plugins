@@ -11,29 +11,231 @@
 
 PluginInfo = {
   Name = "Lighting~Philips Hue Bridge",
-  Version = "1.0",
-  BuildVersion = "1.0.0.0",
+  Version = "1.1",
+  BuildVersion = "1.1.0.0",
   Id = "f2c92329-cf36-419e-86f0-ca471e887fdb",
   Author = "AV Programming",
   Description = "Control Philips Hue lights, rooms, zones and scenes (power, brightness, color, color temperature, scenes, effects) through a Hue Bridge over the local CLIP API v2.",
   ShowDebug = true,
 }
 
--- Palette ---------------------------------------------------------------
-local C = {
-  bg      = {22, 24, 29},
-  panel   = {34, 37, 44},
-  tile    = {27, 30, 36},
-  stroke  = {58, 63, 74},
-  accent  = {84, 132, 240},   -- Hue blue
-  accentD = {38, 58, 108},
-  text    = {232, 234, 238},
-  sub     = {150, 157, 170},
-  btn     = {52, 56, 66},
-  red     = {214, 69, 65},
-  amber   = {240, 165, 40},
-  green   = {62, 181, 74},
+local ACCENT = { 84, 132, 240 }  -- Hue blue
+
+--[[ Console theme for Q-SYS plugins, v1.1 (2026-10-14): copied unchanged from the project style guide (qsys-plugin-style-guide/theme.lua). ]]
+local Theme = {}
+
+Theme.W = 640   -- page width; every page is 640 wide
+Theme.GRID = 8  -- positions and sizes snap to 8 (4 for fine alignment inside a row)
+
+-- Neutrals: shared by every plugin. Never brand-tint these.
+-- Violet "dusk" greys, lifted off black; text colors come from home-dash.
+Theme.N = {
+  bg      = { 24, 22, 40 },    -- chassis: page background
+  panel   = { 36, 33, 58 },    -- rack panel: sections
+  strip   = { 30, 28, 50 },    -- channel strip / tile inside a section
+  rowAlt  = { 41, 38, 66 },    -- alternate list row
+  well    = { 15, 14, 28 },    -- recessed display: readouts, fields, meters, hint bar
+  stroke  = { 66, 60, 100 },   -- 1 px outlines
+  btn     = { 54, 50, 86 },    -- button off state
+  btnOn   = { 84, 78, 126 },   -- utility button on state
+  ledOff  = { 52, 48, 80 },
+  text    = { 217, 238, 242 }, -- home-dash --text
+  sub     = { 156, 199, 207 }, -- home-dash --text-soft: labels, section titles
+  dim     = { 122, 128, 162 }, -- units, captions
 }
+
+-- Semantic colors (home-dash): same meaning in every plugin, never used as a brand accent.
+Theme.S = {
+  ok    = { 0, 240, 255 },   -- cyan: online, connected, healthy
+  warn  = { 255, 176, 32 },  -- amber: attention, identify
+  fault = { 255, 42, 79 },   -- hot red: offline, error, destructive actions
+}
+
+function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
+  return { math.floor(a[1] + (b[1] - a[1]) * t + 0.5),
+           math.floor(a[2] + (b[2] - a[2]) * t + 0.5),
+           math.floor(a[3] + (b[3] - a[3]) * t + 0.5) }
+end
+
+-- Derives the brand set from one accent RGB.
+function Theme.brand(accent)
+  return {
+    accent = accent,                              -- active state, fader fill, header outline
+    dim    = Theme.mix(accent, Theme.N.bg, 0.55),  -- secondary action off state
+    pad    = Theme.mix(accent, Theme.N.panel, 0.78), -- pad off state (lit-but-idle step button)
+    ink    = Theme.mix(accent, { 255, 255, 255 }, 0.35), -- accent-colored text on dark (page tab)
+  }
+end
+
+local FONT, MONO, DISPLAY = "Roboto", "Roboto Mono", "Montserrat"
+
+local function merge(t, extra)
+  for k, v in pairs(extra or {}) do t[k] = v end
+  return t
+end
+
+function Theme.kit(layout, graphics, accent)
+  local N, S, B = Theme.N, Theme.S, Theme.brand(accent)
+  local ui = { N = N, S = S, B = B }
+
+  local function g(t) table.insert(graphics, t) end
+
+  -- Static text. size: 10 hint, 11 label, 12 body, 13 emphasis
+  function ui.label(text, x, y, w, h, align, size, color, style)
+    g({ Type = "Label", Text = text, Font = FONT, FontStyle = style or "Regular", FontSize = size or 11,
+        HTextAlign = align or "Right", Color = color or N.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+
+  -- Page background. Call first so it sits behind everything.
+  function ui.page(h)
+    g({ Type = "GroupBox", Fill = N.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { Theme.W, h } })
+  end
+
+  -- Transport-bar header: wordmark, page tab, device name readout, Status, Online LED.
+  -- Sliced sun (home-dash brand mark): cyan to red bands, slices in the lower half.
+  -- s should be a multiple of 4; the gaps show whatever is drawn underneath.
+  function ui.sun(x, y, s)
+    local r, rows = s / 2, s / 2
+    for i = 0, rows - 1 do
+      local yy = i * 2
+      local lower = yy >= r
+      if not lower or ((yy - r) / 2) % 2 == 0 then
+        local dy = yy + 1 - r
+        local hw = math.floor(math.sqrt(math.max(r * r - dy * dy, 0)) + 0.5)
+        g({ Type = "GroupBox", Fill = Theme.mix(S.ok, S.fault, yy / (s - 2)), StrokeWidth = 0, CornerRadius = 0,
+            Position = { x + r - hw, y + yy }, Size = { hw * 2, 2 } })
+      end
+    end
+  end
+
+  function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl)
+    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = B.accent, StrokeWidth = 1, CornerRadius = 6,
+        Position = { 8, 8 }, Size = { 624, 48 } })
+    ui.sun(20, 18, 28)
+    g({ Type = "Label", Text = wordmark, Font = DISPLAY, FontStyle = "Bold", FontSize = 20, HTextAlign = "Left",
+        Color = N.text, Position = { 56, 16 }, Size = { 96, 32 } })
+    g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Bold", FontSize = 10,
+        HTextAlign = "Center", Color = B.ink, Fill = B.pad, CornerRadius = 10, StrokeWidth = 0,
+        Position = { 156, 22 }, Size = { 84, 20 } })
+    if nameCtl then ui.readout(nameCtl, nil, 248, 20, 196, 24) end
+    if statusCtl then
+      layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 452, 20 }, Size = { 140, 24 },
+        Font = FONT, FontSize = 11, CornerRadius = 3 }
+    end
+    if ledCtl then ui.led(ledCtl, "Online", 602, 22, 20, "ok") end
+  end
+
+  -- Rack panel with a color-tab title (uppercase, like a console channel label).
+  -- The tab is the house cyan/red, not the brand accent.
+  -- Content starts 32 px below y.
+  function ui.section(title, x, y, w, h)
+    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 6,
+        Position = { x, y }, Size = { w, h } })
+    if title and title ~= "" then
+      -- two-tone tab, cyan over red: the house sunset mark on every section
+      g({ Type = "GroupBox", Fill = S.ok, StrokeWidth = 0, CornerRadius = 0, Position = { x + 12, y + 10 }, Size = { 4, 6 } })
+      g({ Type = "GroupBox", Fill = S.fault, StrokeWidth = 0, CornerRadius = 0, Position = { x + 12, y + 16 }, Size = { 4, 6 } })
+      ui.label(string.upper(title), x + 22, y + 6, w - 34, 20, "Left", 11, N.sub, "Medium")
+    end
+  end
+
+  -- Channel strip / tile inside a section.
+  function ui.strip(x, y, w, h)
+    g({ Type = "GroupBox", Fill = N.strip, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 4,
+        Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Alternating list row background (i = row number).
+  function ui.row(x, y, w, h, i)
+    g({ Type = "GroupBox", Fill = (i % 2 == 0) and N.rowAlt or N.strip, StrokeWidth = 0, CornerRadius = 2,
+        Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Hint bar: one recessed line of help per page, bottom of the page.
+  function ui.hint(text, y)
+    g({ Type = "Label", Text = text, Font = FONT, FontSize = 10, HTextAlign = "Left", Color = N.sub, Fill = N.well,
+        CornerRadius = 4, StrokeWidth = 0, Margin = 0, Padding = 8, Position = { 8, y }, Size = { 624, 24 } })
+  end
+
+  -- Buttons. kind:
+  --   "primary" accent when on       "utility" neutral, lighter when on
+  --   "secondary" accent, dim off     "pad"     step-pad: tinted off, full accent on
+  --   "power" big primary, 16 bold   "warn" / "danger" / "ok" semantic
+  -- Pass ButtonStyle ("Toggle", "Momentary", "Trigger"...) in extra to match the control's ButtonType.
+  local KINDS = {
+    primary   = function() return B.accent, N.btn, 12, "Medium" end,
+    secondary = function() return B.accent, B.dim, 12, "Regular" end,
+    utility   = function() return N.btnOn, N.btn, 12, "Regular" end,
+    pad       = function() return B.accent, B.pad, 12, "Medium" end,
+    power     = function() return B.accent, N.btn, 16, "Bold" end,
+    warn      = function() return S.warn, Theme.mix(S.warn, N.panel, 0.7), 12, "Medium" end,
+    danger    = function() return S.fault, Theme.mix(S.fault, N.panel, 0.7), 12, "Medium" end,
+    ok        = function() return S.ok, Theme.mix(S.ok, N.panel, 0.7), 12, "Medium" end,
+  }
+  function ui.button(name, legend, x, y, w, h, kind, extra)
+    local on, off, size, style = (KINDS[kind or "primary"] or KINDS.primary)()
+    layout[name] = merge({ PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
+      Color = on, OffColor = off, UnlinkOffColor = true, TextColor = N.text, Font = FONT, FontStyle = style,
+      FontSize = size, CornerRadius = 4, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0, WordWrap = true }, extra)
+  end
+
+  -- Read-only readout: recessed well, mono digits, no outline.
+  function ui.readout(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = MONO, FontStyle = "Medium", FontSize = 12, HTextAlign = "Left",
+      CornerRadius = 3, StrokeWidth = 0, Padding = 4 }, extra)
+  end
+
+  -- Editable field: same well, plus a 1 px outline so it reads as typeable.
+  function ui.field(name, pretty, x, y, w, h, extra)
+    ui.readout(name, pretty, x, y, w, h, merge({ StrokeColor = N.stroke, StrokeWidth = 1 }, extra))
+  end
+
+  -- Plain value text on the panel (names, secondary info). No well.
+  function ui.value(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 20 },
+      Color = N.panel, TextColor = N.text, Font = FONT, FontSize = 12, HTextAlign = "Left", StrokeWidth = 0,
+      TextBoxStyle = "NoBackground" }, extra)
+  end
+
+  function ui.combo(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 12, StrokeColor = N.stroke, StrokeWidth = 1 }, extra)
+  end
+
+  -- Fader: horizontal when w > h, vertical (channel strip) when h > w.
+  function ui.fader(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Fader", Position = { x, y }, Size = { w, h },
+      Color = color or B.accent }, extra)
+  end
+
+  -- Knob: secondary parameters only (trim, fade time, step). 36 or 48 square.
+  function ui.knob(name, pretty, x, y, s, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Knob", Position = { x, y }, Size = { s or 36, s or 36 },
+      Color = color or B.accent }, extra)
+  end
+
+  -- LED. kind: "ok" | "warn" | "fault" | "accent" | an RGB table (e.g. a color swatch)
+  function ui.led(name, pretty, x, y, s, kind, extra)
+    local c = type(kind) == "table" and kind or (kind == "accent" and B.accent) or S[kind or "ok"] or S.ok
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Led", Position = { x, y }, Size = { s or 16, s or 16 },
+      Color = c, OffColor = N.ledOff, UnlinkOffColor = true, StrokeColor = N.stroke, StrokeWidth = 1, Margin = 2 }, extra)
+  end
+
+  -- Meter: bar on a recessed well, no built-in text box (put a readout next to it).
+  function ui.meter(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Meter", MeterStyle = "Standard", Position = { x, y },
+      Size = { w, h }, Color = color or B.accent, BackgroundColor = N.well, CornerRadius = 2, ShowTextbox = false,
+      StrokeWidth = 0 }, extra)
+  end
+
+  -- Hide a control but keep its pins.
+  function ui.hide(name, pretty)
+    layout[name] = { PrettyName = pretty or name, Style = "None", Position = { 0, 0 }, Size = { 0, 0 } }
+  end
+
+  return ui
+end
 
 local QuickColors = {
   {"Red",    {255, 0, 0}},     {"Orange", {255, 110, 0}},
@@ -48,7 +250,7 @@ local GROUP_TILES = 8
 local LIGHT_TILES = 8
 
 function GetColor(props)
-  return C.accent
+  return ACCENT
 end
 
 function GetPrettyName(props)
@@ -162,218 +364,173 @@ end
 
 function GetControlLayout(props)
   local layout, graphics = {}, {}
+  local ui = Theme.kit(layout, graphics, ACCENT)
+  local N, S, B = ui.N, ui.S, ui.B
   local page = PageNames[props["page_index"].Value]
-  local W = 640
+  local H = ({ Control = 736, Rooms = 608, Lights = 608, Scenes = 480, Setup = 416 })[page] or 600
+  local DARK = { 20, 20, 20 }  -- legend on bright content-colored buttons
 
-  local function box(text, x, y, w, h)
-    table.insert(graphics, { Type = "GroupBox", Text = text, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold",
-      Color = C.accent, Fill = C.panel, StrokeColor = C.stroke, StrokeWidth = 1, CornerRadius = 8,
-      Position = { x, y }, Size = { w, h } })
-  end
-  local function tile(x, y, w, h)
-    table.insert(graphics, { Type = "GroupBox", Fill = C.tile, StrokeColor = C.stroke, StrokeWidth = 1, CornerRadius = 6,
-      Position = { x, y }, Size = { w, h } })
-  end
-  local function label(text, x, y, w, h, align, size, color)
-    table.insert(graphics, { Type = "Label", Text = text, HTextAlign = align or "Right", FontSize = size or 12,
-      Color = color or C.sub, Position = { x, y }, Size = { w, h or 20 } })
-  end
-  local function button(name, legend, x, y, w, h, color, extra)
-    local b = { PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
-      Color = color or C.accent, OffColor = C.btn, UnlinkOffColor = true, FontSize = 12, FontColor = C.text,
-      CornerRadius = 6, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0 }
-    for k, v in pairs(extra or {}) do b[k] = v end
-    layout[name] = b
-  end
-  local function textbox(name, pretty, x, y, w, h, extra)
-    local t = { PrettyName = pretty, Style = "Text", Position = { x, y }, Size = { w, h or 22 }, FontSize = 12,
-      Color = { 20, 22, 26 }, TextColor = C.text, HTextAlign = "Center", CornerRadius = 4, StrokeColor = C.stroke, StrokeWidth = 1 }
-    for k, v in pairs(extra or {}) do t[k] = v end
-    layout[name] = t
-  end
-  local function combo(name, pretty, x, y, w, h)
-    layout[name] = { PrettyName = pretty, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 }, FontSize = 12,
-      Color = { 20, 22, 26 }, TextColor = C.text }
-  end
-  local function fader(name, pretty, x, y, w, h, color)
-    layout[name] = { PrettyName = pretty, Style = "Fader", Position = { x, y }, Size = { w, h or 24 }, Color = color or C.accent }
-  end
-  local function led(name, pretty, x, y, s, color)
-    layout[name] = { PrettyName = pretty, Style = "Led", Position = { x, y }, Size = { s, s }, Color = color or C.accent,
-      OffColor = { 60, 60, 60 }, UnlinkOffColor = true, StrokeWidth = 1, StrokeColor = C.stroke, Margin = 2 }
+  local function note(text, x, y, w)  -- 10 px dim note that sits next to its control
+    ui.label(text, x, y, w, 16, "Left", 10, N.dim)
   end
 
-  -- page background + header (all pages)
-  local H = ({ Control = 724, Rooms = 584, Lights = 584, Scenes = 488, Setup = 476 })[page] or 600
-  table.insert(graphics, { Type = "GroupBox", Fill = C.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { W, H } })
-  table.insert(graphics, { Type = "GroupBox", Fill = C.panel, StrokeColor = C.accent, StrokeWidth = 1, CornerRadius = 8,
-    Position = { 8, 8 }, Size = { W - 16, 48 } })
-  label("hue", 20, 12, 70, 38, "Left", 28, C.text)
-  label(page:upper(), 150, 22, 110, 20, "Left", 12, C.sub)
-  textbox("BridgeName", "Bridge Name", 262, 20, 170, 24, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", FontSize = 13 })
-  layout["Status"] = { PrettyName = "Status", Style = "Text", Position = { 438, 20 }, Size = { 150, 24 }, FontSize = 11, CornerRadius = 4 }
-  led("Online", "Online", 598, 20, 24)
+  ui.page(H)
+  ui.header("hue", page, "BridgeName", "Status", "Online")
+  layout["BridgeName"].PrettyName = "Bridge Name"
 
   if page == "Control" then
     -- Target
-    box("Target", 8, 64, 624, 76)
-    label("Control", 16, 94, 70, 20)
-    combo("TargetSelect", "Target~Select", 92, 92, 260, 26)
-    textbox("TargetInfo", "Target~Info", 360, 92, 160, 26, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", TextColor = C.sub, FontSize = 11 })
-    button("Identify", "Identify", 528, 92, 96, 26, C.amber, { OffColor = { 200, 135, 30 }, FontColor = { 20, 20, 20 }, FontStyle = "Bold" })
-    label("Pick All Lights, a room, a zone or one light. Everything on this page acts on it.", 16, 120, 600, 16, "Left", 10)
+    ui.section("Target", 8, 64, 624, 72)
+    ui.label("Control", 16, 98, 64, 24)
+    ui.combo("TargetSelect", "Target~Select", 88, 98, 264, 24)
+    ui.value("TargetInfo", "Target~Info", 364, 100, 148, 20, { TextColor = N.sub, FontSize = 11 })
+    ui.button("Identify", "Identify", 520, 96, 104, 28, "warn")
 
     -- Power
-    box("Power", 8, 148, 200, 160)
-    button("Power", "POWER", 24, 176, 168, 64, C.accent, { FontSize = 18, FontStyle = "Bold" })
-    button("PowerOn", "On", 24, 252, 80, 36, C.accentD)
-    button("PowerOff", "Off", 112, 252, 80, 36, C.accentD)
+    ui.section("Power", 8, 144, 200, 152)
+    ui.button("Power", "POWER", 24, 176, 168, 64, "power")
+    ui.button("PowerOn", "On", 24, 252, 80, 28, "secondary")
+    ui.button("PowerOff", "Off", 112, 252, 80, 28, "secondary")
 
     -- Brightness
-    box("Brightness", 216, 148, 416, 160)
-    fader("Brightness", "Brightness~Level", 232, 180, 300, 28)
-    button("BrightnessDown", "-", 540, 180, 36, 28, C.accentD, { FontSize = 18 })
-    button("BrightnessUp", "+", 582, 180, 36, 28, C.accentD, { FontSize = 18 })
-    label("Step", 232, 224, 50, 20)
-    layout["BrightnessStep"] = { PrettyName = "Brightness~Step", Style = "Text", Position = { 288, 224 }, Size = { 56, 22 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
-    label("Fade Time (s)", 352, 224, 110, 20)
-    layout["FadeTime"] = { PrettyName = "Brightness~Fade Time", Style = "Text", Position = { 468, 224 }, Size = { 56, 22 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
-    label("Fade time applies to every change on this page (Hue 'dynamics.duration').", 232, 260, 390, 16, "Left", 10)
-    label("Brightness 0 turns the target off.", 232, 276, 390, 16, "Left", 10)
+    ui.section("Brightness", 216, 144, 416, 152)
+    ui.fader("Brightness", "Brightness~Level", 232, 180, 296, 24)
+    ui.button("BrightnessDown", "-", 536, 178, 40, 28, "utility", { FontSize = 18 })
+    ui.button("BrightnessUp", "+", 584, 178, 40, 28, "utility", { FontSize = 18 })
+    ui.label("Step", 232, 224, 40, 24)
+    ui.field("BrightnessStep", "Brightness~Step", 280, 224, 56, 24, { HTextAlign = "Center" })
+    ui.label("Fade Time (s)", 352, 224, 88, 24)
+    ui.field("FadeTime", "Brightness~Fade Time", 448, 224, 56, 24, { HTextAlign = "Center" })
+    note("Fade time applies to every change on this page (Hue 'dynamics.duration').", 232, 264, 392)
 
     -- Color
-    box("Color", 8, 316, 624, 220)
-    local rows = { { "Hue", "Hue", { 230, 80, 200 } }, { "Saturation", "Saturation", C.accent },
-                   { "Red", "Red", C.red }, { "Green", "Green", { 60, 200, 80 } }, { "Blue", "Blue", { 60, 110, 240 } } }
+    ui.section("Color", 8, 304, 624, 200)
+    local rows = { { "Hue", "Hue", { 230, 80, 200 } }, { "Saturation", "Saturation", ACCENT },
+                   { "Red", "Red", { 214, 69, 65 } }, { "Green", "Green", { 60, 200, 80 } }, { "Blue", "Blue", { 60, 110, 240 } } }
     for i, r in ipairs(rows) do
-      local y = 344 + (i - 1) * 34
-      label(r[2], 16, y + 2, 76, 20)
-      fader(r[1], "Color~" .. r[2], 100, y, 300, 24, r[3])
+      local y = 336 + (i - 1) * 32
+      ui.label(r[2], 16, y, 76, 24)
+      ui.fader(r[1], "Color~" .. r[2], 100, y, 300, 24, r[3])
     end
-    led("ColorSwatch", "Color~Swatch", 432, 344, 112, { 255, 255, 255 })
-    layout["ColorSwatch"].Margin = 0
-    label("Hex", 552, 346, 70, 20, "Left")
-    textbox("HexColor", "Color~Hex", 552, 368, 72, 24)
-    label("Mode", 552, 404, 70, 20, "Left")
-    textbox("ColorMode", "Color~Mode", 552, 426, 72, 24, { Color = C.panel, FontSize = 11 })
-    label("Hue / Sat change color only.", 432, 476, 194, 16, "Left", 10)
-    label("RGB and Hex also set brightness.", 432, 492, 194, 16, "Left", 10)
+    ui.led("ColorSwatch", "Color~Swatch", 424, 336, 112, { 255, 255, 255 }, { Margin = 0 })
+    ui.label("Hex", 552, 336, 72, 20, "Left")
+    ui.field("HexColor", "Color~Hex", 552, 360, 72, 24, { HTextAlign = "Center" })
+    ui.label("Mode", 552, 392, 72, 20, "Left")
+    ui.readout("ColorMode", "Color~Mode", 552, 416, 72, 24, { HTextAlign = "Center", Font = "Roboto", FontSize = 11 })
+    note("Hue / Sat change color only.", 424, 456, 200)
+    note("RGB and Hex also set brightness.", 424, 472, 200)
 
     -- White
-    box("White (Color Temperature)", 8, 544, 624, 92)
-    label("Kelvin", 16, 574, 76, 20)
-    fader("ColorTemp", "White~Color Temp", 100, 572, 300, 24, C.amber)
+    ui.section("White (Color Temperature)", 8, 512, 624, 96)
+    ui.label("Kelvin", 16, 544, 76, 24)
+    ui.fader("ColorTemp", "White~Color Temp", 100, 544, 300, 24, { 240, 165, 40 })
+    note("2000 K - 6500 K (lamp limits apply)", 412, 548, 212)
     for i, wp in ipairs(WhitePresets) do
-      local x = 100 + (i - 1) * 104
-      button("WhitePreset " .. i, wp[1], x, 602, 98, 24, C.amber, { Color = C.amber, OffColor = { 70, 60, 44 } })
+      ui.button("WhitePreset " .. i, wp[1], 100 + (i - 1) * 104, 576, 96, 24, "pad",
+        { Color = { 240, 165, 40 }, OffColor = { 70, 60, 44 } })
     end
-    label("2000 K - 6500 K (lamp limits apply)", 412, 574, 210, 20, "Left", 11)
 
     -- Quick colors
-    box("Quick Colors", 8, 644, 624, 72)
+    ui.section("Quick Colors", 8, 616, 624, 80)
     for i, qc in ipairs(QuickColors) do
-      local x = 20 + (i - 1) * 76
-      button("QuickColor " .. i, qc[1], x, 674, 70, 32, qc[2],
-        { OffColor = { math.floor(qc[2][1] * 0.75), math.floor(qc[2][2] * 0.75), math.floor(qc[2][3] * 0.75) },
-          FontColor = { 20, 20, 20 }, FontStyle = "Bold" })
+      local c = qc[2]
+      ui.button("QuickColor " .. i, qc[1], 20 + (i - 1) * 76, 648, 68, 32, "pad",
+        { Color = c, OffColor = { math.floor(c[1] * 0.75), math.floor(c[2] * 0.75), math.floor(c[3] * 0.75) },
+          TextColor = DARK, FontStyle = "Bold" })
     end
 
-  elseif page == "Rooms" then
-    box("All Lights", 8, 64, 624, 64)
-    button("AllOn", "All On", 20, 92, 120, 28, C.accent, { FontStyle = "Bold" })
-    button("AllOff", "All Off", 148, 92, 120, 28, C.accentD, { FontStyle = "Bold" })
-    textbox("AllInfo", "All~Info", 280, 94, 340, 24, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", TextColor = C.sub })
+    ui.hint("Pick All Lights, a room, a zone or one light. Brightness 0 turns the target off.", 704)
 
-    box("Rooms & Zones", 8, 136, 624, 440)
-    for i = 1, GROUP_TILES do
+  elseif page == "Rooms" or page == "Lights" then
+    local isRooms = page == "Rooms"
+    if isRooms then
+      ui.section("All Lights", 8, 64, 624, 72)
+      ui.button("AllOn", "All On", 20, 96, 120, 28, "secondary")
+      ui.button("AllOff", "All Off", 148, 96, 120, 28, "secondary")
+      ui.value("AllInfo", "All~Info", 284, 100, 336, 20, { TextColor = N.sub })
+    else
+      ui.section("Filter", 8, 64, 624, 72)
+      ui.label("Show", 16, 98, 64, 24)
+      ui.combo("LightFilter", "Lights~Filter", 88, 98, 264, 24)
+    end
+
+    ui.section(isRooms and "Rooms & Zones" or "Lights", 8, 144, 624, 424)
+    local P, cat = isRooms and "Group" or "Light", isRooms and "Rooms" or "Lights"
+    for i = 1, (isRooms and GROUP_TILES or LIGHT_TILES) do
       local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
-      local x0, y0 = 20 + col * 308, 164 + row * 92
-      tile(x0, y0, 296, 84)
-      textbox("GroupName " .. i, "Rooms~Name " .. i, x0 + 8, y0 + 6, 172, 22,
-        { Color = C.tile, StrokeWidth = 0, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold" })
-      textbox("GroupInfo " .. i, "Rooms~Info " .. i, x0 + 8, y0 + 28, 172, 18,
-        { Color = C.tile, StrokeWidth = 0, HTextAlign = "Left", FontSize = 10, TextColor = C.sub })
-      fader("GroupBrightness " .. i, "Rooms~Brightness " .. i, x0 + 10, y0 + 54, 168, 22)
-      button("GroupPower " .. i, "Power", x0 + 188, y0 + 8, 98, 30, C.accent, { FontStyle = "Bold" })
-      button("GroupControl " .. i, "Control >", x0 + 188, y0 + 48, 98, 28, C.btn, { Color = C.accentD })
+      local x0, y0 = 20 + col * 304, 176 + row * 88
+      ui.strip(x0, y0, 296, 80)
+      local nx = x0 + 8
+      if not isRooms then
+        ui.led("LightSwatch " .. i, "Lights~Swatch " .. i, x0 + 8, y0 + 8, 20, { 255, 255, 255 })
+        nx = x0 + 36
+      end
+      ui.value(P .. "Name " .. i, cat .. "~Name " .. i, nx, y0 + 8, x0 + 184 - nx, 20,
+        { Color = N.strip, FontSize = 13, FontStyle = "Bold" })
+      ui.value(P .. "Info " .. i, cat .. "~Info " .. i, x0 + 8, y0 + 30, 176, 16,
+        { Color = N.strip, FontSize = 10, TextColor = N.sub })
+      ui.fader(P .. "Brightness " .. i, cat .. "~Brightness " .. i, x0 + 8, y0 + 50, 176, 22)
+      ui.button(P .. "Power " .. i, "Power", x0 + 192, y0 + 8, 96, 28, "primary")
+      ui.button(P .. "Control " .. i, "Control >", x0 + 192, y0 + 44, 96, 28, "utility")
     end
-    button("GroupPageDown", "< Page", 20, 536, 80, 28, C.btn)
-    textbox("GroupPageLabel", "Rooms~Page", 108, 538, 424, 24, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
-    button("GroupPageUp", "Page >", 540, 536, 80, 28, C.btn)
+    ui.button(P .. "PageDown", "< Page", 20, 528, 80, 28, "utility")
+    ui.value(P .. "PageLabel", cat .. "~Page", 108, 532, 424, 20, { TextColor = N.sub, HTextAlign = "Center" })
+    ui.button(P .. "PageUp", "Page >", 540, 528, 80, 28, "utility")
 
-  elseif page == "Lights" then
-    box("Filter", 8, 64, 624, 64)
-    label("Show", 16, 94, 70, 20)
-    combo("LightFilter", "Lights~Filter", 92, 92, 260, 26)
-    label("Control > makes a light the Control page target.", 364, 96, 260, 18, "Left", 10)
-
-    box("Lights", 8, 136, 624, 440)
-    for i = 1, LIGHT_TILES do
-      local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
-      local x0, y0 = 20 + col * 308, 164 + row * 92
-      tile(x0, y0, 296, 84)
-      led("LightSwatch " .. i, "Lights~Swatch " .. i, x0 + 8, y0 + 8, 22, { 255, 255, 255 })
-      textbox("LightName " .. i, "Lights~Name " .. i, x0 + 34, y0 + 6, 146, 22,
-        { Color = C.tile, StrokeWidth = 0, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold" })
-      textbox("LightInfo " .. i, "Lights~Info " .. i, x0 + 8, y0 + 30, 172, 18,
-        { Color = C.tile, StrokeWidth = 0, HTextAlign = "Left", FontSize = 10, TextColor = C.sub })
-      fader("LightBrightness " .. i, "Lights~Brightness " .. i, x0 + 10, y0 + 54, 168, 22)
-      button("LightPower " .. i, "Power", x0 + 188, y0 + 8, 98, 30, C.accent, { FontStyle = "Bold" })
-      button("LightControl " .. i, "Control >", x0 + 188, y0 + 48, 98, 28, C.btn, { Color = C.accentD })
-    end
-    button("LightPageDown", "< Page", 20, 536, 80, 28, C.btn)
-    textbox("LightPageLabel", "Lights~Page", 108, 538, 424, 24, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
-    button("LightPageUp", "Page >", 540, 536, 80, 28, C.btn)
+    ui.hint(isRooms and "Control > makes a room or zone the Control page target."
+                     or "Control > makes a light the Control page target.", 576)
 
   elseif page == "Scenes" then
-    box("Scenes", 8, 64, 624, 308)
-    label("Room", 16, 92, 70, 20)
-    combo("SceneGroup", "Scenes~Room or Zone", 92, 90, 220, 26)
-    label("Active", 318, 92, 50, 20)
-    textbox("SceneActive", "Scenes~Active", 374, 90, 250, 26, { Color = C.panel, TextColor = C.accent, FontSize = 13, FontStyle = "Bold" })
+    ui.section("Scenes", 8, 64, 624, 296)
+    ui.label("Room", 16, 96, 64, 24)
+    ui.combo("SceneGroup", "Scenes~Room or Zone", 88, 96, 232, 24)
+    ui.label("Active", 328, 96, 48, 24)
+    ui.readout("SceneActive", "Scenes~Active", 384, 96, 240, 24, { TextColor = B.ink, HTextAlign = "Center", FontStyle = "Bold" })
     for i = 1, SCENE_BUTTONS do
       local col, row = (i - 1) % 4, math.floor((i - 1) / 4)
-      button("SceneButton " .. i, "", 20 + col * 152, 128 + row * 54, 144, 46, C.accent, { FontSize = 12, WordWrap = true })
+      ui.button("SceneButton " .. i, "", 20 + col * 152, 128 + row * 52, 144, 44, "pad")
     end
-    button("ScenePageDown", "< Page", 20, 292, 80, 28, C.btn)
-    textbox("ScenePageLabel", "Scenes~Page", 108, 294, 424, 24, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
-    button("ScenePageUp", "Page >", 540, 292, 80, 28, C.btn)
-    label("Transition (s)", 16, 334, 100, 20)
-    layout["SceneTransition"] = { PrettyName = "Scenes~Transition", Style = "Text", Position = { 122, 332 }, Size = { 56, 24 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
-    button("SceneDynamic", "Dynamic", 196, 330, 110, 28, C.accent, { FontStyle = "Bold" })
-    label("plays the scene's palette", 312, 334, 160, 20, "Left", 10)
-    button("SceneGroupOff", "Room Off", 500, 330, 120, 28, C.accentD)
+    ui.button("ScenePageDown", "< Page", 20, 284, 80, 28, "utility")
+    ui.value("ScenePageLabel", "Scenes~Page", 108, 288, 424, 20, { TextColor = N.sub, HTextAlign = "Center" })
+    ui.button("ScenePageUp", "Page >", 540, 284, 80, 28, "utility")
+    ui.label("Transition (s)", 16, 324, 96, 24)
+    ui.field("SceneTransition", "Scenes~Transition", 120, 324, 56, 24, { HTextAlign = "Center" })
+    ui.button("SceneDynamic", "Dynamic", 192, 322, 112, 28, "primary")
+    note("plays the scene's palette", 312, 328, 160)
+    ui.button("SceneGroupOff", "Room Off", 500, 322, 120, 28, "secondary")
 
-    box("Light Effects", 8, 380, 624, 100)
-    label("Effect", 16, 410, 70, 20)
-    combo("EffectSelect", "Effects~Select", 92, 408, 220, 26)
-    textbox("EffectStatus", "Effects~Status", 320, 408, 300, 26, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", TextColor = C.sub })
-    label("Effects (candle, fire, sparkle...) play on the Control page target. Lamps that", 16, 440, 600, 16, "Left", 10)
-    label("do not support an effect ignore it. Pick 'no_effect' to stop.", 16, 456, 600, 16, "Left", 10)
+    ui.section("Light Effects", 8, 368, 624, 72)
+    ui.label("Effect", 16, 400, 64, 24)
+    ui.combo("EffectSelect", "Effects~Select", 88, 400, 232, 24)
+    ui.value("EffectStatus", "Effects~Status", 332, 402, 292, 20, { TextColor = N.sub })
+
+    ui.hint("Effects play on the Control page target; lamps without one ignore it. 'no_effect' stops.", 448)
 
   elseif page == "Setup" then
-    box("Connection", 8, 64, 624, 176)
-    label("Bridge IP", 16, 94, 100, 20)
-    textbox("IPAddress", "Setup~IP Address", 122, 92, 200, 26, { HTextAlign = "Left" })
-    button("Connect", "Connect / Refresh", 340, 92, 150, 26, C.accentD)
-    label("App Key", 16, 130, 100, 20)
-    textbox("AppKey", "Setup~App Key", 122, 128, 368, 26, { HTextAlign = "Left", FontSize = 11 })
-    button("Pair", "Pair", 500, 92, 120, 26, C.accent, { OffColor = { 64, 104, 200 }, FontStyle = "Bold" })
-    button("ForgetKey", "Forget Key", 500, 128, 120, 26, C.red, { OffColor = { 120, 44, 42 } })
-    label("To pair: press Pair, then press the round link button on the bridge within 30 s.", 16, 170, 600, 20, "Left", 11, C.text)
-    label("Last Error", 16, 202, 100, 20)
-    textbox("LastError", "Setup~Last Error", 122, 200, 498, 26, { Color = C.panel, HTextAlign = "Left", TextColor = C.amber })
+    ui.section("Connection", 8, 64, 624, 144)
+    ui.label("Bridge IP", 16, 98, 96, 24)
+    ui.field("IPAddress", "Setup~IP Address", 120, 98, 208, 24)
+    ui.button("Connect", "Connect / Refresh", 336, 96, 152, 28, "secondary")
+    ui.button("Pair", "Pair", 496, 96, 128, 28, "ok")
+    ui.label("App Key", 16, 136, 96, 24)
+    ui.field("AppKey", "Setup~App Key", 120, 136, 368, 24, { FontSize = 11 })
+    ui.button("ForgetKey", "Forget Key", 496, 134, 128, 28, "danger")
+    ui.label("Last Error", 16, 172, 96, 24)
+    ui.readout("LastError", "Setup~Last Error", 120, 172, 504, 24, { TextColor = S.warn })
 
-    box("Bridge Information", 8, 248, 624, 220)
+    ui.section("Bridge Information", 8, 216, 624, 160)
     local info = { { "BridgeId", "Bridge ID" }, { "Model", "Model" }, { "Software", "Software" }, { "Counts", "Contents" } }
     for i, f in ipairs(info) do
-      local y = 278 + (i - 1) * 36
-      label(f[2], 16, y + 2, 100, 20)
-      textbox(f[1], "Setup~" .. f[2], 122, y, 300, 26, { Color = C.panel, HTextAlign = "Left" })
+      local y = 248 + (i - 1) * 32
+      ui.label(f[2], 16, y, 96, 24)
+      ui.readout(f[1], "Setup~" .. f[2], 120, y, 296, 24)
     end
-    label("Poll interval and group command", 436, 282, 190, 16, "Left", 10)
-    label("interval are set in Properties.", 436, 298, 190, 16, "Left", 10)
-    label("Give the bridge a DHCP reservation so its IP address never changes.", 16, 428, 600, 16, "Left", 10)
+    note("Poll interval and group command", 432, 252, 192)
+    note("interval are set in Properties.", 432, 268, 192)
+    note("Give the bridge a DHCP reservation", 432, 300, 192)
+    note("so its IP address never changes.", 432, 316, 192)
+
+    ui.hint("To pair: press Pair, then press the round link button on the bridge within 30 s.", 384)
   end
 
   return layout, graphics

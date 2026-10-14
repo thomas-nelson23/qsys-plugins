@@ -23,31 +23,231 @@
 
 PluginInfo = {
   Name = "Network~UniFi Network Monitor",
-  Version = "1.0",
-  BuildVersion = "1.0.0.0",
+  Version = "1.1",
+  BuildVersion = "1.1.0.0",
   Id = "6b0e7f3a-3c2d-4f0e-9a51-2d8c1b7e4a90",
   Author = "AV Programming",
   Description = "Monitor a UniFi console (UDM Pro and others): client list with IP, MAC and bandwidth, WAN and network health, throughput, speed test, devices, ports, radios and firmware, over the local UniFi Network API.",
   ShowDebug = true,
 }
 
--- Palette ---------------------------------------------------------------
-local C = {
-  bg      = {22, 24, 29},
-  panel   = {34, 37, 44},
-  tile    = {27, 30, 36},
-  row     = {30, 33, 40},
-  stroke  = {58, 63, 74},
-  accent  = {0, 111, 255},    -- UniFi blue
-  accentD = {16, 52, 112},
-  text    = {232, 234, 238},
-  sub     = {150, 157, 170},
-  btn     = {52, 56, 66},
-  red     = {214, 69, 65},
-  amber   = {240, 165, 40},
-  green   = {62, 181, 74},
-  field   = {20, 22, 26},
+local ACCENT = { 0, 111, 255 }  -- UniFi blue
+
+--[[ Console theme for Q-SYS plugins, v1.1 (2026-10-14): copied unchanged from the project style guide (qsys-plugin-style-guide/theme.lua). ]]
+local Theme = {}
+
+Theme.W = 640   -- page width; every page is 640 wide
+Theme.GRID = 8  -- positions and sizes snap to 8 (4 for fine alignment inside a row)
+
+-- Neutrals: shared by every plugin. Never brand-tint these.
+-- Violet "dusk" greys, lifted off black; text colors come from home-dash.
+Theme.N = {
+  bg      = { 24, 22, 40 },    -- chassis: page background
+  panel   = { 36, 33, 58 },    -- rack panel: sections
+  strip   = { 30, 28, 50 },    -- channel strip / tile inside a section
+  rowAlt  = { 41, 38, 66 },    -- alternate list row
+  well    = { 15, 14, 28 },    -- recessed display: readouts, fields, meters, hint bar
+  stroke  = { 66, 60, 100 },   -- 1 px outlines
+  btn     = { 54, 50, 86 },    -- button off state
+  btnOn   = { 84, 78, 126 },   -- utility button on state
+  ledOff  = { 52, 48, 80 },
+  text    = { 217, 238, 242 }, -- home-dash --text
+  sub     = { 156, 199, 207 }, -- home-dash --text-soft: labels, section titles
+  dim     = { 122, 128, 162 }, -- units, captions
 }
+
+-- Semantic colors (home-dash): same meaning in every plugin, never used as a brand accent.
+Theme.S = {
+  ok    = { 0, 240, 255 },   -- cyan: online, connected, healthy
+  warn  = { 255, 176, 32 },  -- amber: attention, identify
+  fault = { 255, 42, 79 },   -- hot red: offline, error, destructive actions
+}
+
+function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
+  return { math.floor(a[1] + (b[1] - a[1]) * t + 0.5),
+           math.floor(a[2] + (b[2] - a[2]) * t + 0.5),
+           math.floor(a[3] + (b[3] - a[3]) * t + 0.5) }
+end
+
+-- Derives the brand set from one accent RGB.
+function Theme.brand(accent)
+  return {
+    accent = accent,                              -- active state, fader fill, header outline
+    dim    = Theme.mix(accent, Theme.N.bg, 0.55),  -- secondary action off state
+    pad    = Theme.mix(accent, Theme.N.panel, 0.78), -- pad off state (lit-but-idle step button)
+    ink    = Theme.mix(accent, { 255, 255, 255 }, 0.35), -- accent-colored text on dark (page tab)
+  }
+end
+
+local FONT, MONO, DISPLAY = "Roboto", "Roboto Mono", "Montserrat"
+
+local function merge(t, extra)
+  for k, v in pairs(extra or {}) do t[k] = v end
+  return t
+end
+
+function Theme.kit(layout, graphics, accent)
+  local N, S, B = Theme.N, Theme.S, Theme.brand(accent)
+  local ui = { N = N, S = S, B = B }
+
+  local function g(t) table.insert(graphics, t) end
+
+  -- Static text. size: 10 hint, 11 label, 12 body, 13 emphasis
+  function ui.label(text, x, y, w, h, align, size, color, style)
+    g({ Type = "Label", Text = text, Font = FONT, FontStyle = style or "Regular", FontSize = size or 11,
+        HTextAlign = align or "Right", Color = color or N.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+
+  -- Page background. Call first so it sits behind everything.
+  function ui.page(h)
+    g({ Type = "GroupBox", Fill = N.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { Theme.W, h } })
+  end
+
+  -- Transport-bar header: wordmark, page tab, device name readout, Status, Online LED.
+  -- Sliced sun (home-dash brand mark): cyan to red bands, slices in the lower half.
+  -- s should be a multiple of 4; the gaps show whatever is drawn underneath.
+  function ui.sun(x, y, s)
+    local r, rows = s / 2, s / 2
+    for i = 0, rows - 1 do
+      local yy = i * 2
+      local lower = yy >= r
+      if not lower or ((yy - r) / 2) % 2 == 0 then
+        local dy = yy + 1 - r
+        local hw = math.floor(math.sqrt(math.max(r * r - dy * dy, 0)) + 0.5)
+        g({ Type = "GroupBox", Fill = Theme.mix(S.ok, S.fault, yy / (s - 2)), StrokeWidth = 0, CornerRadius = 0,
+            Position = { x + r - hw, y + yy }, Size = { hw * 2, 2 } })
+      end
+    end
+  end
+
+  function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl)
+    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = B.accent, StrokeWidth = 1, CornerRadius = 6,
+        Position = { 8, 8 }, Size = { 624, 48 } })
+    ui.sun(20, 18, 28)
+    g({ Type = "Label", Text = wordmark, Font = DISPLAY, FontStyle = "Bold", FontSize = 20, HTextAlign = "Left",
+        Color = N.text, Position = { 56, 16 }, Size = { 96, 32 } })
+    g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Bold", FontSize = 10,
+        HTextAlign = "Center", Color = B.ink, Fill = B.pad, CornerRadius = 10, StrokeWidth = 0,
+        Position = { 156, 22 }, Size = { 84, 20 } })
+    if nameCtl then ui.readout(nameCtl, nil, 248, 20, 196, 24) end
+    if statusCtl then
+      layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 452, 20 }, Size = { 140, 24 },
+        Font = FONT, FontSize = 11, CornerRadius = 3 }
+    end
+    if ledCtl then ui.led(ledCtl, "Online", 602, 22, 20, "ok") end
+  end
+
+  -- Rack panel with a color-tab title (uppercase, like a console channel label).
+  -- The tab is the house cyan/red, not the brand accent.
+  -- Content starts 32 px below y.
+  function ui.section(title, x, y, w, h)
+    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 6,
+        Position = { x, y }, Size = { w, h } })
+    if title and title ~= "" then
+      -- two-tone tab, cyan over red: the house sunset mark on every section
+      g({ Type = "GroupBox", Fill = S.ok, StrokeWidth = 0, CornerRadius = 0, Position = { x + 12, y + 10 }, Size = { 4, 6 } })
+      g({ Type = "GroupBox", Fill = S.fault, StrokeWidth = 0, CornerRadius = 0, Position = { x + 12, y + 16 }, Size = { 4, 6 } })
+      ui.label(string.upper(title), x + 22, y + 6, w - 34, 20, "Left", 11, N.sub, "Medium")
+    end
+  end
+
+  -- Channel strip / tile inside a section.
+  function ui.strip(x, y, w, h)
+    g({ Type = "GroupBox", Fill = N.strip, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 4,
+        Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Alternating list row background (i = row number).
+  function ui.row(x, y, w, h, i)
+    g({ Type = "GroupBox", Fill = (i % 2 == 0) and N.rowAlt or N.strip, StrokeWidth = 0, CornerRadius = 2,
+        Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Hint bar: one recessed line of help per page, bottom of the page.
+  function ui.hint(text, y)
+    g({ Type = "Label", Text = text, Font = FONT, FontSize = 10, HTextAlign = "Left", Color = N.sub, Fill = N.well,
+        CornerRadius = 4, StrokeWidth = 0, Margin = 0, Padding = 8, Position = { 8, y }, Size = { 624, 24 } })
+  end
+
+  -- Buttons. kind:
+  --   "primary" accent when on       "utility" neutral, lighter when on
+  --   "secondary" accent, dim off     "pad"     step-pad: tinted off, full accent on
+  --   "power" big primary, 16 bold   "warn" / "danger" / "ok" semantic
+  -- Pass ButtonStyle ("Toggle", "Momentary", "Trigger"...) in extra to match the control's ButtonType.
+  local KINDS = {
+    primary   = function() return B.accent, N.btn, 12, "Medium" end,
+    secondary = function() return B.accent, B.dim, 12, "Regular" end,
+    utility   = function() return N.btnOn, N.btn, 12, "Regular" end,
+    pad       = function() return B.accent, B.pad, 12, "Medium" end,
+    power     = function() return B.accent, N.btn, 16, "Bold" end,
+    warn      = function() return S.warn, Theme.mix(S.warn, N.panel, 0.7), 12, "Medium" end,
+    danger    = function() return S.fault, Theme.mix(S.fault, N.panel, 0.7), 12, "Medium" end,
+    ok        = function() return S.ok, Theme.mix(S.ok, N.panel, 0.7), 12, "Medium" end,
+  }
+  function ui.button(name, legend, x, y, w, h, kind, extra)
+    local on, off, size, style = (KINDS[kind or "primary"] or KINDS.primary)()
+    layout[name] = merge({ PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
+      Color = on, OffColor = off, UnlinkOffColor = true, TextColor = N.text, Font = FONT, FontStyle = style,
+      FontSize = size, CornerRadius = 4, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0, WordWrap = true }, extra)
+  end
+
+  -- Read-only readout: recessed well, mono digits, no outline.
+  function ui.readout(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = MONO, FontStyle = "Medium", FontSize = 12, HTextAlign = "Left",
+      CornerRadius = 3, StrokeWidth = 0, Padding = 4 }, extra)
+  end
+
+  -- Editable field: same well, plus a 1 px outline so it reads as typeable.
+  function ui.field(name, pretty, x, y, w, h, extra)
+    ui.readout(name, pretty, x, y, w, h, merge({ StrokeColor = N.stroke, StrokeWidth = 1 }, extra))
+  end
+
+  -- Plain value text on the panel (names, secondary info). No well.
+  function ui.value(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 20 },
+      Color = N.panel, TextColor = N.text, Font = FONT, FontSize = 12, HTextAlign = "Left", StrokeWidth = 0,
+      TextBoxStyle = "NoBackground" }, extra)
+  end
+
+  function ui.combo(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 12, StrokeColor = N.stroke, StrokeWidth = 1 }, extra)
+  end
+
+  -- Fader: horizontal when w > h, vertical (channel strip) when h > w.
+  function ui.fader(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Fader", Position = { x, y }, Size = { w, h },
+      Color = color or B.accent }, extra)
+  end
+
+  -- Knob: secondary parameters only (trim, fade time, step). 36 or 48 square.
+  function ui.knob(name, pretty, x, y, s, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Knob", Position = { x, y }, Size = { s or 36, s or 36 },
+      Color = color or B.accent }, extra)
+  end
+
+  -- LED. kind: "ok" | "warn" | "fault" | "accent" | an RGB table (e.g. a color swatch)
+  function ui.led(name, pretty, x, y, s, kind, extra)
+    local c = type(kind) == "table" and kind or (kind == "accent" and B.accent) or S[kind or "ok"] or S.ok
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Led", Position = { x, y }, Size = { s or 16, s or 16 },
+      Color = c, OffColor = N.ledOff, UnlinkOffColor = true, StrokeColor = N.stroke, StrokeWidth = 1, Margin = 2 }, extra)
+  end
+
+  -- Meter: bar on a recessed well, no built-in text box (put a readout next to it).
+  function ui.meter(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Meter", MeterStyle = "Standard", Position = { x, y },
+      Size = { w, h }, Color = color or B.accent, BackgroundColor = N.well, CornerRadius = 2, ShowTextbox = false,
+      StrokeWidth = 0 }, extra)
+  end
+
+  -- Hide a control but keep its pins.
+  function ui.hide(name, pretty)
+    layout[name] = { PrettyName = pretty or name, Style = "None", Position = { 0, 0 }, Size = { 0, 0 } }
+  end
+
+  return ui
+end
 
 local CLIENT_ROWS = 14
 local DEVICE_ROWS = 10
@@ -60,7 +260,7 @@ local CLIENT_SORTS = { "Name", "IP Address", "Bandwidth", "Connection", "Connect
 local DEVICE_FILTERS = { "All", "Gateways", "Switches", "Access Points", "Offline" }
 
 function GetColor(props)
-  return C.accent
+  return ACCENT
 end
 
 function GetPrettyName(props)
@@ -159,300 +359,260 @@ end
 function GetControlLayout(props)
   local layout, graphics = {}, {}
   local page = PageNames[props["page_index"].Value]
-  local W = 640
+  local ui = Theme.kit(layout, graphics, ACCENT)
+  local N, S = ui.N, ui.S
+  local MONO = "Roboto Mono"
 
-  local function box(text, x, y, w, h)
-    table.insert(graphics, { Type = "GroupBox", Text = text, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold",
-      Color = C.accent, Fill = C.panel, StrokeColor = C.stroke, StrokeWidth = 1, CornerRadius = 8,
-      Position = { x, y }, Size = { w, h } })
-  end
-  local function strip(x, y, w, h, color)
-    table.insert(graphics, { Type = "GroupBox", Fill = color or C.row, StrokeWidth = 0, CornerRadius = 3,
-      Position = { x, y }, Size = { w, h } })
-  end
-  local function label(text, x, y, w, h, align, size, color, style)
-    table.insert(graphics, { Type = "Label", Text = text, HTextAlign = align or "Right", FontSize = size or 12,
-      FontStyle = style, Color = color or C.sub, Position = { x, y }, Size = { w, h or 20 } })
-  end
-  local function button(name, legend, x, y, w, h, color, extra)
-    local b = { PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
-      Color = color or C.accent, OffColor = C.btn, UnlinkOffColor = true, FontSize = 12, FontColor = C.text,
-      CornerRadius = 6, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0 }
-    for k, v in pairs(extra or {}) do b[k] = v end
-    layout[name] = b
-  end
-  local function textbox(name, pretty, x, y, w, h, extra)
-    local t = { PrettyName = pretty, Style = "Text", Position = { x, y }, Size = { w, h or 22 }, FontSize = 12,
-      Color = C.field, TextColor = C.text, HTextAlign = "Center", CornerRadius = 4, StrokeColor = C.stroke, StrokeWidth = 1 }
-    for k, v in pairs(extra or {}) do t[k] = v end
-    layout[name] = t
-  end
-  local function value(name, pretty, x, y, w, h, extra)
-    local e = { Color = C.panel, HTextAlign = "Left", StrokeWidth = 0 }
-    for k, v in pairs(extra or {}) do e[k] = v end
-    textbox(name, pretty, x, y, w, h, e)
+  local function colhead(text, x, y, w, align)
+    ui.label(string.upper(text), x, y, w, 16, align or "Left", 10, N.dim, "Medium")
   end
   local function cell(name, pretty, x, y, w, extra)
-    local e = { Color = C.row, HTextAlign = "Left", StrokeWidth = 0, FontSize = 11, CornerRadius = 0 }
+    local e = { FontSize = 11 }
     for k, v in pairs(extra or {}) do e[k] = v end
-    textbox(name, pretty, x, y, w, 20, e)
+    ui.value(name, pretty, x, y, w, 20, e)
   end
-  local function combo(name, pretty, x, y, w, h)
-    layout[name] = { PrettyName = pretty, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 }, FontSize = 12,
-      Color = C.field, TextColor = C.text }
+  local function mono(extra)
+    local e = { Font = MONO, FontSize = 11 }
+    for k, v in pairs(extra or {}) do e[k] = v end
+    return e
   end
-  local function meterbar(name, pretty, x, y, w, h, color)
-    layout[name] = { PrettyName = pretty, Style = "Meter", MeterStyle = "Standard", Position = { x, y }, Size = { w, h or 20 },
-      Color = color or C.accent, BackgroundColor = C.field, ShowTextbox = false, CornerRadius = 4 }
+  local function rowsel(name, x, y, w, align)
+    ui.button(name, "", x, y, w, 20, "utility", { FontSize = 11, HTextAlign = align or "Left", CornerRadius = 3 })
   end
-  local function led(name, pretty, x, y, s, color)
-    layout[name] = { PrettyName = pretty, Style = "Led", Position = { x, y }, Size = { s, s }, Color = color or C.green,
-      OffColor = { 60, 60, 60 }, UnlinkOffColor = true, StrokeWidth = 1, StrokeColor = C.stroke, Margin = 2 }
-  end
+  -- table scroll bar: ^ button, vertical fader (same control names as before), v button
   local function scrollbar(prefix, pretty, x, y, h)
-    button(prefix .. "ScrollUp", "^", x, y, 20, 20, C.btn, { FontSize = 11 })
-    layout[prefix .. "Scroll"] = { PrettyName = pretty .. "~Scroll", Style = "Fader", Position = { x, y + 22 }, Size = { 20, h - 44 },
-      Color = C.accent, ShowTextbox = false }
-    button(prefix .. "ScrollDown", "v", x, y + h - 20, 20, 20, C.btn, { FontSize = 11 })
+    ui.button(prefix .. "ScrollUp", "^", x, y, 20, 20, "utility", { FontSize = 11 })
+    ui.fader(prefix .. "Scroll", pretty .. "~Scroll", x, y + 24, 20, h - 48, nil, { ShowTextbox = false })
+    ui.button(prefix .. "ScrollDown", "v", x, y + h - 20, 20, 20, "utility", { FontSize = 11 })
   end
 
-  -- page background + header (all pages)
-  local H = ({ Network = 640, Clients = 696, Devices = 690, Ports = 584, Setup = 516 })[page] or 600
-  table.insert(graphics, { Type = "GroupBox", Fill = C.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { W, H } })
-  table.insert(graphics, { Type = "GroupBox", Fill = C.panel, StrokeColor = C.accent, StrokeWidth = 1, CornerRadius = 8,
-    Position = { 8, 8 }, Size = { W - 16, 48 } })
-  label("UniFi", 20, 12, 110, 38, "Left", 26, C.text, "Bold")
-  label(page:upper(), 150, 22, 110, 20, "Left", 12, C.sub)
-  value("ConsoleName", "Console Name", 262, 20, 170, 24, { FontSize = 13 })
-  layout["Status"] = { PrettyName = "Status", Style = "Text", Position = { 438, 20 }, Size = { 150, 24 }, FontSize = 11, CornerRadius = 4 }
-  led("Online", "Online", 598, 20, 24)
+  local H = ({ Network = 680, Clients = 752, Devices = 760, Ports = 632, Setup = 496 })[page] or 600
+  ui.page(H)
+  ui.header("UniFi", page, "ConsoleName", "Status", "Online")
+  layout["ConsoleName"].PrettyName = "Console Name"
 
   if page == "Network" then
-    box("Internet", 8, 64, 624, 124)
-    led("InternetUp", "Internet~Up", 20, 91, 22)
-    value("WanStatus", "Internet~WAN Status", 48, 90, 150, 24, { FontStyle = "Bold" })
-    label("WAN IP", 204, 92, 52, 20)
-    value("WanIP", "Internet~WAN IP", 262, 90, 132, 24, { Color = C.field, StrokeWidth = 1, HTextAlign = "Center" })
-    label("Latency", 400, 92, 60, 20)
-    value("Latency", "Internet~Latency", 466, 90, 154, 24)
-    label("Gateway", 16, 122, 70, 20)
-    value("GatewayInfo", "Internet~Gateway", 92, 120, 302, 24)
-    label("Uptime", 400, 122, 60, 20)
-    value("WanUptime", "Internet~WAN Uptime", 466, 120, 154, 24)
-    label("Link", 16, 152, 70, 20)
-    value("WanDetail", "Internet~WAN Detail", 92, 150, 528, 24, { TextColor = C.sub, FontSize = 11 })
+    ui.section("Internet", 8, 64, 624, 120)
+    ui.led("InternetUp", "Internet~Up", 20, 100, 16, "ok")
+    ui.value("WanStatus", "Internet~WAN Status", 44, 98, 156, 20, { FontStyle = "Bold", FontSize = 13 })
+    ui.label("WAN IP", 200, 98, 56, 20)
+    ui.readout("WanIP", "Internet~WAN IP", 264, 96, 136, 24, { HTextAlign = "Center" })
+    ui.label("Latency", 400, 98, 64, 20)
+    ui.readout("Latency", "Internet~Latency", 472, 96, 144, 24)
+    ui.label("Gateway", 16, 126, 64, 20)
+    ui.value("GatewayInfo", "Internet~Gateway", 88, 126, 304, 20)
+    ui.label("Uptime", 400, 126, 64, 20)
+    ui.readout("WanUptime", "Internet~WAN Uptime", 472, 124, 144, 24)
+    ui.label("Link", 16, 154, 64, 20)
+    ui.value("WanDetail", "Internet~WAN Detail", 88, 154, 528, 20, { TextColor = N.sub, FontSize = 11 })
 
-    box("WAN Throughput", 8, 196, 624, 112)
-    label("Down", 16, 226, 50, 20)
-    meterbar("WanDownMeter", "Throughput~Down Meter", 72, 226, 420, 20, C.accent)
-    value("WanDownText", "Throughput~Down", 500, 224, 120, 24, { FontStyle = "Bold", FontSize = 13 })
-    label("Up", 16, 258, 50, 20)
-    meterbar("WanUpMeter", "Throughput~Up Meter", 72, 258, 420, 20, { 0, 180, 200 })
-    value("WanUpText", "Throughput~Up", 500, 256, 120, 24, { FontStyle = "Bold", FontSize = 13 })
-    label("Live rate at the gateway's WAN port. Meter full scale is set in Properties.", 16, 284, 600, 16, "Left", 10)
+    ui.section("WAN Throughput", 8, 192, 624, 96)
+    ui.label("Down", 16, 226, 48, 20)
+    ui.meter("WanDownMeter", "Throughput~Down Meter", 72, 228, 416, 16)
+    ui.readout("WanDownText", "Throughput~Down", 496, 224, 120, 24, { HTextAlign = "Right", FontSize = 13 })
+    ui.label("Up", 16, 258, 48, 20)
+    ui.meter("WanUpMeter", "Throughput~Up Meter", 72, 260, 416, 16, S.ok)
+    ui.readout("WanUpText", "Throughput~Up", 496, 256, 120, 24, { HTextAlign = "Right", FontSize = 13 })
 
-    box("Speed Test", 8, 316, 624, 92)
-    label("Down", 16, 344, 50, 20)
-    value("SpeedDown", "Speed Test~Down", 72, 342, 100, 24, { Color = C.field, StrokeWidth = 1, HTextAlign = "Center" })
-    label("Up", 176, 344, 30, 20)
-    value("SpeedUp", "Speed Test~Up", 212, 342, 100, 24, { Color = C.field, StrokeWidth = 1, HTextAlign = "Center" })
-    label("Ping", 316, 344, 40, 20)
-    value("SpeedPing", "Speed Test~Ping", 362, 342, 80, 24, { Color = C.field, StrokeWidth = 1, HTextAlign = "Center" })
-    button("RunSpeedTest", "Run Speed Test", 490, 340, 130, 28, C.accent, { OffColor = { 0, 86, 200 }, FontStyle = "Bold" })
-    label("Last run", 8, 376, 58, 20)
-    value("SpeedLastRun", "Speed Test~Last Run", 72, 374, 240, 24, { TextColor = C.sub })
-    value("SpeedStatus", "Speed Test~Status", 320, 374, 300, 24, { TextColor = C.amber, FontSize = 11 })
+    ui.section("Speed Test", 8, 296, 624, 96)
+    ui.label("Down", 16, 330, 48, 20)
+    ui.readout("SpeedDown", "Speed Test~Down", 72, 328, 104, 24, { HTextAlign = "Center" })
+    ui.label("Up", 176, 330, 32, 20)
+    ui.readout("SpeedUp", "Speed Test~Up", 216, 328, 104, 24, { HTextAlign = "Center" })
+    ui.label("Ping", 320, 330, 40, 20)
+    ui.readout("SpeedPing", "Speed Test~Ping", 368, 328, 80, 24, { HTextAlign = "Center" })
+    ui.button("RunSpeedTest", "Run Speed Test", 488, 326, 128, 28, "secondary", { FontStyle = "Medium" })
+    ui.label("Last run", 8, 360, 56, 20)
+    ui.value("SpeedLastRun", "Speed Test~Last Run", 72, 360, 248, 20, { TextColor = N.sub, FontSize = 11 })
+    ui.value("SpeedStatus", "Speed Test~Status", 328, 360, 288, 20, { TextColor = S.warn, FontSize = 11 })
 
-    box("Gateway", 8, 416, 308, 132)
-    label("CPU", 16, 444, 40, 20)
-    meterbar("GwCpuMeter", "Gateway~CPU Meter", 62, 444, 170, 18, C.green)
-    value("GwCpu", "Gateway~CPU", 238, 442, 70, 22)
-    label("Memory", 4, 472, 54, 20, "Right", 11)
-    meterbar("GwMemMeter", "Gateway~Memory Meter", 62, 472, 170, 18, C.amber)
-    value("GwMem", "Gateway~Memory", 238, 470, 70, 22)
-    label("Load", 16, 498, 40, 20)
-    value("GwLoad", "Gateway~Load", 62, 496, 246, 22, { TextColor = C.sub, FontSize = 11 })
-    label("Temp", 16, 522, 40, 20)
-    value("GwTemp", "Gateway~Temperature", 62, 520, 246, 22, { TextColor = C.sub, FontSize = 11 })
+    ui.section("Gateway", 8, 400, 308, 144)
+    ui.label("CPU", 16, 434, 40, 20)
+    ui.meter("GwCpuMeter", "Gateway~CPU Meter", 64, 436, 168, 16, S.ok)
+    ui.readout("GwCpu", "Gateway~CPU", 240, 432, 64, 24, { HTextAlign = "Right" })
+    ui.label("Memory", 8, 462, 48, 20, "Right", 10)
+    ui.meter("GwMemMeter", "Gateway~Memory Meter", 64, 464, 168, 16, S.warn)
+    ui.readout("GwMem", "Gateway~Memory", 240, 460, 64, 24, { HTextAlign = "Right" })
+    ui.label("Load", 16, 492, 40, 20)
+    ui.value("GwLoad", "Gateway~Load", 64, 492, 240, 20, mono({ TextColor = N.sub }))
+    ui.label("Temp", 16, 516, 40, 20)
+    ui.value("GwTemp", "Gateway~Temperature", 64, 516, 240, 20, mono({ TextColor = N.sub }))
 
-    box("Health", 324, 416, 308, 132)
+    ui.section("Health", 324, 400, 308, 144)
     for i, h in ipairs(HEALTH) do
-      local y = 440 + (i - 1) * 21
-      led("HealthLed " .. i, "Health~" .. h[2] .. " LED", 334, y + 2, 16)
-      label(h[2], 354, y, 62, 20, "Left", 11, C.text)
-      value("HealthText " .. i, "Health~" .. h[2], 418, y, 206, 20, { TextColor = C.sub, FontSize = 11 })
+      local y = 430 + (i - 1) * 22
+      ui.row(332, y, 292, 20, i)
+      ui.led("HealthLed " .. i, "Health~" .. h[2] .. " LED", 336, y + 2, 16, "ok")
+      ui.label(h[2], 358, y, 60, 20, "Left", 11, N.text)
+      ui.value("HealthText " .. i, "Health~" .. h[2], 420, y, 200, 20, { TextColor = N.sub, FontSize = 11 })
     end
 
-    box("Counts", 8, 556, 624, 76)
+    ui.section("Counts", 8, 552, 624, 88)
     local counts = { { "ClientsTotal", "Clients" }, { "ClientsWired", "Wired" }, { "ClientsWireless", "Wireless" }, { "ClientsGuest", "Guests" },
                      { "DevicesOnline", "Devices" }, { "APCount", "APs" }, { "SwitchCount", "Switches" }, { "VpnUsers", "VPN Users" } }
     for i, c in ipairs(counts) do
       local col, row = (i - 1) % 4, math.floor((i - 1) / 4)
-      local x, y = 16 + col * 154, 582 + row * 24
-      label(c[2], x, y + 1, 66, 20)
-      if c[1] == "DevicesOnline" then
-        value(c[1], "Counts~" .. c[2], x + 72, y, 76, 22, { FontStyle = "Bold" })
-      else
-        layout[c[1]] = { PrettyName = "Counts~" .. c[2], Style = "Text", Position = { x + 72, y }, Size = { 76, 22 }, FontSize = 12,
-          FontStyle = "Bold", Color = C.panel, TextColor = C.text, HTextAlign = "Left", StrokeWidth = 0 }
-      end
+      local x, y = 16 + col * 152, 584 + row * 28
+      ui.label(c[2], x, y + 2, 64, 20)
+      ui.readout(c[1], "Counts~" .. c[2], x + 72, y, 72, 24, { FontStyle = "Medium" })
     end
+    ui.hint("Live rate at the gateway's WAN port. Meter full scale is set in Properties.", 648)
 
   elseif page == "Clients" then
-    box("Clients", 8, 64, 624, 60)
-    label("Show", 16, 92, 38, 20)
-    combo("ClientFilter", "Clients~Filter", 60, 90, 112, 24)
-    label("Sort", 176, 92, 34, 20)
-    combo("ClientSort", "Clients~Sort", 214, 90, 120, 24)
-    label("Search", 338, 92, 48, 20)
-    textbox("ClientSearch", "Clients~Search", 390, 90, 130, 24, { HTextAlign = "Left" })
-    value("ClientCount", "Clients~Count", 526, 90, 98, 24, { TextColor = C.sub, FontSize = 11 })
+    ui.section("Clients", 8, 64, 624, 64)
+    ui.label("Show", 16, 98, 40, 20)
+    ui.combo("ClientFilter", "Clients~Filter", 64, 96, 112, 24)
+    ui.label("Sort", 176, 98, 40, 20)
+    ui.combo("ClientSort", "Clients~Sort", 224, 96, 120, 24)
+    ui.label("Search", 344, 98, 56, 20)
+    ui.field("ClientSearch", "Clients~Search", 408, 96, 128, 24, { Font = "Roboto", FontStyle = "Regular" })
+    ui.value("ClientCount", "Clients~Count", 544, 98, 80, 20, { TextColor = N.sub, FontSize = 11 })
 
-    box("Connected Clients", 8, 132, 624, 388)
-    local cols = { { "Name", 20, 148 }, { "IP Address", 172, 98 }, { "MAC Address", 274, 116 }, { "Connection", 394, 100 },
-                   { "Down", 498, 48 }, { "Up", 550, 48 } }
-    for _, c in ipairs(cols) do label(c[1], c[2] + 2, 156, c[3] - 2, 18, "Left", 10, C.sub, "Bold") end
-    label("Down / Up in Mbps", 420, 138, 200, 16, "Right", 10, C.sub)
+    ui.section("Connected Clients", 8, 136, 624, 392)
+    ui.label("Down / Up in Mbps", 424, 142, 200, 16, "Right", 10, N.dim)
+    local cols = { { "Name", 18, 148 }, { "IP Address", 170, 96 }, { "MAC Address", 270, 116 }, { "Connection", 390, 100 },
+                   { "Down", 494, 50, "Right" }, { "Up", 548, 48, "Right" } }
+    for _, c in ipairs(cols) do colhead(c[1], c[2] + 2, 164, c[3] - 4, c[4]) end
     for i = 1, CLIENT_ROWS do
-      local y = 176 + (i - 1) * 24
-      strip(20, y - 1, 580, 22, (i % 2 == 0) and C.tile or C.row)
-      button("ClientSel " .. i, "", 20, y, 148, 20, C.accentD, { OffColor = (i % 2 == 0) and C.tile or C.row, FontSize = 11, HTextAlign = "Left", CornerRadius = 3 })
-      cell("ClientIP " .. i, "Clients~IP " .. i, 172, y, 98, { Color = (i % 2 == 0) and C.tile or C.row })
-      cell("ClientMAC " .. i, "Clients~MAC " .. i, 274, y, 116, { Color = (i % 2 == 0) and C.tile or C.row, TextColor = C.sub })
-      cell("ClientConn " .. i, "Clients~Connection " .. i, 394, y, 100, { Color = (i % 2 == 0) and C.tile or C.row })
-      cell("ClientDown " .. i, "Clients~Down " .. i, 498, y, 48, { Color = (i % 2 == 0) and C.tile or C.row, HTextAlign = "Right" })
-      cell("ClientUp " .. i, "Clients~Up " .. i, 550, y, 48, { Color = (i % 2 == 0) and C.tile or C.row, HTextAlign = "Right" })
+      local y = 184 + (i - 1) * 24
+      ui.row(16, y - 1, 584, 22, i)
+      rowsel("ClientSel " .. i, 18, y, 148)
+      cell("ClientIP " .. i, "Clients~IP " .. i, 170, y, 96, mono())
+      cell("ClientMAC " .. i, "Clients~MAC " .. i, 270, y, 116, mono({ TextColor = N.sub, FontSize = 10 }))
+      cell("ClientConn " .. i, "Clients~Connection " .. i, 390, y, 100)
+      cell("ClientDown " .. i, "Clients~Down " .. i, 494, y, 50, mono({ HTextAlign = "Right" }))
+      cell("ClientUp " .. i, "Clients~Up " .. i, 548, y, 48, mono({ HTextAlign = "Right" }))
     end
-    scrollbar("Client", "Clients", 604, 176, 334)
+    scrollbar("Client", "Clients", 604, 184, 334)
 
-    box("Selected Client", 8, 528, 624, 160)
+    ui.section("Selected Client", 8, 536, 624, 176)
     local left = { { "SelName", "Name" }, { "SelIP", "IP / MAC" }, { "SelType", "Type" }, { "SelUplink", "Uplink" } }
     local right = { { "SelSignal", "Signal" }, { "SelLinkRate", "Link Rate" }, { "SelRate", "Down / Up" }, { "SelConnected", "Connected" } }
     for i, f in ipairs(left) do
-      local y = 554 + (i - 1) * 26
-      label(f[2], 16, y + 1, 64, 20)
-      value(f[1], "Selected~" .. f[2], 86, y, 230, 22, (i == 1) and { FontStyle = "Bold" } or nil)
+      local y = 568 + (i - 1) * 26
+      ui.label(f[2], 16, y, 64, 20)
+      ui.value(f[1], "Selected~" .. f[2], 88, y, 224, 20, (i == 1) and { FontStyle = "Bold", FontSize = 13 } or nil)
     end
     for i, f in ipairs(right) do
-      local y = 554 + (i - 1) * 26
-      label(f[2], 322, y + 1, 70, 20)
-      value(f[1], "Selected~" .. f[2], 398, y, 222, 22)
+      local y = 568 + (i - 1) * 26
+      ui.label(f[2], 320, y, 72, 20)
+      ui.value(f[1], "Selected~" .. f[2], 400, y, 216, 20)
     end
-    label("Network", 16, 659, 64, 20)
-    value("SelNetwork", "Selected~Network", 86, 658, 140, 22, { TextColor = C.sub, FontSize = 11 })
-    value("SelAccess", "Selected~Access", 230, 658, 140, 22, { TextColor = C.sub, FontSize = 11 })
-    label("Min", 368, 659, 30, 20)
-    layout["GuestMinutes"] = { PrettyName = "Selected~Guest Minutes", Style = "Text", Position = { 402, 658 }, Size = { 52, 22 }, FontSize = 11, Color = C.field, TextColor = C.text }
-    button("GuestAuthorize", "Authorize", 460, 656, 78, 26, C.green, { OffColor = { 40, 120, 50 }, FontSize = 11 })
-    button("GuestUnauthorize", "Revoke", 542, 656, 78, 26, C.red, { OffColor = { 120, 44, 42 }, FontSize = 11 })
+    ui.label("Network", 16, 678, 64, 20)
+    ui.value("SelNetwork", "Selected~Network", 88, 678, 136, 20, { TextColor = N.sub, FontSize = 11 })
+    ui.value("SelAccess", "Selected~Access", 228, 678, 128, 20, { TextColor = N.sub, FontSize = 11 })
+    ui.label("Min", 360, 678, 32, 20)
+    ui.field("GuestMinutes", "Selected~Guest Minutes", 400, 676, 56, 24, { HTextAlign = "Center", FontSize = 11 })
+    ui.button("GuestAuthorize", "Authorize", 464, 674, 72, 28, "ok", { FontSize = 11 })
+    ui.button("GuestUnauthorize", "Revoke", 544, 674, 72, 28, "danger", { FontSize = 11 })
+    ui.hint("Tap a name for details. Authorize and Revoke apply to guest clients only.", 720)
 
   elseif page == "Devices" then
-    box("Devices", 8, 64, 624, 60)
-    label("Show", 16, 92, 38, 20)
-    combo("DeviceFilter", "Devices~Filter", 60, 90, 150, 24)
-    value("DeviceCount", "Devices~Count", 220, 90, 400, 24, { TextColor = C.sub, FontSize = 11 })
+    ui.section("Devices", 8, 64, 624, 64)
+    ui.label("Show", 16, 98, 40, 20)
+    ui.combo("DeviceFilter", "Devices~Filter", 64, 96, 152, 24)
+    ui.value("DeviceCount", "Devices~Count", 224, 98, 392, 20, { TextColor = N.sub, FontSize = 11 })
 
-    box("UniFi Devices", 8, 132, 624, 292)
-    local cols = { { "Name", 38, 142 }, { "Model", 184, 72 }, { "IP Address", 260, 92 }, { "Firmware", 356, 94 }, { "Status", 454, 146 } }
-    for _, c in ipairs(cols) do label(c[1], c[2] + 2, 156, c[3] - 2, 18, "Left", 10, C.sub, "Bold") end
+    ui.section("UniFi Devices", 8, 136, 624, 296)
+    local cols = { { "Name", 40, 140 }, { "Model", 184, 72 }, { "IP Address", 260, 92 }, { "Firmware", 356, 94 }, { "Status", 454, 146 } }
+    for _, c in ipairs(cols) do colhead(c[1], c[2] + 2, 164, c[3] - 4) end
     for i = 1, DEVICE_ROWS do
-      local y = 176 + (i - 1) * 24
-      local rc = (i % 2 == 0) and C.tile or C.row
-      strip(20, y - 1, 580, 22, rc)
-      led("DeviceLed " .. i, "Devices~LED " .. i, 21, y + 2, 16)
-      button("DeviceSel " .. i, "", 38, y, 142, 20, C.accentD, { OffColor = rc, FontSize = 11, HTextAlign = "Left", CornerRadius = 3 })
-      cell("DeviceModel " .. i, "Devices~Model " .. i, 184, y, 72, { Color = rc, TextColor = C.sub })
-      cell("DeviceIP " .. i, "Devices~IP " .. i, 260, y, 92, { Color = rc })
-      cell("DeviceFw " .. i, "Devices~Firmware " .. i, 356, y, 94, { Color = rc })
-      cell("DeviceInfo " .. i, "Devices~Status " .. i, 454, y, 146, { Color = rc, TextColor = C.sub })
+      local y = 184 + (i - 1) * 24
+      ui.row(16, y - 1, 584, 22, i)
+      ui.led("DeviceLed " .. i, "Devices~LED " .. i, 20, y + 2, 16, "ok")
+      rowsel("DeviceSel " .. i, 40, y, 140)
+      cell("DeviceModel " .. i, "Devices~Model " .. i, 184, y, 72, { TextColor = N.sub })
+      cell("DeviceIP " .. i, "Devices~IP " .. i, 260, y, 92, mono())
+      cell("DeviceFw " .. i, "Devices~Firmware " .. i, 356, y, 94, mono())
+      cell("DeviceInfo " .. i, "Devices~Status " .. i, 454, y, 146, { TextColor = N.sub })
     end
-    scrollbar("Device", "Devices", 604, 176, 238)
+    scrollbar("Device", "Devices", 604, 184, 238)
 
-    box("Selected Device", 8, 432, 624, 250)
+    ui.section("Selected Device", 8, 440, 624, 280)
     local left = { { "DevName", "Name" }, { "DevMAC", "MAC" }, { "DevFirmware", "Firmware" }, { "DevUptime", "Uptime" }, { "DevLoad", "Load" } }
     local right = { { "DevModel", "Model" }, { "DevIP", "IP" }, { "DevState", "State" }, { "DevUplink", "Uplink" }, { "DevUplinkRate", "Uplink Rate" } }
     for i, f in ipairs(left) do
-      local y = 458 + (i - 1) * 26
-      label(f[2], 16, y + 1, 62, 20)
-      value(f[1], "Device~" .. f[2], 84, y, 232, 22, (i == 1) and { FontStyle = "Bold" } or nil)
+      local y = 472 + (i - 1) * 26
+      ui.label(f[2], 16, y, 64, 20)
+      ui.value(f[1], "Device~" .. f[2], 88, y, 224, 20, (i == 1) and { FontStyle = "Bold", FontSize = 13 } or nil)
     end
     for i, f in ipairs(right) do
-      local y = 458 + (i - 1) * 26
-      label(f[2], 322, y + 1, 70, 20)
-      value(f[1], "Device~" .. f[2], 398, y, 222, 22)
+      local y = 472 + (i - 1) * 26
+      ui.label(f[2], 320, y, 72, 20)
+      ui.value(f[1], "Device~" .. f[2], 400, y, 216, 20)
     end
-    label("CPU", 16, 589, 62, 20)
-    meterbar("DevCpuMeter", "Device~CPU Meter", 84, 590, 150, 16, C.green)
-    value("DevCpu", "Device~CPU", 240, 586, 76, 22)
-    label("Memory", 322, 589, 70, 20)
-    meterbar("DevMemMeter", "Device~Memory Meter", 398, 590, 140, 16, C.amber)
-    value("DevMem", "Device~Memory", 544, 586, 76, 22)
+    ui.label("CPU", 16, 606, 64, 20)
+    ui.meter("DevCpuMeter", "Device~CPU Meter", 88, 608, 144, 16, S.ok)
+    ui.readout("DevCpu", "Device~CPU", 240, 604, 72, 24, { HTextAlign = "Right" })
+    ui.label("Memory", 320, 606, 72, 20)
+    ui.meter("DevMemMeter", "Device~Memory Meter", 400, 608, 136, 16, S.warn)
+    ui.readout("DevMem", "Device~Memory", 544, 604, 72, 24, { HTextAlign = "Right" })
+    ui.label("Radios", 16, 638, 64, 20)
     for i = 1, RADIO_LINES do
       local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
-      if i == 1 then label("Radios", 16, 615, 62, 20) end
-      value("DevRadio " .. i, "Device~Radio " .. i, 84 + col * 236, 614 + row * 22, 230, 20, { TextColor = C.sub, FontSize = 11 })
+      ui.value("DevRadio " .. i, "Device~Radio " .. i, 88 + col * 312, 638 + row * 22, 224 - col * 8, 20, { TextColor = N.sub, FontSize = 11 })
     end
-    value("DevActionStatus", "Device~Action Status", 84, 660, 360, 20, { TextColor = C.amber, FontSize = 11 })
-    button("DevRestart", "Restart", 500, 652, 120, 26, C.red, { OffColor = { 120, 44, 42 }, FontStyle = "Bold" })
+    ui.value("DevActionStatus", "Device~Action Status", 88, 688, 400, 20, { TextColor = S.warn, FontSize = 11 })
+    ui.button("DevRestart", "Restart", 504, 684, 112, 28, "danger")
+    ui.hint("Tap a device for details. Restart drops every client on that device.", 728)
 
   elseif page == "Ports" then
-    box("Device", 8, 64, 624, 60)
-    label("Device", 16, 92, 50, 20)
-    combo("PortDevice", "Ports~Device", 72, 90, 250, 24)
-    value("PortSummary", "Ports~Summary", 330, 90, 290, 24, { TextColor = C.sub, FontSize = 11 })
+    ui.section("Device", 8, 64, 624, 64)
+    ui.label("Device", 16, 98, 48, 20)
+    ui.combo("PortDevice", "Ports~Device", 72, 96, 248, 24)
+    ui.value("PortSummary", "Ports~Summary", 328, 98, 288, 20, { TextColor = N.sub, FontSize = 11 })
 
-    box("Ports", 8, 132, 624, 340)
-    local cols = { { "Port", 38, 60 }, { "Name", 102, 120 }, { "Link", 226, 100 }, { "Type", 330, 60 }, { "PoE", 394, 90 },
-                   { "Rx", 488, 54 }, { "Tx", 546, 54 } }
-    for _, c in ipairs(cols) do label(c[1], c[2] + 2, 156, c[3] - 2, 18, "Left", 10, C.sub, "Bold") end
-    label("Rx / Tx in Mbps", 420, 138, 200, 16, "Right", 10, C.sub)
+    ui.section("Ports", 8, 136, 624, 344)
+    ui.label("Rx / Tx in Mbps", 424, 142, 200, 16, "Right", 10, N.dim)
+    local cols = { { "Port", 40, 60, "Center" }, { "Name", 104, 120 }, { "Link", 228, 100 }, { "Type", 332, 60 }, { "PoE", 396, 92 },
+                   { "Rx", 492, 50, "Right" }, { "Tx", 546, 52, "Right" } }
+    for _, c in ipairs(cols) do colhead(c[1], c[2] + 2, 164, c[3] - 4, c[4]) end
     for i = 1, PORT_ROWS do
-      local y = 176 + (i - 1) * 24
-      local rc = (i % 2 == 0) and C.tile or C.row
-      strip(20, y - 1, 580, 22, rc)
-      led("PortLed " .. i, "Ports~LED " .. i, 21, y + 2, 16)
-      button("PortSel " .. i, "", 38, y, 60, 20, C.accentD, { OffColor = rc, FontSize = 11, CornerRadius = 3 })
-      cell("PortName " .. i, "Ports~Name " .. i, 102, y, 120, { Color = rc })
-      cell("PortLink " .. i, "Ports~Link " .. i, 226, y, 100, { Color = rc })
-      cell("PortConn " .. i, "Ports~Type " .. i, 330, y, 60, { Color = rc, TextColor = C.sub })
-      cell("PortPoe " .. i, "Ports~PoE " .. i, 394, y, 90, { Color = rc, TextColor = C.sub })
-      cell("PortRx " .. i, "Ports~Rx " .. i, 488, y, 54, { Color = rc, HTextAlign = "Right" })
-      cell("PortTx " .. i, "Ports~Tx " .. i, 546, y, 54, { Color = rc, HTextAlign = "Right" })
+      local y = 184 + (i - 1) * 24
+      ui.row(16, y - 1, 584, 22, i)
+      ui.led("PortLed " .. i, "Ports~LED " .. i, 20, y + 2, 16, "ok")
+      rowsel("PortSel " .. i, 40, y, 60, "Center")
+      cell("PortName " .. i, "Ports~Name " .. i, 104, y, 120)
+      cell("PortLink " .. i, "Ports~Link " .. i, 228, y, 100, mono())
+      cell("PortConn " .. i, "Ports~Type " .. i, 332, y, 60, { TextColor = N.sub })
+      cell("PortPoe " .. i, "Ports~PoE " .. i, 396, y, 92, { TextColor = N.sub })
+      cell("PortRx " .. i, "Ports~Rx " .. i, 492, y, 50, mono({ HTextAlign = "Right" }))
+      cell("PortTx " .. i, "Ports~Tx " .. i, 546, y, 52, mono({ HTextAlign = "Right" }))
     end
-    scrollbar("Port", "Ports", 604, 176, 286)
+    scrollbar("Port", "Ports", 604, 184, 286)
 
-    box("Selected Port", 8, 480, 624, 96)
-    value("PortSelInfo", "Port~Info", 16, 506, 604, 24, { FontStyle = "Bold" })
-    value("PortActionStatus", "Port~Action Status", 16, 540, 470, 24, { TextColor = C.amber, FontSize = 11 })
-    button("PortPowerCycle", "PoE Power Cycle", 490, 538, 130, 28, C.red, { OffColor = { 120, 44, 42 }, FontStyle = "Bold" })
+    ui.section("Selected Port", 8, 488, 624, 104)
+    ui.value("PortSelInfo", "Port~Info", 16, 520, 600, 24, { FontStyle = "Bold", FontSize = 13 })
+    ui.value("PortActionStatus", "Port~Action Status", 16, 556, 464, 20, { TextColor = S.warn, FontSize = 11 })
+    ui.button("PortPowerCycle", "PoE Power Cycle", 488, 552, 128, 28, "danger")
+    ui.hint("Tap a port for its summary. PoE Power Cycle cuts power to the device on that port.", 600)
 
   elseif page == "Setup" then
-    box("Connection", 8, 64, 624, 236)
-    label("Console IP", 16, 94, 100, 20)
-    textbox("IPAddress", "Setup~IP Address", 122, 92, 200, 26, { HTextAlign = "Left" })
-    button("Connect", "Connect / Refresh", 470, 92, 150, 26, C.accent, { OffColor = { 0, 86, 200 }, FontStyle = "Bold" })
-    label("API Key", 16, 130, 100, 20)
-    textbox("ApiKey", "Setup~API Key", 122, 128, 498, 26, { HTextAlign = "Left", FontSize = 11 })
-    label("Site", 16, 166, 100, 20)
-    textbox("SiteName", "Setup~Site Name", 122, 164, 200, 26, { HTextAlign = "Left" })
-    label("Blank = first site (\"Default\")", 330, 168, 290, 18, "Left", 10)
-    label("Local user", 16, 202, 100, 20)
-    textbox("Username", "Setup~Username", 122, 200, 160, 26, { HTextAlign = "Left" })
-    label("Password", 284, 202, 70, 20)
-    textbox("Password", "Setup~Password", 360, 200, 160, 26, { HTextAlign = "Left" })
-    label("(optional)", 526, 204, 90, 18, "Left", 10)
-    label("Create the key in UniFi Network > Settings > Control Plane > Integrations. The local user is only", 16, 234, 604, 16, "Left", 10)
-    label("needed if Extended Stats are refused with the API key on your Network version.", 16, 250, 604, 16, "Left", 10)
-    label("Last Error", 16, 272, 100, 20)
-    value("LastError", "Setup~Last Error", 122, 270, 498, 24, { Color = C.field, StrokeWidth = 1, TextColor = C.amber, FontSize = 11 })
+    ui.section("Connection", 8, 64, 624, 192)
+    ui.label("Console IP", 16, 98, 96, 20)
+    ui.field("IPAddress", "Setup~IP Address", 120, 96, 200, 24)
+    ui.button("Connect", "Connect / Refresh", 472, 94, 144, 28, "secondary", { FontStyle = "Medium" })
+    ui.label("API Key", 16, 130, 96, 20)
+    ui.field("ApiKey", "Setup~API Key", 120, 128, 496, 24, { FontSize = 11 })
+    ui.label("Site", 16, 162, 96, 20)
+    ui.field("SiteName", "Setup~Site Name", 120, 160, 200, 24)
+    ui.label("Blank = first site (\"Default\")", 328, 162, 288, 20, "Left", 10, N.dim)
+    ui.label("Local user", 16, 194, 96, 20)
+    ui.field("Username", "Setup~Username", 120, 192, 160, 24)
+    ui.label("Password", 280, 194, 72, 20)
+    ui.field("Password", "Setup~Password", 360, 192, 160, 24)
+    ui.label("(optional)", 528, 194, 88, 20, "Left", 10, N.dim)
+    ui.label("Last Error", 16, 226, 96, 20)
+    ui.readout("LastError", "Setup~Last Error", 120, 224, 496, 24, { TextColor = S.warn, FontSize = 11 })
 
-    box("Console Information", 8, 308, 624, 200)
+    ui.section("Console Information", 8, 264, 624, 192)
     local info = { { "AppVersion", "Network App" }, { "SiteId", "Site" }, { "ApiMode", "APIs" }, { "Counts", "Contents" }, { "LastUpdate", "Last Update" } }
     for i, f in ipairs(info) do
-      local y = 336 + (i - 1) * 32
-      label(f[2], 16, y + 2, 100, 20)
-      value(f[1], "Setup~" .. f[2], 122, y, 498, 24, { Color = C.field, StrokeWidth = 1, FontSize = 11 })
+      local y = 296 + (i - 1) * 32
+      ui.label(f[2], 16, y + 2, 96, 20)
+      ui.readout(f[1], "Setup~" .. f[2], 120, y, 496, 24, { FontSize = 11 })
     end
+    ui.hint("API key: Settings > Control Plane > Integrations. Local user only if Extended Stats fail.", 464)
   end
 
   return layout, graphics
@@ -900,9 +1060,9 @@ if Controls then
   end
 
   local function stateColor(state)
-    if state == "ONLINE" then return "#3EB54A"
-    elseif state == "OFFLINE" or state == "CONNECTION_INTERRUPTED" or state == "ISOLATED" then return "#D64541" end
-    return "#F0A528"
+    if state == "ONLINE" then return "#00F0FF"
+    elseif state == "OFFLINE" or state == "CONNECTION_INTERRUPTED" or state == "ISOLATED" then return "#FF2A4F" end
+    return "#FFB020"
   end
 
   local function renderSelectedDevice()
@@ -1037,7 +1197,7 @@ if Controls then
       b.Boolean = p ~= nil and num(p.idx) == selPortIdx
       b.IsDisabled = (p == nil)
       Controls.PortLed[i].Boolean = p ~= nil and p.state == "UP"
-      Controls.PortLed[i].Color = "#3EB54A"
+      Controls.PortLed[i].Color = "#00F0FF"
       Controls.PortName[i].String = (l and str(l.name)) or ""
       if p then
         local link = (p.state == "UP" and p.speedMbps) and (fmtSpeed(p.speedMbps) .. " / " .. fmtSpeed(p.maxSpeedMbps)) or (str(p.state):lower() .. " / " .. fmtSpeed(p.maxSpeedMbps))
@@ -1104,7 +1264,7 @@ if Controls then
     local inetOk = www and str(www.status) == "ok"
     if www == nil then inetOk = wanOk end
     Controls.InternetUp.Boolean = inetOk == true
-    Controls.InternetUp.Color = (inetOk == true) and "#3EB54A" or "#D64541"
+    Controls.InternetUp.Color = (inetOk == true) and "#00F0FF" or "#FF2A4F"
     if wan or gd then
       Controls.WanStatus.String = (inetOk and "Internet OK") or (wanOk and "WAN up, no internet") or "WAN down"
     else
@@ -1187,7 +1347,7 @@ if Controls then
       local s = health[h[1]]
       local st = s and str(s.status) or ""
       Controls.HealthLed[i].Boolean = st ~= ""
-      Controls.HealthLed[i].Color = (st == "ok") and "#3EB54A" or ((st == "unknown" or st == "") and "#5A5A5A" or (st == "warning" and "#F0A528" or "#D64541"))
+      Controls.HealthLed[i].Color = (st == "ok") and "#00F0FF" or ((st == "unknown" or st == "") and "#343050" or (st == "warning" and "#FFB020" or "#FF2A4F"))
       local t = {}
       if st ~= "" then table.insert(t, st) end
       if s then

@@ -25,8 +25,8 @@
 
 PluginInfo = {
   Name = "Radio~FlexRadio FLEX-6600 (SmartSDR)",
-  Version = "1.0",
-  BuildVersion = "1.0.0.0",
+  Version = "1.1",
+  BuildVersion = "1.1.0.0",
   Id = "c4f1a2e8-6600-4b7d-9e3a-5f2d8a1c0b66",
   Author = "AV Programming",
   Description = "Control a FlexRadio FLEX-6600 (FLEX-6000 series) over the SmartSDR TCP/IP API: slices, band, mode, filter, AF gain, AGC, noise reduction, squelch, RIT, antennas, line out, guarded transmit with ATU, power, SWR and status meters.",
@@ -140,33 +140,34 @@ function GetControls(props)
   }
 end
 
---[[ Console theme for Q-SYS plugins, v1.0 (2026-10-14): copied unchanged from the project style guide (qsys-plugin-style-guide/theme.lua). ]]
+--[[ Console theme for Q-SYS plugins, v1.1 (2026-10-14): copied unchanged from the project style guide (qsys-plugin-style-guide/theme.lua). ]]
 local Theme = {}
 
 Theme.W = 640   -- page width; every page is 640 wide
 Theme.GRID = 8  -- positions and sizes snap to 8 (4 for fine alignment inside a row)
 
 -- Neutrals: shared by every plugin. Never brand-tint these.
+-- Violet "dusk" greys, lifted off black; text colors come from home-dash.
 Theme.N = {
-  bg      = { 22, 24, 29 },    -- chassis: page background
-  panel   = { 34, 37, 44 },    -- rack panel: sections
-  strip   = { 27, 30, 36 },    -- channel strip / tile inside a section
-  rowAlt  = { 31, 34, 41 },    -- alternate list row
-  well    = { 12, 13, 16 },    -- recessed display: readouts, fields, meters, hint bar
-  stroke  = { 58, 63, 74 },    -- 1 px outlines
-  btn     = { 52, 56, 66 },    -- button off state
-  btnOn   = { 78, 84, 98 },    -- utility button on state
-  ledOff  = { 46, 49, 56 },
-  text    = { 232, 234, 238 },
-  sub     = { 150, 157, 170 }, -- labels, section titles
-  dim     = { 104, 110, 122 }, -- units, captions
+  bg      = { 24, 22, 40 },    -- chassis: page background
+  panel   = { 36, 33, 58 },    -- rack panel: sections
+  strip   = { 30, 28, 50 },    -- channel strip / tile inside a section
+  rowAlt  = { 41, 38, 66 },    -- alternate list row
+  well    = { 15, 14, 28 },    -- recessed display: readouts, fields, meters, hint bar
+  stroke  = { 66, 60, 100 },   -- 1 px outlines
+  btn     = { 54, 50, 86 },    -- button off state
+  btnOn   = { 84, 78, 126 },   -- utility button on state
+  ledOff  = { 52, 48, 80 },
+  text    = { 217, 238, 242 }, -- home-dash --text
+  sub     = { 156, 199, 207 }, -- home-dash --text-soft: labels, section titles
+  dim     = { 122, 128, 162 }, -- units, captions
 }
 
--- Semantic colors: same meaning in every plugin, never used as a brand accent.
+-- Semantic colors (home-dash): same meaning in every plugin, never used as a brand accent.
 Theme.S = {
-  ok    = { 62, 181, 74 },   -- online, connected, healthy
-  warn  = { 240, 165, 40 },  -- attention, identify, solo-style latches
-  fault = { 214, 69, 65 },   -- offline, error, destructive actions
+  ok    = { 0, 240, 255 },   -- cyan: online, connected, healthy
+  warn  = { 255, 176, 32 },  -- amber: attention, identify
+  fault = { 255, 42, 79 },   -- hot red: offline, error, destructive actions
 }
 
 function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
@@ -178,7 +179,7 @@ end
 -- Derives the brand set from one accent RGB.
 function Theme.brand(accent)
   return {
-    accent = accent,                              -- active state, fader fill, header outline, section tab
+    accent = accent,                              -- active state, fader fill, header outline
     dim    = Theme.mix(accent, Theme.N.bg, 0.55),  -- secondary action off state
     pad    = Theme.mix(accent, Theme.N.panel, 0.78), -- pad off state (lit-but-idle step button)
     ink    = Theme.mix(accent, { 255, 255, 255 }, 0.35), -- accent-colored text on dark (page tab)
@@ -210,14 +211,31 @@ function Theme.kit(layout, graphics, accent)
   end
 
   -- Transport-bar header: wordmark, page tab, device name readout, Status, Online LED.
+  -- Sliced sun (home-dash brand mark): cyan to red bands, slices in the lower half.
+  -- s should be a multiple of 4; the gaps show whatever is drawn underneath.
+  function ui.sun(x, y, s)
+    local r, rows = s / 2, s / 2
+    for i = 0, rows - 1 do
+      local yy = i * 2
+      local lower = yy >= r
+      if not lower or ((yy - r) / 2) % 2 == 0 then
+        local dy = yy + 1 - r
+        local hw = math.floor(math.sqrt(math.max(r * r - dy * dy, 0)) + 0.5)
+        g({ Type = "GroupBox", Fill = Theme.mix(S.ok, S.fault, yy / (s - 2)), StrokeWidth = 0, CornerRadius = 0,
+            Position = { x + r - hw, y + yy }, Size = { hw * 2, 2 } })
+      end
+    end
+  end
+
   function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl)
     g({ Type = "GroupBox", Fill = N.panel, StrokeColor = B.accent, StrokeWidth = 1, CornerRadius = 6,
         Position = { 8, 8 }, Size = { 624, 48 } })
+    ui.sun(20, 18, 28)
     g({ Type = "Label", Text = wordmark, Font = DISPLAY, FontStyle = "Bold", FontSize = 20, HTextAlign = "Left",
-        Color = N.text, Position = { 20, 16 }, Size = { 116, 32 } })
+        Color = N.text, Position = { 56, 16 }, Size = { 96, 32 } })
     g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Bold", FontSize = 10,
         HTextAlign = "Center", Color = B.ink, Fill = B.pad, CornerRadius = 10, StrokeWidth = 0,
-        Position = { 140, 22 }, Size = { 96, 20 } })
+        Position = { 156, 22 }, Size = { 84, 20 } })
     if nameCtl then ui.readout(nameCtl, nil, 248, 20, 196, 24) end
     if statusCtl then
       layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 452, 20 }, Size = { 140, 24 },
@@ -227,12 +245,15 @@ function Theme.kit(layout, graphics, accent)
   end
 
   -- Rack panel with a color-tab title (uppercase, like a console channel label).
+  -- The tab is the house cyan/red, not the brand accent.
   -- Content starts 32 px below y.
   function ui.section(title, x, y, w, h)
     g({ Type = "GroupBox", Fill = N.panel, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 6,
         Position = { x, y }, Size = { w, h } })
     if title and title ~= "" then
-      g({ Type = "GroupBox", Fill = B.accent, StrokeWidth = 0, CornerRadius = 1, Position = { x + 12, y + 10 }, Size = { 4, 12 } })
+      -- two-tone tab, cyan over red: the house sunset mark on every section
+      g({ Type = "GroupBox", Fill = S.ok, StrokeWidth = 0, CornerRadius = 0, Position = { x + 12, y + 10 }, Size = { 4, 6 } })
+      g({ Type = "GroupBox", Fill = S.fault, StrokeWidth = 0, CornerRadius = 0, Position = { x + 12, y + 16 }, Size = { 4, 6 } })
       ui.label(string.upper(title), x + 22, y + 6, w - 34, 20, "Left", 11, N.sub, "Medium")
     end
   end

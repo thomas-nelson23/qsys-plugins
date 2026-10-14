@@ -158,9 +158,14 @@ memories, DVK, memories, TX profiles, mic bias / boost and EQ, transverters, amp
   layout, meter class code `0x8002` and the meter value scaling.
 - Q-SYS TcpSocket reference: https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/TcpSocket.htm
 - Q-SYS UdpSocket reference: https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/UdpSocket.htm
-- Layout uses the project's Console theme v1.0 (`qsys-plugin-style-guide/theme.lua`), embedded unchanged.
+- Layout uses the project's Console theme v1.1 (`qsys-plugin-style-guide/theme.lua`), embedded unchanged.
 
 FlexLib itself (FlexRadio's C# library) is distributed with SmartSDR rather than published online, so it was not read directly;
 xLib6000 stands in for it where the wiki is silent. The FLEX-6600 figures used (4 receivers / slices, two SCUs, 100 W) are
 from the WiMo dealer listing (https://www.wimo.com/en/fr-6601); FlexRadio's own product page could not be read from the build
 environment.
+
+## Changelog
+
+- 1.1: restyled to the Console style guide v1.1 (vaporwave palette); no control or pin changes.
+- 1.0: first release.

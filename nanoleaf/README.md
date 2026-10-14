@@ -25,7 +25,9 @@
 | **Panels** | Panel count, global orientation, Identify (flash); pick an individual panel and set its RGB color, or set all panels, with a transition time |
 | **Setup** | IP, auth token, Pair/Unpair, last error, plus model, serial, firmware and manufacturer |
 
-The header on every page shows the device name, the Q-SYS status (OK / Fault / Not Present / Initializing) and an Online LED.
+The header on every page shows the device name, the Q-SYS status (OK / Fault / Not Present / Initializing) and a cyan Online LED.
+
+**Look:** the layout follows the Console style guide v1.1 (vaporwave palette): violet-grey panels, Nanoleaf green as the brand accent (effect pads, active buttons, faders), semantic cyan/amber/red for status LEDs and Identify/Unpair, and one hint line at the bottom of each page. Color swatches, the RGB/hue/kelvin faders and the quick-color buttons show their own colors.
 
 **Properties:** Port (default 16021), Poll Interval (default 3 s), and Debug Print (None / Errors / All).
 
@@ -42,7 +44,7 @@ Every control has a pin, so UCI buttons, control scripts and snapshots can drive
 **This plugin has not been run against a real Nanoleaf or a real Q-SYS Core.** The logic was tested in a Lua 5.3 harness with mocked Q-SYS controls, `HttpClient`, `Timer` and `rapidjson`, against a simulated Nanoleaf. That covered pairing (403 and 200), power, brightness, fade and step, RGB/hex/quick colors, white presets, effect select/next/prev/paging, per-panel static writes, identify, orientation, rhythm, write coalescing, going offline and coming back, and unpair. The layout previews (`preview_*.png`) are a close rendering, not a Designer screenshot.
 
 Check these on site:
-- **Layout styling:** that Designer renders the layout the same way. The plugin uses flat buttons, rounded corners, and runtime `.Color` on the swatch LEDs.
+- **Layout styling:** that Designer renders the layout the same way. The plugin uses flat buttons, rounded corners, `TextColor` for button and text colors (per the Q-SYS layout reference), and runtime `.Color` on the swatch LEDs.
 - **Per-panel color:** that `animType: "static"` behaves on your model and firmware. Some newer firmware may want a different `animData` format for large panel IDs.
 - **Unpair on older firmware:** unpair uses `HttpClient.Delete`. On Q-SYS firmware without it, unpair is skipped.
 - **Empty palette:** the static write's empty `palette` uses `rapidjson.array` when the Core provides it. Otherwise the field is left out.
@@ -60,3 +62,7 @@ Not included:
 - Cross-check of endpoints and JSON bodies: `nanoleafapi` Python library source, https://github.com/MylesMor/nanoleafapi
 
 The official Nanoleaf and Q-SYS developer pages could not be fully loaded from the build environment. Endpoint bodies were confirmed against the `nanoleafapi` source. The Q-SYS plugin layout properties (`GroupBox`/`Label` graphics, `Style`, `OffColor`, `CornerRadius`) follow the Q-SYS plugin conventions, so check them in Designer.
+
+## Changelog
+- 1.0: first release.
+- 1.1: restyled to the Console style guide (vaporwave palette); no control or pin changes.
