@@ -1,0 +1,1807 @@
+--[[ UniFi Network monitor plugin for Q-SYS
+  Reads a UniFi console (UDM Pro, UDM SE, UDR, UCG, Cloud Key) over the local
+  UniFi Network API: clients, WAN and network health, bandwidth, devices,
+  ports, radios and firmware. A few actions are included (device restart,
+  PoE power cycle, guest authorization, speed test).
+
+  Two local APIs are used:
+    Official UniFi Network API (Integration v1)  /proxy/network/integration/v1/...   X-API-KEY header
+    Legacy UniFi Network API ("Extended Stats")   /proxy/network/api/s/<site>/...    same API key, or a local login
+  The legacy API is not documented by Ubiquiti. It is only used for data the
+  official API does not have yet (per-client bandwidth and signal, WAN IP,
+  latency, speed test, per-port throughput). It can be turned off in Properties.
+
+  References:
+    UniFi Network API (official, served by the console under UniFi Network > Integrations)
+                                          - https://developer.ui.com/network/v10.6.106/gettingstarted
+    Getting Started with the Official UniFi API - https://help.ui.com/hc/en-us/articles/30076656117655
+    Network API OpenAPI spec v10.1.89, copy of /proxy/network/api-docs/integration.json
+                                          - https://github.com/jonshaffer/go-unifi (openapi/network-integration.json)
+    Legacy API field names                - https://github.com/unpoller/unifi (v5.31.0)
+    Q-SYS HttpClient                      - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/HttpClient.htm
+]]
+
+PluginInfo = {
+  Name = "Network~UniFi Network Monitor",
+  Version = "1.0",
+  BuildVersion = "1.0.0.0",
+  Id = "6b0e7f3a-3c2d-4f0e-9a51-2d8c1b7e4a90",
+  Author = "AV Programming",
+  Description = "Monitor a UniFi console (UDM Pro and others): client list with IP, MAC and bandwidth, WAN and network health, throughput, speed test, devices, ports, radios and firmware, over the local UniFi Network API.",
+  ShowDebug = true,
+}
+
+-- Palette ---------------------------------------------------------------
+local C = {
+  bg      = {22, 24, 29},
+  panel   = {34, 37, 44},
+  tile    = {27, 30, 36},
+  row     = {30, 33, 40},
+  stroke  = {58, 63, 74},
+  accent  = {0, 111, 255},    -- UniFi blue
+  accentD = {16, 52, 112},
+  text    = {232, 234, 238},
+  sub     = {150, 157, 170},
+  btn     = {52, 56, 66},
+  red     = {214, 69, 65},
+  amber   = {240, 165, 40},
+  green   = {62, 181, 74},
+  field   = {20, 22, 26},
+}
+
+local CLIENT_ROWS = 14
+local DEVICE_ROWS = 10
+local PORT_ROWS = 12
+local RADIO_LINES = 4
+local HEALTH = { { "wan", "WAN" }, { "www", "Internet" }, { "lan", "LAN" }, { "wlan", "WLAN" }, { "vpn", "VPN" } }
+
+local CLIENT_FILTERS = { "All", "Wired", "Wireless", "Guests", "VPN" }
+local CLIENT_SORTS = { "Name", "IP Address", "Bandwidth", "Connection", "Connected Time" }
+local DEVICE_FILTERS = { "All", "Gateways", "Switches", "Access Points", "Offline" }
+
+function GetColor(props)
+  return C.accent
+end
+
+function GetPrettyName(props)
+  return "UniFi Network Monitor v" .. PluginInfo.Version
+end
+
+local PageNames = { "Network", "Clients", "Devices", "Ports", "Setup" }
+
+function GetPages(props)
+  local pages = {}
+  for _, name in ipairs(PageNames) do table.insert(pages, { name = name }) end
+  return pages
+end
+
+function GetProperties()
+  return {
+    { Name = "Poll Interval (s)", Type = "integer", Min = 2, Max = 120, Value = 5 },
+    { Name = "Extended Stats", Type = "enum", Choices = { "On", "Off" }, Value = "On" },
+    { Name = "WAN Meter Scale (Mbps)", Type = "integer", Min = 10, Max = 100000, Value = 1000 },
+    { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
+  }
+end
+
+function RectifyProperties(props)
+  return props
+end
+
+function GetControls(props)
+  local function ind(name, count, pin) return { Name = name, ControlType = "Indicator", IndicatorType = "Text", Count = count, PinStyle = pin or "Output", UserPin = (pin ~= "None") } end
+  local function led(name, count) return { Name = name, ControlType = "Indicator", IndicatorType = "Led", Count = count, PinStyle = "Output", UserPin = true } end
+  local function meter(name) return { Name = name, ControlType = "Indicator", IndicatorType = "Meter", Min = 0, Max = 100, PinStyle = "None", UserPin = false } end
+  local function num(name, min, max) return { Name = name, ControlType = "Knob", ControlUnit = "Float", Min = min or 0, Max = max or 100000, PinStyle = "Output", UserPin = true } end
+  local function trig(name, count) return { Name = name, ControlType = "Button", ButtonType = "Trigger", Count = count, PinStyle = "Input", UserPin = true } end
+  local function text(name) return { Name = name, ControlType = "Text", PinStyle = "Both", UserPin = true } end
+  local function scroll(name) return { Name = name, ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, DefaultValue = 100, PinStyle = "None", UserPin = false } end
+
+  return {
+    -- header
+    { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true },
+    led("Online"),
+    ind("ConsoleName"),
+    -- network: internet / WAN
+    led("InternetUp"),
+    ind("WanStatus"), ind("WanIP"), ind("WanDetail"), ind("GatewayInfo"), ind("WanUptime"), ind("Latency"),
+    meter("WanDownMeter"), meter("WanUpMeter"), ind("WanDownText"), ind("WanUpText"),
+    num("WanDownMbps"), num("WanUpMbps"), num("LatencyMs", 0, 100000),
+    -- network: speed test
+    ind("SpeedDown"), ind("SpeedUp"), ind("SpeedPing"), ind("SpeedLastRun"), ind("SpeedStatus"),
+    trig("RunSpeedTest"),
+    -- network: gateway system
+    meter("GwCpuMeter"), meter("GwMemMeter"), ind("GwCpu"), ind("GwMem"), ind("GwLoad"), ind("GwTemp"),
+    num("GwCpuPct", 0, 100), num("GwMemPct", 0, 100),
+    -- network: subsystem health
+    led("HealthLed", #HEALTH), ind("HealthText", #HEALTH),
+    -- network: counts
+    num("ClientsTotal"), num("ClientsWired"), num("ClientsWireless"), num("ClientsGuest"),
+    ind("DevicesOnline"), num("APCount"), num("SwitchCount"), num("VpnUsers"),
+    ind("LanRate"), ind("WlanRate"),
+    -- clients
+    text("ClientFilter"), text("ClientSort"), text("ClientSearch"), ind("ClientCount"),
+    { Name = "ClientSel", ControlType = "Button", ButtonType = "Toggle", Count = CLIENT_ROWS, PinStyle = "Input", UserPin = true },
+    ind("ClientIP", CLIENT_ROWS), ind("ClientMAC", CLIENT_ROWS), ind("ClientConn", CLIENT_ROWS),
+    ind("ClientDown", CLIENT_ROWS), ind("ClientUp", CLIENT_ROWS),
+    scroll("ClientScroll"), trig("ClientScrollUp"), trig("ClientScrollDown"),
+    ind("SelName"), ind("SelIP"), ind("SelMAC"), ind("SelType"), ind("SelNetwork"), ind("SelUplink"),
+    ind("SelSignal"), ind("SelLinkRate"), ind("SelRate"), ind("SelConnected"), ind("SelAccess"),
+    { Name = "GuestMinutes", ControlType = "Knob", ControlUnit = "Integer", Min = 1, Max = 10080, DefaultValue = 480, PinStyle = "Input", UserPin = true },
+    trig("GuestAuthorize"), trig("GuestUnauthorize"),
+    text("ClientSelectMAC"),
+    -- devices
+    text("DeviceFilter"), ind("DeviceCount"),
+    led("DeviceLed", DEVICE_ROWS),
+    { Name = "DeviceSel", ControlType = "Button", ButtonType = "Toggle", Count = DEVICE_ROWS, PinStyle = "Input", UserPin = true },
+    ind("DeviceModel", DEVICE_ROWS), ind("DeviceIP", DEVICE_ROWS), ind("DeviceFw", DEVICE_ROWS), ind("DeviceInfo", DEVICE_ROWS),
+    scroll("DeviceScroll"), trig("DeviceScrollUp"), trig("DeviceScrollDown"),
+    ind("DevName"), ind("DevModel"), ind("DevMAC"), ind("DevIP"), ind("DevFirmware"), ind("DevState"),
+    ind("DevUptime"), ind("DevUplink"), ind("DevLoad"), ind("DevUplinkRate"), ind("DevCpu"), ind("DevMem"),
+    meter("DevCpuMeter"), meter("DevMemMeter"),
+    ind("DevRadio", RADIO_LINES),
+    trig("DevRestart"), ind("DevActionStatus"),
+    -- ports
+    text("PortDevice"), ind("PortSummary"),
+    led("PortLed", PORT_ROWS),
+    { Name = "PortSel", ControlType = "Button", ButtonType = "Toggle", Count = PORT_ROWS, PinStyle = "Input", UserPin = true },
+    ind("PortName", PORT_ROWS), ind("PortLink", PORT_ROWS), ind("PortConn", PORT_ROWS), ind("PortPoe", PORT_ROWS),
+    ind("PortRx", PORT_ROWS), ind("PortTx", PORT_ROWS),
+    scroll("PortScroll"), trig("PortScrollUp"), trig("PortScrollDown"),
+    ind("PortSelInfo"), trig("PortPowerCycle"), ind("PortActionStatus"),
+    -- setup
+    text("IPAddress"), text("ApiKey"), text("SiteName"), text("Username"), text("Password"),
+    trig("Connect"),
+    ind("AppVersion"), ind("SiteId"), ind("ApiMode"), ind("Counts"), ind("LastUpdate"), ind("LastError"),
+  }
+end
+
+function GetControlLayout(props)
+  local layout, graphics = {}, {}
+  local page = PageNames[props["page_index"].Value]
+  local W = 640
+
+  local function box(text, x, y, w, h)
+    table.insert(graphics, { Type = "GroupBox", Text = text, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold",
+      Color = C.accent, Fill = C.panel, StrokeColor = C.stroke, StrokeWidth = 1, CornerRadius = 8,
+      Position = { x, y }, Size = { w, h } })
+  end
+  local function strip(x, y, w, h, color)
+    table.insert(graphics, { Type = "GroupBox", Fill = color or C.row, StrokeWidth = 0, CornerRadius = 3,
+      Position = { x, y }, Size = { w, h } })
+  end
+  local function label(text, x, y, w, h, align, size, color, style)
+    table.insert(graphics, { Type = "Label", Text = text, HTextAlign = align or "Right", FontSize = size or 12,
+      FontStyle = style, Color = color or C.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+  local function button(name, legend, x, y, w, h, color, extra)
+    local b = { PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
+      Color = color or C.accent, OffColor = C.btn, UnlinkOffColor = true, FontSize = 12, FontColor = C.text,
+      CornerRadius = 6, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0 }
+    for k, v in pairs(extra or {}) do b[k] = v end
+    layout[name] = b
+  end
+  local function textbox(name, pretty, x, y, w, h, extra)
+    local t = { PrettyName = pretty, Style = "Text", Position = { x, y }, Size = { w, h or 22 }, FontSize = 12,
+      Color = C.field, TextColor = C.text, HTextAlign = "Center", CornerRadius = 4, StrokeColor = C.stroke, StrokeWidth = 1 }
+    for k, v in pairs(extra or {}) do t[k] = v end
+    layout[name] = t
+  end
+  local function value(name, pretty, x, y, w, h, extra)
+    local e = { Color = C.panel, HTextAlign = "Left", StrokeWidth = 0 }
+    for k, v in pairs(extra or {}) do e[k] = v end
+    textbox(name, pretty, x, y, w, h, e)
+  end
+  local function cell(name, pretty, x, y, w, extra)
+    local e = { Color = C.row, HTextAlign = "Left", StrokeWidth = 0, FontSize = 11, CornerRadius = 0 }
+    for k, v in pairs(extra or {}) do e[k] = v end
+    textbox(name, pretty, x, y, w, 20, e)
+  end
+  local function combo(name, pretty, x, y, w, h)
+    layout[name] = { PrettyName = pretty, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 }, FontSize = 12,
+      Color = C.field, TextColor = C.text }
+  end
+  local function meterbar(name, pretty, x, y, w, h, color)
+    layout[name] = { PrettyName = pretty, Style = "Meter", MeterStyle = "Standard", Position = { x, y }, Size = { w, h or 20 },
+      Color = color or C.accent, BackgroundColor = C.field, ShowTextbox = false, CornerRadius = 4 }
+  end
+  local function led(name, pretty, x, y, s, color)
+    layout[name] = { PrettyName = pretty, Style = "Led", Position = { x, y }, Size = { s, s }, Color = color or C.green,
+      OffColor = { 60, 60, 60 }, UnlinkOffColor = true, StrokeWidth = 1, StrokeColor = C.stroke, Margin = 2 }
+  end
+  local function scrollbar(prefix, pretty, x, y, h)
+    button(prefix .. "ScrollUp", "^", x, y, 20, 20, C.btn, { FontSize = 11 })
+    layout[prefix .. "Scroll"] = { PrettyName = pretty .. "~Scroll", Style = "Fader", Position = { x, y + 22 }, Size = { 20, h - 44 },
+      Color = C.accent, ShowTextbox = false }
+    button(prefix .. "ScrollDown", "v", x, y + h - 20, 20, 20, C.btn, { FontSize = 11 })
+  end
+
+  -- page background + header (all pages)
+  local H = ({ Network = 640, Clients = 696, Devices = 690, Ports = 584, Setup = 516 })[page] or 600
+  table.insert(graphics, { Type = "GroupBox", Fill = C.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { W, H } })
+  table.insert(graphics, { Type = "GroupBox", Fill = C.panel, StrokeColor = C.accent, StrokeWidth = 1, CornerRadius = 8,
+    Position = { 8, 8 }, Size = { W - 16, 48 } })
+  label("UniFi", 20, 12, 110, 38, "Left", 26, C.text, "Bold")
+  label(page:upper(), 150, 22, 110, 20, "Left", 12, C.sub)
+  value("ConsoleName", "Console Name", 262, 20, 170, 24, { FontSize = 13 })
+  layout["Status"] = { PrettyName = "Status", Style = "Text", Position = { 438, 20 }, Size = { 150, 24 }, FontSize = 11, CornerRadius = 4 }
+  led("Online", "Online", 598, 20, 24)
+
+  if page == "Network" then
+    box("Internet", 8, 64, 624, 124)
+    led("InternetUp", "Internet~Up", 20, 91, 22)
+    value("WanStatus", "Internet~WAN Status", 48, 90, 150, 24, { FontStyle = "Bold" })
+    label("WAN IP", 204, 92, 52, 20)
+    value("WanIP", "Internet~WAN IP", 262, 90, 132, 24, { Color = C.field, StrokeWidth = 1, HTextAlign = "Center" })
+    label("Latency", 400, 92, 60, 20)
+    value("Latency", "Internet~Latency", 466, 90, 154, 24)
+    label("Gateway", 16, 122, 70, 20)
+    value("GatewayInfo", "Internet~Gateway", 92, 120, 302, 24)
+    label("Uptime", 400, 122, 60, 20)
+    value("WanUptime", "Internet~WAN Uptime", 466, 120, 154, 24)
+    label("Link", 16, 152, 70, 20)
+    value("WanDetail", "Internet~WAN Detail", 92, 150, 528, 24, { TextColor = C.sub, FontSize = 11 })
+
+    box("WAN Throughput", 8, 196, 624, 112)
+    label("Down", 16, 226, 50, 20)
+    meterbar("WanDownMeter", "Throughput~Down Meter", 72, 226, 420, 20, C.accent)
+    value("WanDownText", "Throughput~Down", 500, 224, 120, 24, { FontStyle = "Bold", FontSize = 13 })
+    label("Up", 16, 258, 50, 20)
+    meterbar("WanUpMeter", "Throughput~Up Meter", 72, 258, 420, 20, { 0, 180, 200 })
+    value("WanUpText", "Throughput~Up", 500, 256, 120, 24, { FontStyle = "Bold", FontSize = 13 })
+    label("Live rate at the gateway's WAN port. Meter full scale is set in Properties.", 16, 284, 600, 16, "Left", 10)
+
+    box("Speed Test", 8, 316, 624, 92)
+    label("Down", 16, 344, 50, 20)
+    value("SpeedDown", "Speed Test~Down", 72, 342, 100, 24, { Color = C.field, StrokeWidth = 1, HTextAlign = "Center" })
+    label("Up", 176, 344, 30, 20)
+    value("SpeedUp", "Speed Test~Up", 212, 342, 100, 24, { Color = C.field, StrokeWidth = 1, HTextAlign = "Center" })
+    label("Ping", 316, 344, 40, 20)
+    value("SpeedPing", "Speed Test~Ping", 362, 342, 80, 24, { Color = C.field, StrokeWidth = 1, HTextAlign = "Center" })
+    button("RunSpeedTest", "Run Speed Test", 490, 340, 130, 28, C.accent, { OffColor = { 0, 86, 200 }, FontStyle = "Bold" })
+    label("Last run", 8, 376, 58, 20)
+    value("SpeedLastRun", "Speed Test~Last Run", 72, 374, 240, 24, { TextColor = C.sub })
+    value("SpeedStatus", "Speed Test~Status", 320, 374, 300, 24, { TextColor = C.amber, FontSize = 11 })
+
+    box("Gateway", 8, 416, 308, 132)
+    label("CPU", 16, 444, 40, 20)
+    meterbar("GwCpuMeter", "Gateway~CPU Meter", 62, 444, 170, 18, C.green)
+    value("GwCpu", "Gateway~CPU", 238, 442, 70, 22)
+    label("Memory", 4, 472, 54, 20, "Right", 11)
+    meterbar("GwMemMeter", "Gateway~Memory Meter", 62, 472, 170, 18, C.amber)
+    value("GwMem", "Gateway~Memory", 238, 470, 70, 22)
+    label("Load", 16, 498, 40, 20)
+    value("GwLoad", "Gateway~Load", 62, 496, 246, 22, { TextColor = C.sub, FontSize = 11 })
+    label("Temp", 16, 522, 40, 20)
+    value("GwTemp", "Gateway~Temperature", 62, 520, 246, 22, { TextColor = C.sub, FontSize = 11 })
+
+    box("Health", 324, 416, 308, 132)
+    for i, h in ipairs(HEALTH) do
+      local y = 440 + (i - 1) * 21
+      led("HealthLed " .. i, "Health~" .. h[2] .. " LED", 334, y + 2, 16)
+      label(h[2], 354, y, 62, 20, "Left", 11, C.text)
+      value("HealthText " .. i, "Health~" .. h[2], 418, y, 206, 20, { TextColor = C.sub, FontSize = 11 })
+    end
+
+    box("Counts", 8, 556, 624, 76)
+    local counts = { { "ClientsTotal", "Clients" }, { "ClientsWired", "Wired" }, { "ClientsWireless", "Wireless" }, { "ClientsGuest", "Guests" },
+                     { "DevicesOnline", "Devices" }, { "APCount", "APs" }, { "SwitchCount", "Switches" }, { "VpnUsers", "VPN Users" } }
+    for i, c in ipairs(counts) do
+      local col, row = (i - 1) % 4, math.floor((i - 1) / 4)
+      local x, y = 16 + col * 154, 582 + row * 24
+      label(c[2], x, y + 1, 66, 20)
+      if c[1] == "DevicesOnline" then
+        value(c[1], "Counts~" .. c[2], x + 72, y, 76, 22, { FontStyle = "Bold" })
+      else
+        layout[c[1]] = { PrettyName = "Counts~" .. c[2], Style = "Text", Position = { x + 72, y }, Size = { 76, 22 }, FontSize = 12,
+          FontStyle = "Bold", Color = C.panel, TextColor = C.text, HTextAlign = "Left", StrokeWidth = 0 }
+      end
+    end
+
+  elseif page == "Clients" then
+    box("Clients", 8, 64, 624, 60)
+    label("Show", 16, 92, 38, 20)
+    combo("ClientFilter", "Clients~Filter", 60, 90, 112, 24)
+    label("Sort", 176, 92, 34, 20)
+    combo("ClientSort", "Clients~Sort", 214, 90, 120, 24)
+    label("Search", 338, 92, 48, 20)
+    textbox("ClientSearch", "Clients~Search", 390, 90, 130, 24, { HTextAlign = "Left" })
+    value("ClientCount", "Clients~Count", 526, 90, 98, 24, { TextColor = C.sub, FontSize = 11 })
+
+    box("Connected Clients", 8, 132, 624, 388)
+    local cols = { { "Name", 20, 148 }, { "IP Address", 172, 98 }, { "MAC Address", 274, 116 }, { "Connection", 394, 100 },
+                   { "Down", 498, 48 }, { "Up", 550, 48 } }
+    for _, c in ipairs(cols) do label(c[1], c[2] + 2, 156, c[3] - 2, 18, "Left", 10, C.sub, "Bold") end
+    label("Down / Up in Mbps", 420, 138, 200, 16, "Right", 10, C.sub)
+    for i = 1, CLIENT_ROWS do
+      local y = 176 + (i - 1) * 24
+      strip(20, y - 1, 580, 22, (i % 2 == 0) and C.tile or C.row)
+      button("ClientSel " .. i, "", 20, y, 148, 20, C.accentD, { OffColor = (i % 2 == 0) and C.tile or C.row, FontSize = 11, HTextAlign = "Left", CornerRadius = 3 })
+      cell("ClientIP " .. i, "Clients~IP " .. i, 172, y, 98, { Color = (i % 2 == 0) and C.tile or C.row })
+      cell("ClientMAC " .. i, "Clients~MAC " .. i, 274, y, 116, { Color = (i % 2 == 0) and C.tile or C.row, TextColor = C.sub })
+      cell("ClientConn " .. i, "Clients~Connection " .. i, 394, y, 100, { Color = (i % 2 == 0) and C.tile or C.row })
+      cell("ClientDown " .. i, "Clients~Down " .. i, 498, y, 48, { Color = (i % 2 == 0) and C.tile or C.row, HTextAlign = "Right" })
+      cell("ClientUp " .. i, "Clients~Up " .. i, 550, y, 48, { Color = (i % 2 == 0) and C.tile or C.row, HTextAlign = "Right" })
+    end
+    scrollbar("Client", "Clients", 604, 176, 334)
+
+    box("Selected Client", 8, 528, 624, 160)
+    local left = { { "SelName", "Name" }, { "SelIP", "IP / MAC" }, { "SelType", "Type" }, { "SelUplink", "Uplink" } }
+    local right = { { "SelSignal", "Signal" }, { "SelLinkRate", "Link Rate" }, { "SelRate", "Down / Up" }, { "SelConnected", "Connected" } }
+    for i, f in ipairs(left) do
+      local y = 554 + (i - 1) * 26
+      label(f[2], 16, y + 1, 64, 20)
+      value(f[1], "Selected~" .. f[2], 86, y, 230, 22, (i == 1) and { FontStyle = "Bold" } or nil)
+    end
+    for i, f in ipairs(right) do
+      local y = 554 + (i - 1) * 26
+      label(f[2], 322, y + 1, 70, 20)
+      value(f[1], "Selected~" .. f[2], 398, y, 222, 22)
+    end
+    label("Network", 16, 659, 64, 20)
+    value("SelNetwork", "Selected~Network", 86, 658, 140, 22, { TextColor = C.sub, FontSize = 11 })
+    value("SelAccess", "Selected~Access", 230, 658, 140, 22, { TextColor = C.sub, FontSize = 11 })
+    label("Min", 368, 659, 30, 20)
+    layout["GuestMinutes"] = { PrettyName = "Selected~Guest Minutes", Style = "Text", Position = { 402, 658 }, Size = { 52, 22 }, FontSize = 11, Color = C.field, TextColor = C.text }
+    button("GuestAuthorize", "Authorize", 460, 656, 78, 26, C.green, { OffColor = { 40, 120, 50 }, FontSize = 11 })
+    button("GuestUnauthorize", "Revoke", 542, 656, 78, 26, C.red, { OffColor = { 120, 44, 42 }, FontSize = 11 })
+
+  elseif page == "Devices" then
+    box("Devices", 8, 64, 624, 60)
+    label("Show", 16, 92, 38, 20)
+    combo("DeviceFilter", "Devices~Filter", 60, 90, 150, 24)
+    value("DeviceCount", "Devices~Count", 220, 90, 400, 24, { TextColor = C.sub, FontSize = 11 })
+
+    box("UniFi Devices", 8, 132, 624, 292)
+    local cols = { { "Name", 38, 142 }, { "Model", 184, 72 }, { "IP Address", 260, 92 }, { "Firmware", 356, 94 }, { "Status", 454, 146 } }
+    for _, c in ipairs(cols) do label(c[1], c[2] + 2, 156, c[3] - 2, 18, "Left", 10, C.sub, "Bold") end
+    for i = 1, DEVICE_ROWS do
+      local y = 176 + (i - 1) * 24
+      local rc = (i % 2 == 0) and C.tile or C.row
+      strip(20, y - 1, 580, 22, rc)
+      led("DeviceLed " .. i, "Devices~LED " .. i, 21, y + 2, 16)
+      button("DeviceSel " .. i, "", 38, y, 142, 20, C.accentD, { OffColor = rc, FontSize = 11, HTextAlign = "Left", CornerRadius = 3 })
+      cell("DeviceModel " .. i, "Devices~Model " .. i, 184, y, 72, { Color = rc, TextColor = C.sub })
+      cell("DeviceIP " .. i, "Devices~IP " .. i, 260, y, 92, { Color = rc })
+      cell("DeviceFw " .. i, "Devices~Firmware " .. i, 356, y, 94, { Color = rc })
+      cell("DeviceInfo " .. i, "Devices~Status " .. i, 454, y, 146, { Color = rc, TextColor = C.sub })
+    end
+    scrollbar("Device", "Devices", 604, 176, 238)
+
+    box("Selected Device", 8, 432, 624, 250)
+    local left = { { "DevName", "Name" }, { "DevMAC", "MAC" }, { "DevFirmware", "Firmware" }, { "DevUptime", "Uptime" }, { "DevLoad", "Load" } }
+    local right = { { "DevModel", "Model" }, { "DevIP", "IP" }, { "DevState", "State" }, { "DevUplink", "Uplink" }, { "DevUplinkRate", "Uplink Rate" } }
+    for i, f in ipairs(left) do
+      local y = 458 + (i - 1) * 26
+      label(f[2], 16, y + 1, 62, 20)
+      value(f[1], "Device~" .. f[2], 84, y, 232, 22, (i == 1) and { FontStyle = "Bold" } or nil)
+    end
+    for i, f in ipairs(right) do
+      local y = 458 + (i - 1) * 26
+      label(f[2], 322, y + 1, 70, 20)
+      value(f[1], "Device~" .. f[2], 398, y, 222, 22)
+    end
+    label("CPU", 16, 589, 62, 20)
+    meterbar("DevCpuMeter", "Device~CPU Meter", 84, 590, 150, 16, C.green)
+    value("DevCpu", "Device~CPU", 240, 586, 76, 22)
+    label("Memory", 322, 589, 70, 20)
+    meterbar("DevMemMeter", "Device~Memory Meter", 398, 590, 140, 16, C.amber)
+    value("DevMem", "Device~Memory", 544, 586, 76, 22)
+    for i = 1, RADIO_LINES do
+      local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+      if i == 1 then label("Radios", 16, 615, 62, 20) end
+      value("DevRadio " .. i, "Device~Radio " .. i, 84 + col * 236, 614 + row * 22, 230, 20, { TextColor = C.sub, FontSize = 11 })
+    end
+    value("DevActionStatus", "Device~Action Status", 84, 660, 360, 20, { TextColor = C.amber, FontSize = 11 })
+    button("DevRestart", "Restart", 500, 652, 120, 26, C.red, { OffColor = { 120, 44, 42 }, FontStyle = "Bold" })
+
+  elseif page == "Ports" then
+    box("Device", 8, 64, 624, 60)
+    label("Device", 16, 92, 50, 20)
+    combo("PortDevice", "Ports~Device", 72, 90, 250, 24)
+    value("PortSummary", "Ports~Summary", 330, 90, 290, 24, { TextColor = C.sub, FontSize = 11 })
+
+    box("Ports", 8, 132, 624, 340)
+    local cols = { { "Port", 38, 60 }, { "Name", 102, 120 }, { "Link", 226, 100 }, { "Type", 330, 60 }, { "PoE", 394, 90 },
+                   { "Rx", 488, 54 }, { "Tx", 546, 54 } }
+    for _, c in ipairs(cols) do label(c[1], c[2] + 2, 156, c[3] - 2, 18, "Left", 10, C.sub, "Bold") end
+    label("Rx / Tx in Mbps", 420, 138, 200, 16, "Right", 10, C.sub)
+    for i = 1, PORT_ROWS do
+      local y = 176 + (i - 1) * 24
+      local rc = (i % 2 == 0) and C.tile or C.row
+      strip(20, y - 1, 580, 22, rc)
+      led("PortLed " .. i, "Ports~LED " .. i, 21, y + 2, 16)
+      button("PortSel " .. i, "", 38, y, 60, 20, C.accentD, { OffColor = rc, FontSize = 11, CornerRadius = 3 })
+      cell("PortName " .. i, "Ports~Name " .. i, 102, y, 120, { Color = rc })
+      cell("PortLink " .. i, "Ports~Link " .. i, 226, y, 100, { Color = rc })
+      cell("PortConn " .. i, "Ports~Type " .. i, 330, y, 60, { Color = rc, TextColor = C.sub })
+      cell("PortPoe " .. i, "Ports~PoE " .. i, 394, y, 90, { Color = rc, TextColor = C.sub })
+      cell("PortRx " .. i, "Ports~Rx " .. i, 488, y, 54, { Color = rc, HTextAlign = "Right" })
+      cell("PortTx " .. i, "Ports~Tx " .. i, 546, y, 54, { Color = rc, HTextAlign = "Right" })
+    end
+    scrollbar("Port", "Ports", 604, 176, 286)
+
+    box("Selected Port", 8, 480, 624, 96)
+    value("PortSelInfo", "Port~Info", 16, 506, 604, 24, { FontStyle = "Bold" })
+    value("PortActionStatus", "Port~Action Status", 16, 540, 470, 24, { TextColor = C.amber, FontSize = 11 })
+    button("PortPowerCycle", "PoE Power Cycle", 490, 538, 130, 28, C.red, { OffColor = { 120, 44, 42 }, FontStyle = "Bold" })
+
+  elseif page == "Setup" then
+    box("Connection", 8, 64, 624, 236)
+    label("Console IP", 16, 94, 100, 20)
+    textbox("IPAddress", "Setup~IP Address", 122, 92, 200, 26, { HTextAlign = "Left" })
+    button("Connect", "Connect / Refresh", 470, 92, 150, 26, C.accent, { OffColor = { 0, 86, 200 }, FontStyle = "Bold" })
+    label("API Key", 16, 130, 100, 20)
+    textbox("ApiKey", "Setup~API Key", 122, 128, 498, 26, { HTextAlign = "Left", FontSize = 11 })
+    label("Site", 16, 166, 100, 20)
+    textbox("SiteName", "Setup~Site Name", 122, 164, 200, 26, { HTextAlign = "Left" })
+    label("Blank = first site (\"Default\")", 330, 168, 290, 18, "Left", 10)
+    label("Local user", 16, 202, 100, 20)
+    textbox("Username", "Setup~Username", 122, 200, 160, 26, { HTextAlign = "Left" })
+    label("Password", 284, 202, 70, 20)
+    textbox("Password", "Setup~Password", 360, 200, 160, 26, { HTextAlign = "Left" })
+    label("(optional)", 526, 204, 90, 18, "Left", 10)
+    label("Create the key in UniFi Network > Settings > Control Plane > Integrations. The local user is only", 16, 234, 604, 16, "Left", 10)
+    label("needed if Extended Stats are refused with the API key on your Network version.", 16, 250, 604, 16, "Left", 10)
+    label("Last Error", 16, 272, 100, 20)
+    value("LastError", "Setup~Last Error", 122, 270, 498, 24, { Color = C.field, StrokeWidth = 1, TextColor = C.amber, FontSize = 11 })
+
+    box("Console Information", 8, 308, 624, 200)
+    local info = { { "AppVersion", "Network App" }, { "SiteId", "Site" }, { "ApiMode", "APIs" }, { "Counts", "Contents" }, { "LastUpdate", "Last Update" } }
+    for i, f in ipairs(info) do
+      local y = 336 + (i - 1) * 32
+      label(f[2], 16, y + 2, 100, 20)
+      value(f[1], "Setup~" .. f[2], 122, y, 498, 24, { Color = C.field, StrokeWidth = 1, FontSize = 11 })
+    end
+  end
+
+  return layout, graphics
+end
+
+--=====================================================================
+-- Runtime
+--=====================================================================
+if Controls then
+  local rapidjson = require("rapidjson")
+
+  local POLL = Properties["Poll Interval (s)"].Value
+  local EXTENDED = Properties["Extended Stats"].Value == "On"
+  local WAN_SCALE = Properties["WAN Meter Scale (Mbps)"].Value
+  local DEBUG = Properties["Debug Print"].Value
+  local DEVICE_LIST_EVERY = 6      -- re-read the device list every N polls
+  local LEGACY_DEVICES_EVERY = 6   -- re-read legacy stat/device (all devices) every N polls
+  local LEGACY_RETRY_EVERY = 60    -- after the legacy API refused us, try again every N polls
+  local PAGE_LIMIT = 200           -- maximum page size of the official API
+  local INT = "/proxy/network/integration/v1"
+  local LEG = "/proxy/network/api/s/"
+
+  local function dbg(level, ...)
+    if DEBUG == "All" or (DEBUG == "Errors" and level == "err") then print(...) end
+  end
+
+  -- state ------------------------------------------------------------
+  local site = nil               -- { id, ref, name }
+  local devices = {}             -- device id -> record
+  local deviceByMac = {}         -- lower-case mac -> device id
+  local deviceOrder = {}         -- device ids sorted by name
+  local clients = {}             -- list of client records (official API)
+  local legacyClients = {}       -- lower-case mac -> stat/sta record
+  local legacyDevices = {}       -- lower-case mac -> stat/device record
+  local health = {}              -- subsystem -> stat/health record
+  local wans = {}                -- official WAN list
+  local clientView, deviceView, portView = {}, {}, {}
+  local clientOffset, deviceOffset, portOffset = 0, 0, 0
+  local selClientId, selDeviceId, selPortIdx = nil, nil, nil
+  local portDeviceId = nil
+  local pollCount = 0
+  local statsCursor = 0
+  local legacy = { state = EXTENDED and "try" or "off", cookie = nil, csrf = nil, failedAt = 0, note = "" }
+  local armed = {}               -- action key -> time armed (press twice to confirm)
+  local CONFIRM = 5
+  local failCount = 0
+  local lastOk = nil
+
+  -- helpers ----------------------------------------------------------
+  local function now() return os.clock() end
+  local function trim(s) return ((s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+  local function str(v)
+    if type(v) == "string" then return v elseif type(v) == "number" then return tostring(v) end
+    return ""
+  end
+  local function num(v)
+    if type(v) == "number" then return v elseif type(v) == "string" then return tonumber(v) end
+    return nil
+  end
+  local function istrue(v) return v == true or v == 1 or v == "true" end
+  local function list(v) return (type(v) == "table") and v or {} end
+  local function lower(s) return string.lower(str(s)) end
+  local function round(v) return math.floor(v + 0.5) end
+
+  local function fmtDuration(sec)
+    sec = num(sec)
+    if not sec or sec < 0 then return "" end
+    local d = math.floor(sec / 86400)
+    local h = math.floor((sec % 86400) / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    if d > 0 then return string.format("%dd %dh", d, h)
+    elseif h > 0 then return string.format("%dh %dm", h, m)
+    else return string.format("%dm", m) end
+  end
+
+  -- bits per second to a readable rate
+  local function fmtRate(bps)
+    bps = num(bps)
+    if not bps then return "-" end
+    if bps >= 1e9 then return string.format("%.2f Gbps", bps / 1e9)
+    elseif bps >= 1e6 then return string.format("%.1f Mbps", bps / 1e6)
+    else return string.format("%.0f kbps", bps / 1e3) end
+  end
+  local function fmtMbps(bps)
+    bps = num(bps)
+    if not bps then return "" end
+    local m = bps / 1e6
+    if m >= 100 then return string.format("%.0f", m) end
+    return string.format("%.1f", m)
+  end
+  local function fmtSpeed(mbps)
+    mbps = num(mbps)
+    if not mbps or mbps <= 0 then return "" end
+    if mbps >= 1000 then
+      local g = mbps / 1000
+      return (g == math.floor(g)) and string.format("%dG", g) or string.format("%.1fG", g)
+    end
+    return string.format("%dM", mbps)
+  end
+
+  -- "2026-10-14T13:35:53Z" / "...53.123+02:00" -> epoch seconds (UTC)
+  local utcOffset = nil
+  local function parseIso(s)
+    s = str(s)
+    local Y, Mo, D, h, mi, se, rest = s:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)(.*)$")
+    if not Y then return nil end
+    if not utcOffset then
+      local t = os.time()
+      utcOffset = os.time(os.date("*t", t)) - os.time(os.date("!*t", t))
+    end
+    local t = os.time({ year = tonumber(Y), month = tonumber(Mo), day = tonumber(D), hour = tonumber(h), min = tonumber(mi), sec = tonumber(se) })
+    t = t + utcOffset
+    local sign, oh, om = rest:match("([%+%-])(%d%d):?(%d%d)$")
+    if sign then
+      local off = tonumber(oh) * 3600 + tonumber(om) * 60
+      t = (sign == "+") and (t - off) or (t + off)
+    end
+    return t
+  end
+
+  local function ipKey(ip)
+    local a, b, c, d = str(ip):match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if not a then return math.huge end
+    return ((tonumber(a) * 256 + tonumber(b)) * 256 + tonumber(c)) * 256 + tonumber(d)
+  end
+
+  local function setStatus(code, msg)
+    Controls.Status.Value = code
+    Controls.Status.String = msg or ""
+  end
+
+  local function setError(msg)
+    Controls.LastError.String = (msg or "") ~= "" and (os.date("%H:%M:%S ") .. msg) or ""
+    if msg and msg ~= "" then dbg("err", "UniFi: " .. msg) end
+  end
+
+  local function host() return trim(Controls.IPAddress.String) end
+  local function apiKey() return trim(Controls.ApiKey.String) end
+  local function configured() return host() ~= "" and apiKey() ~= "" end
+
+  local function header(hdrs, name)
+    if type(hdrs) ~= "table" then return nil end
+    for k, v in pairs(hdrs) do
+      if lower(k) == name then return v end
+    end
+    return nil
+  end
+
+  local function apiMessage(resp)
+    local ok, t = pcall(rapidjson.decode, resp or "")
+    if ok and type(t) == "table" then
+      if type(t.message) == "string" then return t.message end
+      if type(t.meta) == "table" and type(t.meta.msg) == "string" then return t.meta.msg end
+    end
+    return nil
+  end
+
+  -- HTTP queue -------------------------------------------------------
+  -- One request in flight at a time. Polls are skipped while the previous
+  -- round is still running, so a slow console never builds up a backlog.
+  local queue = {}
+  local busy = false
+  local generation = 0
+  local sendNext
+
+  local function enqueue(job, front)
+    if job.key then
+      for i, q in ipairs(queue) do
+        if q.key == job.key then queue[i] = job; return end
+      end
+    end
+    if front then table.insert(queue, 1, job) else table.insert(queue, job) end
+    sendNext()
+  end
+
+  sendNext = function()
+    if busy or #queue == 0 then return end
+    local job = table.remove(queue, 1)
+    busy = true
+    local gen = generation
+    local url = "https://" .. host() .. job.path
+    local headers = { ["Accept"] = "application/json" }
+    if job.body then headers["Content-Type"] = "application/json" end
+    if job.legacy and legacy.cookie then
+      headers["Cookie"] = legacy.cookie
+      if legacy.csrf then headers["X-CSRF-Token"] = legacy.csrf end
+    elseif not job.noKey then
+      headers["X-API-KEY"] = apiKey()
+    end
+    local data = job.body and rapidjson.encode(job.body) or nil
+    dbg("All", job.method .. " " .. url .. (data and (" " .. data) or ""))
+    local function done(tbl, code, resp, err, hdrs)
+      if gen ~= generation then return end   -- answer to a request from before a restart
+      busy = false
+      local ok, decoded = false, nil
+      if code == 200 or code == 201 then
+        ok, decoded = pcall(rapidjson.decode, resp or "")
+        if not ok then decoded = nil end
+      end
+      local handled, cb = pcall(job.callback or function() end, code, decoded, resp, err, hdrs)
+      if not handled then setError("Script error handling " .. job.path .. ": " .. tostring(cb)) end
+      sendNext()
+    end
+    if job.method == "GET" then
+      HttpClient.Download { Url = url, Headers = headers, Timeout = job.timeout or 8, EventHandler = done }
+    else
+      HttpClient.Upload { Url = url, Method = job.method, Data = data or "", Headers = headers, Timeout = job.timeout or 8, EventHandler = done }
+    end
+  end
+
+  local function get(path, cb, opts)
+    local job = { method = "GET", path = path, callback = cb, key = "GET " .. path }
+    for k, v in pairs(opts or {}) do job[k] = v end
+    enqueue(job)
+  end
+  local function post(path, body, cb, opts)
+    local job = { method = "POST", path = path, body = body, callback = cb }
+    for k, v in pairs(opts or {}) do job[k] = v end
+    enqueue(job, true)
+  end
+
+  -- common error handling for the official API
+  local function intError(what, code, resp, err)
+    if code == 401 or code == 403 then
+      setStatus(2, "Unauthorized - check API key")
+      setError(string.format("%s: HTTP %d. The API key was refused%s", what, code, apiMessage(resp) and (" (" .. apiMessage(resp) .. ")") or ""))
+      Controls.Online.Boolean = false
+      return true
+    elseif code == nil or code == 0 then
+      setError(what .. ": " .. tostring(err or "no response (check the IP address and HTTPS certificate)"))
+      return true
+    elseif code >= 400 then
+      setError(string.format("%s: HTTP %d%s", what, code, apiMessage(resp) and (" " .. apiMessage(resp)) or ""))
+      return true
+    end
+    return false
+  end
+
+  -- device helpers ---------------------------------------------------
+  local function hasFeature(d, f)
+    for _, x in ipairs(d.features or {}) do if x == f then return true end end
+    return false
+  end
+  local function deviceKind(d)
+    if hasFeature(d, "gateway") then return "Gateway"
+    elseif hasFeature(d, "accessPoint") then return "Access Point"
+    elseif hasFeature(d, "switching") then return "Switch" end
+    return "Device"
+  end
+  local function gatewayId()
+    for _, id in ipairs(deviceOrder) do
+      if hasFeature(devices[id], "gateway") then return id end
+    end
+    return nil
+  end
+  local function deviceName(id)
+    local d = id and devices[id]
+    return d and (d.name ~= "" and d.name or d.mac) or ""
+  end
+
+  ---------------------------------------------------------------------
+  -- Rendering
+  ---------------------------------------------------------------------
+  local function scrollTo(ctl, offset, total, rows)
+    local maxOff = math.max(0, total - rows)
+    offset = math.max(0, math.min(maxOff, offset))
+    ctl.Value = (maxOff == 0) and 100 or (100 - offset / maxOff * 100)
+    return offset
+  end
+  local function offsetFromScroll(ctl, total, rows)
+    local maxOff = math.max(0, total - rows)
+    return round((100 - ctl.Value) / 100 * maxOff)
+  end
+
+  -- clients
+  local function clientDown(c)
+    local l = c.mac and legacyClients[c.mac]
+    if not l then return nil end
+    local r = num(l["tx_bytes-r"])
+    if istrue(l.is_wired) and num(l["wired-tx_bytes-r"]) then r = num(l["wired-tx_bytes-r"]) end
+    return r and r * 8 or nil
+  end
+  local function clientUp(c)
+    local l = c.mac and legacyClients[c.mac]
+    if not l then return nil end
+    local r = num(l["rx_bytes-r"])
+    if istrue(l.is_wired) and num(l["wired-rx_bytes-r"]) then r = num(l["wired-rx_bytes-r"]) end
+    return r and r * 8 or nil
+  end
+  local function isGuest(c)
+    local l = c.mac and legacyClients[c.mac]
+    return c.accessType == "GUEST" or (l ~= nil and istrue(l.is_guest))
+  end
+  local function connText(c)
+    local l = c.mac and legacyClients[c.mac]
+    if c.type == "WIRELESS" then
+      local ssid = l and str(l.essid) or ""
+      return ssid ~= "" and ssid or "Wi-Fi"
+    elseif c.type == "WIRED" then
+      local port = l and num(l.sw_port)
+      return port and string.format("Wired p%d", port) or "Wired"
+    elseif c.type == "VPN" then return "VPN"
+    elseif c.type == "TELEPORT" then return "Teleport" end
+    return c.type or ""
+  end
+
+  local function buildClientView()
+    local f = Controls.ClientFilter.String
+    local q = lower(trim(Controls.ClientSearch.String))
+    local view = {}
+    for _, c in ipairs(clients) do
+      local keep = true
+      if f == "Wired" then keep = c.type == "WIRED"
+      elseif f == "Wireless" then keep = c.type == "WIRELESS"
+      elseif f == "Guests" then keep = isGuest(c)
+      elseif f == "VPN" then keep = (c.type == "VPN" or c.type == "TELEPORT") end
+      if keep and q ~= "" then
+        local l = c.mac and legacyClients[c.mac]
+        local hay = lower(c.name) .. " " .. lower(c.ip) .. " " .. lower(c.mac) .. " " .. (l and (lower(l.hostname) .. " " .. lower(l.essid)) or "")
+        keep = hay:find(q, 1, true) ~= nil
+      end
+      if keep then table.insert(view, c) end
+    end
+    local s = Controls.ClientSort.String
+    local function byName(a, b) return lower(a.name) < lower(b.name) end
+    if s == "IP Address" then
+      table.sort(view, function(a, b) local x, y = ipKey(a.ip), ipKey(b.ip); if x ~= y then return x < y end return byName(a, b) end)
+    elseif s == "Bandwidth" then
+      table.sort(view, function(a, b)
+        local x, y = (clientDown(a) or 0) + (clientUp(a) or 0), (clientDown(b) or 0) + (clientUp(b) or 0)
+        if x ~= y then return x > y end return byName(a, b) end)
+    elseif s == "Connection" then
+      table.sort(view, function(a, b) local x, y = connText(a), connText(b); if x ~= y then return x < y end return byName(a, b) end)
+    elseif s == "Connected Time" then
+      table.sort(view, function(a, b) local x, y = a.connectedAt or math.huge, b.connectedAt or math.huge; if x ~= y then return x < y end return byName(a, b) end)
+    else
+      table.sort(view, byName)
+    end
+    clientView = view
+  end
+
+  local function renderSelectedClient()
+    local c = nil
+    for _, x in ipairs(clients) do if x.id == selClientId then c = x end end
+    local l = c and c.mac and legacyClients[c.mac]
+    if not c then
+      for _, n in ipairs({ "SelName", "SelIP", "SelType", "SelUplink", "SelSignal", "SelLinkRate", "SelRate", "SelConnected", "SelNetwork", "SelAccess", "SelMAC" }) do
+        Controls[n].String = ""
+      end
+      Controls.GuestAuthorize.IsDisabled = true
+      Controls.GuestUnauthorize.IsDisabled = true
+      return
+    end
+    Controls.SelName.String = c.name
+    Controls.SelIP.String = (c.ip ~= "" and c.ip or "-") .. "  /  " .. (c.mac ~= "" and c.mac or "-")
+    Controls.SelMAC.String = c.mac or ""
+    local typ = ({ WIRED = "Wired", WIRELESS = "Wireless", VPN = "VPN", TELEPORT = "Teleport" })[c.type] or c.type
+    if l and c.type == "WIRELESS" then
+      local extra = {}
+      if str(l.radio_proto) ~= "" then table.insert(extra, str(l.radio_proto)) end
+      if num(l.channel) then table.insert(extra, "ch " .. num(l.channel)) end
+      if str(l.essid) ~= "" then table.insert(extra, str(l.essid)) end
+      if #extra > 0 then typ = typ .. " - " .. table.concat(extra, ", ") end
+    end
+    Controls.SelType.String = typ
+    local up = deviceName(c.uplinkDeviceId)
+    if l and c.type == "WIRED" and num(l.sw_port) then up = (up ~= "" and up or "Switch") .. " port " .. num(l.sw_port) end
+    Controls.SelUplink.String = up
+    if l and c.type == "WIRELESS" and num(l.signal) then
+      local sat = num(l.satisfaction)
+      Controls.SelSignal.String = string.format("%d dBm%s", num(l.signal), sat and string.format("  (experience %d%%)", sat) or "")
+    else
+      Controls.SelSignal.String = (c.type == "WIRELESS") and "-" or ""
+    end
+    if l and (num(l.tx_rate) or num(l.rx_rate)) then
+      -- tx_rate / rx_rate are the PHY link rates in kbps
+      Controls.SelLinkRate.String = string.format("%s / %s", fmtRate((num(l.tx_rate) or 0) * 1000), fmtRate((num(l.rx_rate) or 0) * 1000))
+    else
+      Controls.SelLinkRate.String = ""
+    end
+    local dn, upr = clientDown(c), clientUp(c)
+    Controls.SelRate.String = (dn or upr) and (fmtRate(dn) .. " / " .. fmtRate(upr)) or "Needs Extended Stats"
+    local since = c.connectedAt and (os.time() - c.connectedAt) or (l and num(l.uptime))
+    Controls.SelConnected.String = since and (fmtDuration(since) .. (c.connectedAt and os.date("  (since %d %b %H:%M)", c.connectedAt) or "")) or ""
+    local net = l and str(l.network) or ""
+    if l and num(l.vlan) and num(l.vlan) > 0 then net = net .. " (VLAN " .. num(l.vlan) .. ")" end
+    Controls.SelNetwork.String = net
+    local guest = isGuest(c)
+    local acc = guest and "Guest" or "Default access"
+    if guest and c.authorized ~= nil then acc = acc .. (c.authorized and " - authorized" or " - not authorized") end
+    Controls.SelAccess.String = acc
+    Controls.GuestAuthorize.IsDisabled = not guest
+    Controls.GuestUnauthorize.IsDisabled = not guest
+  end
+
+  local function renderClients()
+    buildClientView()
+    clientOffset = scrollTo(Controls.ClientScroll, clientOffset, #clientView, CLIENT_ROWS)
+    for i = 1, CLIENT_ROWS do
+      local c = clientView[clientOffset + i]
+      local b = Controls.ClientSel[i]
+      b.Legend = c and c.name or ""
+      b.Boolean = c ~= nil and c.id == selClientId
+      b.IsDisabled = (c == nil)
+      Controls.ClientIP[i].String = c and c.ip or ""
+      Controls.ClientMAC[i].String = c and c.mac or ""
+      Controls.ClientConn[i].String = c and connText(c) or ""
+      Controls.ClientDown[i].String = c and fmtMbps(clientDown(c)) or ""
+      Controls.ClientUp[i].String = c and fmtMbps(clientUp(c)) or ""
+    end
+    local shown = #clientView
+    local first = shown > 0 and (clientOffset + 1) or 0
+    local last = math.min(shown, clientOffset + CLIENT_ROWS)
+    Controls.ClientCount.String = (shown == #clients) and string.format("%d-%d of %d", first, last, shown)
+      or string.format("%d-%d of %d (%d)", first, last, shown, #clients)
+    renderSelectedClient()
+  end
+
+  -- devices
+  local function deviceStatusText(d)
+    local parts = {}
+    if d.state ~= "ONLINE" then table.insert(parts, (d.state:gsub("_", " "):lower():gsub("^%l", string.upper))) end
+    local ld = legacyDevices[d.mac]
+    local up = (d.stats and d.stats.uptimeSec) or (ld and num(ld.uptime))
+    if d.state == "ONLINE" and up then table.insert(parts, "up " .. fmtDuration(up)) end
+    local sta = ld and num(ld.num_sta)
+    if sta then table.insert(parts, sta .. " clients") end
+    if not sta and d.stats and d.stats.cpu then table.insert(parts, string.format("CPU %d%%", round(d.stats.cpu))) end
+    return table.concat(parts, "  ")
+  end
+
+  local function buildDeviceView()
+    local f = Controls.DeviceFilter.String
+    local view = {}
+    for _, id in ipairs(deviceOrder) do
+      local d = devices[id]
+      local keep = true
+      if f == "Gateways" then keep = hasFeature(d, "gateway")
+      elseif f == "Switches" then keep = hasFeature(d, "switching")
+      elseif f == "Access Points" then keep = hasFeature(d, "accessPoint")
+      elseif f == "Offline" then keep = d.state ~= "ONLINE" end
+      if keep then table.insert(view, d) end
+    end
+    deviceView = view
+  end
+
+  local function stateColor(state)
+    if state == "ONLINE" then return "#3EB54A"
+    elseif state == "OFFLINE" or state == "CONNECTION_INTERRUPTED" or state == "ISOLATED" then return "#D64541" end
+    return "#F0A528"
+  end
+
+  local function renderSelectedDevice()
+    local d = selDeviceId and devices[selDeviceId]
+    if not d then
+      for _, n in ipairs({ "DevName", "DevModel", "DevMAC", "DevIP", "DevFirmware", "DevState", "DevUptime", "DevUplink", "DevLoad", "DevUplinkRate", "DevCpu", "DevMem" }) do Controls[n].String = "" end
+      Controls.DevCpuMeter.Value, Controls.DevMemMeter.Value = 0, 0
+      for i = 1, RADIO_LINES do Controls.DevRadio[i].String = "" end
+      Controls.DevRestart.IsDisabled = true
+      return
+    end
+    local ld = legacyDevices[d.mac]
+    Controls.DevName.String = d.name
+    Controls.DevModel.String = d.model .. "  (" .. deviceKind(d) .. ")"
+    Controls.DevMAC.String = d.mac
+    Controls.DevIP.String = d.ip
+    local fw = d.fw ~= "" and d.fw or "-"
+    if d.fwUpdatable then
+      local to = ld and str(ld.upgrade_to_firmware) or ""
+      fw = fw .. (to ~= "" and ("  > update to " .. to) or "  > update available")
+    end
+    Controls.DevFirmware.String = fw
+    Controls.DevState.String = (d.state:gsub("_", " ")) .. ((d.adoptedAt and ("  adopted " .. os.date("%d %b %Y", d.adoptedAt))) or "")
+    local st = d.stats or {}
+    local up = st.uptimeSec or (ld and num(ld.uptime))
+    Controls.DevUptime.String = up and fmtDuration(up) or ""
+    Controls.DevUplink.String = d.uplinkDeviceId and deviceName(d.uplinkDeviceId) or (hasFeature(d, "gateway") and "WAN" or "")
+    if st.load1 then
+      Controls.DevLoad.String = string.format("%.2f  %.2f  %.2f  (1 / 5 / 15 min)", st.load1, st.load5 or 0, st.load15 or 0)
+    else Controls.DevLoad.String = "" end
+    if st.txBps or st.rxBps then
+      Controls.DevUplinkRate.String = string.format("Tx %s  Rx %s", fmtRate(st.txBps), fmtRate(st.rxBps))
+    else Controls.DevUplinkRate.String = "" end
+    Controls.DevCpu.String = st.cpu and string.format("%.0f %%", st.cpu) or ""
+    Controls.DevMem.String = st.mem and string.format("%.0f %%", st.mem) or ""
+    Controls.DevCpuMeter.Value = st.cpu or 0
+    Controls.DevMemMeter.Value = st.mem or 0
+    local radios = d.radios or {}
+    for i = 1, RADIO_LINES do
+      local r = radios[i]
+      if r then
+        local s = string.format("%s GHz  %s  ch %s  %s MHz", str(r.frequencyGHz), str(r.wlanStandard), r.channel and str(r.channel) or "-", str(r.channelWidthMHz))
+        for _, rs in ipairs(st.radios or {}) do
+          if num(rs.frequencyGHz) == num(r.frequencyGHz) and num(rs.txRetriesPct) then s = s .. string.format("  retry %.0f%%", num(rs.txRetriesPct)) end
+        end
+        Controls.DevRadio[i].String = s
+      else
+        Controls.DevRadio[i].String = (i == 1 and #radios == 0) and "No radios" or ""
+      end
+    end
+    Controls.DevRestart.IsDisabled = false
+  end
+
+  local function renderDevices()
+    buildDeviceView()
+    deviceOffset = scrollTo(Controls.DeviceScroll, deviceOffset, #deviceView, DEVICE_ROWS)
+    for i = 1, DEVICE_ROWS do
+      local d = deviceView[deviceOffset + i]
+      local b = Controls.DeviceSel[i]
+      b.Legend = d and d.name or ""
+      b.Boolean = d ~= nil and d.id == selDeviceId
+      b.IsDisabled = (d == nil)
+      Controls.DeviceLed[i].Boolean = d ~= nil
+      if d then Controls.DeviceLed[i].Color = stateColor(d.state) end
+      Controls.DeviceModel[i].String = d and d.model or ""
+      Controls.DeviceIP[i].String = d and d.ip or ""
+      Controls.DeviceFw[i].String = d and (d.fw .. (d.fwUpdatable and " *" or "")) or ""
+      Controls.DeviceInfo[i].String = d and deviceStatusText(d) or ""
+    end
+    local online, updates = 0, 0
+    for _, id in ipairs(deviceOrder) do
+      if devices[id].state == "ONLINE" then online = online + 1 end
+      if devices[id].fwUpdatable then updates = updates + 1 end
+    end
+    Controls.DeviceCount.String = string.format("%d devices, %d online%s.  * = firmware update available", #deviceOrder, online,
+      updates > 0 and string.format(", %d with updates", updates) or "")
+    renderSelectedDevice()
+  end
+
+  -- ports
+  local function portRows()
+    local d = portDeviceId and devices[portDeviceId]
+    if not d then return {} end
+    local ld = legacyDevices[d.mac]
+    local legacyPorts = {}
+    for _, p in ipairs(ld and list(ld.port_table) or {}) do
+      if num(p.port_idx) then legacyPorts[num(p.port_idx)] = p end
+    end
+    local rows = {}
+    for _, p in ipairs(d.ports or {}) do
+      table.insert(rows, { p = p, l = legacyPorts[num(p.idx)] })
+    end
+    table.sort(rows, function(a, b) return (num(a.p.idx) or 0) < (num(b.p.idx) or 0) end)
+    return rows
+  end
+
+  local function renderSelectedPort(rows)
+    local row = nil
+    for _, r in ipairs(rows) do if num(r.p.idx) == selPortIdx then row = r end end
+    if not row then
+      Controls.PortSelInfo.String = (#rows > 0) and "Pick a port" or ""
+      Controls.PortPowerCycle.IsDisabled = true
+      return
+    end
+    local p, l = row.p, row.l
+    local s = string.format("Port %d", num(p.idx))
+    if l and str(l.name) ~= "" then s = s .. "  " .. str(l.name) end
+    s = s .. "  -  " .. str(p.state)
+    if p.speedMbps then s = s .. " " .. fmtSpeed(p.speedMbps) .. (l and istrue(l.full_duplex) and " FDX" or "") end
+    if type(p.poe) == "table" then s = s .. string.format("  -  PoE %s %s", str(p.poe.standard), istrue(p.poe.enabled) and str(p.poe.state) or "off") end
+    if l and num(l.poe_power) and num(l.poe_power) > 0 then s = s .. string.format(" %.1f W", num(l.poe_power)) end
+    if l and istrue(l.is_uplink) then s = s .. "  -  uplink" end
+    Controls.PortSelInfo.String = s
+    Controls.PortPowerCycle.IsDisabled = not (type(p.poe) == "table" and istrue(p.poe.enabled))
+  end
+
+  local function renderPorts()
+    local rows = portRows()
+    portView = rows
+    portOffset = scrollTo(Controls.PortScroll, portOffset, #rows, PORT_ROWS)
+    local up, poe, watts = 0, 0, 0
+    for _, r in ipairs(rows) do
+      if r.p.state == "UP" then up = up + 1 end
+      if type(r.p.poe) == "table" and r.p.poe.state == "UP" then poe = poe + 1 end
+      if r.l and num(r.l.poe_power) then watts = watts + num(r.l.poe_power) end
+    end
+    for i = 1, PORT_ROWS do
+      local r = rows[portOffset + i]
+      local p, l = r and r.p, r and r.l
+      local b = Controls.PortSel[i]
+      b.Legend = p and ("Port " .. str(p.idx)) or ""
+      b.Boolean = p ~= nil and num(p.idx) == selPortIdx
+      b.IsDisabled = (p == nil)
+      Controls.PortLed[i].Boolean = p ~= nil and p.state == "UP"
+      Controls.PortLed[i].Color = "#3EB54A"
+      Controls.PortName[i].String = (l and str(l.name)) or ""
+      if p then
+        local link = (p.state == "UP" and p.speedMbps) and (fmtSpeed(p.speedMbps) .. " / " .. fmtSpeed(p.maxSpeedMbps)) or (str(p.state):lower() .. " / " .. fmtSpeed(p.maxSpeedMbps))
+        Controls.PortLink[i].String = link
+        Controls.PortConn[i].String = ({ RJ45 = "RJ45", SFP = "SFP", SFPPLUS = "SFP+", SFP28 = "SFP28", QSFP28 = "QSFP28" })[str(p.connector)] or str(p.connector)
+        if type(p.poe) == "table" then
+          local ps = istrue(p.poe.enabled) and str(p.poe.state) or "off"
+          if l and num(l.poe_power) and num(l.poe_power) > 0 then ps = string.format("%s %.1fW", ps, num(l.poe_power)) end
+          Controls.PortPoe[i].String = str(p.poe.standard):gsub("802%.3", "") .. " " .. ps
+        else
+          Controls.PortPoe[i].String = ""
+        end
+        Controls.PortRx[i].String = l and fmtMbps((num(l["rx_bytes-r"]) or 0) * 8) or ""
+        Controls.PortTx[i].String = l and fmtMbps((num(l["tx_bytes-r"]) or 0) * 8) or ""
+      else
+        Controls.PortLink[i].String, Controls.PortConn[i].String, Controls.PortPoe[i].String = "", "", ""
+        Controls.PortRx[i].String, Controls.PortTx[i].String = "", ""
+      end
+    end
+    local d = portDeviceId and devices[portDeviceId]
+    if d then
+      Controls.PortSummary.String = (#rows == 0) and "This device reports no ports"
+        or string.format("%d of %d ports up%s%s", up, #rows, poe > 0 and string.format(", %d PoE powered", poe) or "",
+          watts > 0 and string.format(" (%.1f W)", watts) or "")
+    else
+      Controls.PortSummary.String = ""
+    end
+    renderSelectedPort(rows)
+  end
+
+  local function hasPorts(d)
+    for _, i in ipairs(d and d.interfaces or {}) do if i == "ports" then return true end end
+    return false
+  end
+
+  local function updatePortChoices()
+    local choices = {}
+    for _, id in ipairs(deviceOrder) do
+      if hasPorts(devices[id]) then table.insert(choices, devices[id].name) end
+    end
+    Controls.PortDevice.Choices = choices
+    if not (portDeviceId and hasPorts(devices[portDeviceId])) then
+      portDeviceId = nil
+      for _, id in ipairs(deviceOrder) do
+        if not portDeviceId and hasPorts(devices[id]) then portDeviceId = id end   -- gateway sorts first
+      end
+      portOffset, selPortIdx = 0, nil
+    end
+    Controls.PortDevice.String = deviceName(portDeviceId)
+  end
+
+  -- network page
+  local function renderNetwork()
+    local gw = gatewayId()
+    local gd = gw and devices[gw]
+    local gst = gd and gd.stats or {}
+    local wan, www, lan, wlan, vpn = health.wan, health.www, health.lan, health.wlan, health.vpn
+    local ld = gd and legacyDevices[gd.mac]
+    local wan1 = ld and type(ld.wan1) == "table" and ld.wan1 or nil
+
+    -- internet status
+    local wanOk = nil
+    if wan then wanOk = str(wan.status) == "ok" elseif gd then wanOk = gd.state == "ONLINE" end
+    local inetOk = www and str(www.status) == "ok"
+    if www == nil then inetOk = wanOk end
+    Controls.InternetUp.Boolean = inetOk == true
+    Controls.InternetUp.Color = (inetOk == true) and "#3EB54A" or "#D64541"
+    if wan or gd then
+      Controls.WanStatus.String = (inetOk and "Internet OK") or (wanOk and "WAN up, no internet") or "WAN down"
+    else
+      Controls.WanStatus.String = ""
+    end
+    Controls.WanIP.String = (wan and str(wan.wan_ip)) or (wan1 and str(wan1.ip)) or ""
+    local lat = (www and num(www.latency)) or (wan1 and num(wan1.latency))
+    Controls.Latency.String = lat and (lat .. " ms") or ""
+    Controls.LatencyMs.Value = lat or 0
+    if gd then
+      local nm = (gd.name == gd.model) and gd.name or (gd.name .. " (" .. gd.model .. ")")
+      Controls.GatewayInfo.String = string.format("%s  firmware %s%s", nm, gd.fw, gd.fwUpdatable and " (update available)" or "")
+    else
+      Controls.GatewayInfo.String = (wan and str(wan.gw_name)) or ""
+    end
+    local wup = www and num(www.uptime)
+    Controls.WanUptime.String = wup and fmtDuration(wup) or ((gst.uptimeSec and ("gateway " .. fmtDuration(gst.uptimeSec))) or "")
+    local detail = {}
+    if wan1 then
+      if str(wan1.ifname) ~= "" then table.insert(detail, str(wan1.ifname)) end
+      if num(wan1.speed) then table.insert(detail, num(wan1.speed) .. " Mbps" .. (istrue(wan1.full_duplex) and " full duplex" or "")) end
+    end
+    if wan and type(wan.nameservers) == "table" and #wan.nameservers > 0 then table.insert(detail, "DNS " .. table.concat(wan.nameservers, ", ")) end
+    if #wans > 1 then
+      local names = {}
+      for _, w in ipairs(wans) do table.insert(names, w.name) end
+      table.insert(detail, "WANs: " .. table.concat(names, ", "))
+    end
+    if wan and num(wan.drops) then table.insert(detail, num(wan.drops) .. " drops") end
+    Controls.WanDetail.String = table.concat(detail, "  -  ")
+
+    -- throughput: legacy health (bytes/s at the WAN) first, else the gateway's uplink statistics
+    local down, up = nil, nil
+    if wan and num(wan["rx_bytes-r"]) then
+      down, up = num(wan["rx_bytes-r"]) * 8, (num(wan["tx_bytes-r"]) or 0) * 8
+    elseif gst.rxBps or gst.txBps then
+      down, up = gst.rxBps, gst.txBps
+    end
+    Controls.WanDownText.String = down and fmtRate(down) or ""
+    Controls.WanUpText.String = up and fmtRate(up) or ""
+    Controls.WanDownMbps.Value = down and down / 1e6 or 0
+    Controls.WanUpMbps.Value = up and up / 1e6 or 0
+    Controls.WanDownMeter.Value = down and math.min(100, down / 1e6 / WAN_SCALE * 100) or 0
+    Controls.WanUpMeter.Value = up and math.min(100, up / 1e6 / WAN_SCALE * 100) or 0
+
+    -- speed test (results are kept in the www subsystem)
+    if www and num(www.xput_down) then
+      Controls.SpeedDown.String = string.format("%.1f Mbps", num(www.xput_down))
+      Controls.SpeedUp.String = string.format("%.1f Mbps", num(www.xput_up) or 0)
+      Controls.SpeedPing.String = num(www.speedtest_ping) and (num(www.speedtest_ping) .. " ms") or ""
+      local lr = num(www.speedtest_lastrun)
+      Controls.SpeedLastRun.String = (lr and lr > 0) and os.date("%d %b %Y %H:%M", lr) or "never"
+    elseif legacy.state ~= "ok" then
+      Controls.SpeedDown.String, Controls.SpeedUp.String, Controls.SpeedPing.String = "", "", ""
+      Controls.SpeedLastRun.String = "Needs Extended Stats"
+    end
+    if www and str(www.speedtest_status) ~= "" and str(www.speedtest_status) ~= "Idle" then
+      Controls.SpeedStatus.String = "Speed test: " .. str(www.speedtest_status)
+    end
+
+    -- gateway system
+    local gss = wan and type(wan["gw_system-stats"]) == "table" and wan["gw_system-stats"] or {}
+    local cpu = gst.cpu or num(gss.cpu)
+    local mem = gst.mem or num(gss.mem)
+    Controls.GwCpu.String = cpu and string.format("%.0f %%", cpu) or ""
+    Controls.GwMem.String = mem and string.format("%.0f %%", mem) or ""
+    Controls.GwCpuPct.Value = cpu or 0
+    Controls.GwMemPct.Value = mem or 0
+    Controls.GwCpuMeter.Value = cpu or 0
+    Controls.GwMemMeter.Value = mem or 0
+    Controls.GwLoad.String = gst.load1 and string.format("%.2f / %.2f / %.2f  (1, 5, 15 min)", gst.load1, gst.load5 or 0, gst.load15 or 0) or ""
+    local temps = {}
+    for _, t in ipairs(ld and list(ld.temperatures) or {}) do
+      if num(t.value) then table.insert(temps, string.format("%s %.0f C", str(t.name), num(t.value))) end
+    end
+    Controls.GwTemp.String = table.concat(temps, "  ")
+
+    -- subsystem health
+    for i, h in ipairs(HEALTH) do
+      local s = health[h[1]]
+      local st = s and str(s.status) or ""
+      Controls.HealthLed[i].Boolean = st ~= ""
+      Controls.HealthLed[i].Color = (st == "ok") and "#3EB54A" or ((st == "unknown" or st == "") and "#5A5A5A" or (st == "warning" and "#F0A528" or "#D64541"))
+      local t = {}
+      if st ~= "" then table.insert(t, st) end
+      if s then
+        if h[1] == "wan" and str(s.isp_name) ~= "" then table.insert(t, str(s.isp_name)) end
+        if h[1] == "www" and num(s.latency) then table.insert(t, num(s.latency) .. " ms") end
+        if h[1] == "lan" and num(s.num_user) then table.insert(t, num(s.num_user) .. " users") end
+        if h[1] == "lan" and num(s.num_sw) then table.insert(t, num(s.num_sw) .. " sw") end
+        if h[1] == "wlan" and num(s.num_user) then table.insert(t, num(s.num_user) .. " users") end
+        if h[1] == "wlan" and num(s.num_ap) then table.insert(t, num(s.num_ap) .. " APs") end
+        if h[1] == "vpn" and num(s.remote_user_num_active) then table.insert(t, num(s.remote_user_num_active) .. " remote users") end
+        if h[1] == "vpn" and num(s.site_to_site_num_active) and num(s.site_to_site_num_active) > 0 then table.insert(t, num(s.site_to_site_num_active) .. " site-to-site") end
+      end
+      if not s and h[1] == "wan" and gd then t = { gd.state == "ONLINE" and "gateway online" or "gateway offline" } end
+      Controls.HealthText[i].String = table.concat(t, "  ")
+    end
+    Controls.LanRate.String = (lan and num(lan["rx_bytes-r"])) and ("Rx " .. fmtRate(num(lan["rx_bytes-r"]) * 8) .. "  Tx " .. fmtRate((num(lan["tx_bytes-r"]) or 0) * 8)) or ""
+    Controls.WlanRate.String = (wlan and num(wlan["rx_bytes-r"])) and ("Rx " .. fmtRate(num(wlan["rx_bytes-r"]) * 8) .. "  Tx " .. fmtRate((num(wlan["tx_bytes-r"]) or 0) * 8)) or ""
+
+    -- counts
+    local wired, wireless, guests = 0, 0, 0
+    for _, c in ipairs(clients) do
+      if c.type == "WIRED" then wired = wired + 1 elseif c.type == "WIRELESS" then wireless = wireless + 1 end
+      if isGuest(c) then guests = guests + 1 end
+    end
+    Controls.ClientsTotal.Value = #clients
+    Controls.ClientsWired.Value = wired
+    Controls.ClientsWireless.Value = wireless
+    Controls.ClientsGuest.Value = guests
+    local online, aps, sws = 0, 0, 0
+    for _, id in ipairs(deviceOrder) do
+      local d = devices[id]
+      if d.state == "ONLINE" then online = online + 1 end
+      if hasFeature(d, "accessPoint") then aps = aps + 1 end
+      if hasFeature(d, "switching") and not hasFeature(d, "gateway") then sws = sws + 1 end
+    end
+    Controls.DevicesOnline.String = string.format("%d / %d", online, #deviceOrder)
+    Controls.APCount.Value = aps
+    Controls.SwitchCount.Value = sws
+    local vpnUsers = 0
+    for _, c in ipairs(clients) do if c.type == "VPN" or c.type == "TELEPORT" then vpnUsers = vpnUsers + 1 end end
+    Controls.VpnUsers.Value = vpnUsers
+  end
+
+  local function renderSetup()
+    Controls.SiteId.String = site and string.format("%s  (%s, %s)", site.name, site.ref, site.id) or ""
+    local leg = ({ off = "off (Properties)", try = "checking", ok = legacy.cookie and "on (local login)" or "on (API key)",
+                   refused = "refused" .. (legacy.note ~= "" and (" - " .. legacy.note) or "") })[legacy.state] or legacy.state
+    Controls.ApiMode.String = "Official Network API: " .. (site and "on" or "-") .. "    Extended Stats: " .. leg
+    Controls.Counts.String = string.format("%d clients, %d devices, %d WAN%s", #clients, #deviceOrder, #wans, #wans == 1 and "" or "s")
+    Controls.LastUpdate.String = lastOk and os.date("%H:%M:%S", lastOk) or ""
+  end
+
+  local function renderAll()
+    renderNetwork()
+    renderClients()
+    renderDevices()
+    renderPorts()
+    renderSetup()
+  end
+
+  ---------------------------------------------------------------------
+  -- Parsing
+  ---------------------------------------------------------------------
+  local function parseDeviceOverview(o, rec)
+    rec = rec or {}
+    rec.id = str(o.id)
+    rec.mac = lower(o.macAddress)
+    rec.ip = str(o.ipAddress)
+    rec.name = str(o.name)
+    if rec.name == "" then rec.name = rec.mac end
+    rec.model = str(o.model)
+    rec.state = str(o.state)
+    rec.supported = istrue(o.supported)
+    rec.fw = str(o.firmwareVersion)
+    rec.fwUpdatable = istrue(o.firmwareUpdatable)
+    -- the device list gives features as a list ("gateway", "switching", "accessPoint"); the
+    -- details call gives an object without "gateway", so only the list form is kept
+    if type(o.features) == "table" and (#o.features > 0 or not rec.features) then
+      local f = {}
+      for _, x in ipairs(o.features) do table.insert(f, str(x)) end
+      rec.features = f
+    end
+    if type(o.interfaces) == "table" then
+      if #o.interfaces > 0 then
+        local f = {}
+        for _, x in ipairs(o.interfaces) do table.insert(f, str(x)) end
+        rec.interfaces = f
+      else
+        local f = {}
+        if type(o.interfaces.ports) == "table" then table.insert(f, "ports"); rec.ports = o.interfaces.ports end
+        if type(o.interfaces.radios) == "table" then table.insert(f, "radios"); rec.radios = o.interfaces.radios end
+        if #f > 0 then rec.interfaces = f end
+      end
+    end
+    return rec
+  end
+
+  local function parseStats(t)
+    local s = {}
+    s.uptimeSec = num(t.uptimeSec)
+    s.cpu = num(t.cpuUtilizationPct)
+    s.mem = num(t.memoryUtilizationPct)
+    s.load1, s.load5, s.load15 = num(t.loadAverage1Min), num(t.loadAverage5Min), num(t.loadAverage15Min)
+    if type(t.uplink) == "table" then
+      s.txBps, s.rxBps = num(t.uplink.txRateBps), num(t.uplink.rxRateBps)
+    end
+    s.radios = (type(t.interfaces) == "table" and type(t.interfaces.radios) == "table") and t.interfaces.radios or {}
+    return s
+  end
+
+  local function parseClient(o)
+    local c = {
+      id = str(o.id), type = str(o.type), name = str(o.name), ip = str(o.ipAddress),
+      mac = lower(o.macAddress), uplinkDeviceId = (type(o.uplinkDeviceId) == "string") and o.uplinkDeviceId or nil,
+      connectedAt = parseIso(o.connectedAt),
+    }
+    if type(o.access) == "table" then
+      c.accessType = str(o.access.type)
+      if type(o.access.authorized) == "boolean" then c.authorized = o.access.authorized end
+    end
+    if c.mac == "" then c.mac = nil end
+    return c
+  end
+
+  local function fillClientNames()
+    for _, c in ipairs(clients) do
+      if c.name == "" then
+        local l = c.mac and legacyClients[c.mac]
+        c.name = (l and str(l.hostname) ~= "" and str(l.hostname)) or c.mac or c.ip or c.id
+      end
+      if c.ip == "" then
+        local l = c.mac and legacyClients[c.mac]
+        if l then c.ip = str(l.ip) end
+      end
+    end
+  end
+
+  ---------------------------------------------------------------------
+  -- Polling
+  ---------------------------------------------------------------------
+  local function markOnline()
+    failCount = 0
+    lastOk = os.time()
+    Controls.Online.Boolean = true
+    if Controls.Status.Value ~= 0 then setStatus(0, "") end
+  end
+
+  local function markFailure(msg)
+    failCount = failCount + 1
+    if failCount >= 2 then
+      Controls.Online.Boolean = false
+      setStatus(2, msg or "No response")
+    end
+  end
+
+  local function sitePath(p) return INT .. "/sites/" .. site.id .. p end
+  local function legacyPath(p) return LEG .. site.ref .. p end
+
+  -- official: paged list helper. Calls done(items) when every page is in.
+  local function getAll(path, what, done)
+    local items = {}
+    local function page(offset)
+      local sep = path:find("?", 1, true) and "&" or "?"
+      get(path .. sep .. "offset=" .. offset .. "&limit=" .. PAGE_LIMIT, function(code, t, resp, err)
+        if code ~= 200 or type(t) ~= "table" then
+          if not intError(what, code, resp, err) then setError(what .. ": unexpected reply") end
+          if code == nil or code == 0 then markFailure("No response from console") end
+          return
+        end
+        for _, x in ipairs(list(t.data)) do table.insert(items, x) end
+        local total = num(t.totalCount) or #items
+        local count = num(t.count) or #list(t.data)
+        if #items < total and count > 0 then page(offset + count) else done(items) end
+      end)
+    end
+    page(0)
+  end
+
+  local function readDevices(after)
+    getAll(sitePath("/devices"), "Device list", function(items)
+      markOnline()
+      local seen = {}
+      for _, o in ipairs(items) do
+        local id = str(o.id)
+        devices[id] = parseDeviceOverview(o, devices[id])
+        seen[id] = true
+      end
+      for id in pairs(devices) do if not seen[id] then devices[id] = nil end end
+      deviceOrder, deviceByMac = {}, {}
+      for id, d in pairs(devices) do table.insert(deviceOrder, id); deviceByMac[d.mac] = id end
+      table.sort(deviceOrder, function(a, b)
+        local da, db = devices[a], devices[b]
+        local ga, gb = hasFeature(da, "gateway"), hasFeature(db, "gateway")
+        if ga ~= gb then return ga end
+        return lower(da.name) < lower(db.name)
+      end)
+      if selDeviceId and not devices[selDeviceId] then selDeviceId = nil end
+      if not selDeviceId then selDeviceId = gatewayId() or deviceOrder[1] end
+      updatePortChoices()
+      renderAll()
+      if after then after() end
+    end)
+  end
+
+  local function readDeviceDetails(id)
+    if not id or not devices[id] then return end
+    get(sitePath("/devices/" .. id), function(code, t, resp, err)
+      if code == 200 and type(t) == "table" then
+        parseDeviceOverview(t, devices[id])
+        devices[id].uplinkDeviceId = (type(t.uplink) == "table" and type(t.uplink.deviceId) == "string") and t.uplink.deviceId or nil
+        devices[id].adoptedAt = parseIso(t.adoptedAt)
+        renderDevices(); renderPorts()
+      elseif code == 404 then
+        devices[id] = nil
+      else
+        intError("Device details", code, resp, err)
+      end
+    end)
+  end
+
+  local function readDeviceStats(id, render)
+    if not id or not devices[id] then return end
+    get(sitePath("/devices/" .. id .. "/statistics/latest"), function(code, t, resp, err)
+      if code == 200 and type(t) == "table" then
+        if devices[id] then devices[id].stats = parseStats(t) end
+        if render ~= false then renderNetwork(); renderDevices() end
+      elseif code ~= 404 then
+        intError("Device statistics", code, resp, err)
+      end
+    end)
+  end
+
+  local function readClients()
+    getAll(sitePath("/clients"), "Client list", function(items)
+      markOnline()
+      local list2 = {}
+      for _, o in ipairs(items) do table.insert(list2, parseClient(o)) end
+      clients = list2
+      fillClientNames()
+      local found = false
+      for _, c in ipairs(clients) do if c.id == selClientId then found = true end end
+      if not found then selClientId = nil end
+      renderClients(); renderNetwork(); renderSetup()
+    end)
+  end
+
+  local function readWans()
+    get(sitePath("/wans?limit=" .. PAGE_LIMIT), function(code, t)
+      if code == 200 and type(t) == "table" then
+        wans = {}
+        for _, w in ipairs(list(t.data)) do table.insert(wans, { id = str(w.id), name = str(w.name) }) end
+      end
+    end)
+  end
+
+  -- legacy (Extended Stats) -----------------------------------------
+  local function legacyLogin(after)
+    local user, pass = trim(Controls.Username.String), Controls.Password.String or ""
+    post("/api/auth/login", { username = user, password = pass, remember = true }, function(code, t, resp, err, hdrs)
+      if code == 200 then
+        local sc = header(hdrs, "set-cookie")
+        local cookies = {}
+        for _, v in ipairs(type(sc) == "table" and sc or { sc }) do
+          local tok = str(v):match("(TOKEN=[^;]+)")
+          if tok then table.insert(cookies, tok) end
+        end
+        legacy.cookie = (#cookies > 0) and table.concat(cookies, "; ") or nil
+        local csrf = header(hdrs, "x-updated-csrf-token") or header(hdrs, "x-csrf-token")
+        legacy.csrf = (type(csrf) == "table") and csrf[1] or csrf
+        if legacy.cookie then
+          legacy.state = "ok"; legacy.note = ""
+          if after then after() end
+        else
+          legacy.state = "refused"; legacy.note = "login gave no TOKEN cookie"
+          legacy.failedAt = pollCount
+        end
+      else
+        legacy.state = "refused"
+        legacy.note = (code == 429) and "too many login attempts" or ("login HTTP " .. tostring(code))
+        legacy.failedAt = pollCount
+        setError("Extended Stats login failed: HTTP " .. tostring(code) .. ((code == 499) and " (2FA is on; use a local account without 2FA)" or ""))
+      end
+      renderSetup()
+    end, { noKey = true })
+  end
+
+  -- returns true when the reply was usable; handles refusal and fallback
+  local function legacyOk(code, t, what)
+    if code == 200 and type(t) == "table" then
+      if legacy.state ~= "ok" then legacy.state = "ok"; legacy.note = ""; renderSetup() end
+      return true
+    end
+    if code == 401 or code == 403 then
+      if legacy.state == "login" then return false end
+      if legacy.cookie then
+        legacy.cookie, legacy.csrf = nil, nil   -- session expired: log in again next poll
+        legacy.state = "try"
+      elseif trim(Controls.Username.String) ~= "" and legacy.state ~= "login" then
+        legacy.state = "login"
+        legacyLogin()
+      else
+        legacy.state = "refused"
+        legacy.note = "API key not accepted; enter a local user on Setup"
+        legacy.failedAt = pollCount
+      end
+      renderSetup()
+    elseif code ~= 200 then
+      dbg("err", "UniFi: " .. what .. " returned HTTP " .. tostring(code))
+    end
+    return false
+  end
+
+  local function readLegacy(full)
+    if legacy.state == "off" or legacy.state == "login" then return end
+    if legacy.state == "refused" then
+      if pollCount - legacy.failedAt < LEGACY_RETRY_EVERY then return end
+      legacy.state = "try"
+    end
+    local opts = { legacy = true }
+    get(legacyPath("/stat/health"), function(code, t)
+      if not legacyOk(code, t, "stat/health") then return end
+      health = {}
+      for _, s in ipairs(list(t.data)) do health[str(s.subsystem)] = s end
+      renderNetwork()
+    end, opts)
+    get(legacyPath("/stat/sta"), function(code, t)
+      if not legacyOk(code, t, "stat/sta") then return end
+      legacyClients = {}
+      for _, s in ipairs(list(t.data)) do
+        local mac = lower(s.mac)
+        if mac ~= "" then legacyClients[mac] = s end
+      end
+      fillClientNames()
+      renderClients(); renderNetwork()
+    end, opts)
+    if full then
+      get(legacyPath("/stat/device"), function(code, t)
+        if not legacyOk(code, t, "stat/device") then return end
+        legacyDevices = {}
+        for _, s in ipairs(list(t.data)) do legacyDevices[lower(s.mac)] = s end
+        renderNetwork(); renderDevices(); renderPorts()
+      end, opts)
+    else
+      local d = portDeviceId and devices[portDeviceId]
+      if d then
+        get(legacyPath("/stat/device/" .. d.mac), function(code, t)
+          if not legacyOk(code, t, "stat/device") then return end
+          for _, s in ipairs(list(t.data)) do legacyDevices[lower(s.mac)] = s end
+          renderPorts()
+        end, opts)
+      end
+    end
+  end
+
+  local function pollCycle()
+    pollCount = pollCount + 1
+    if pollCount % DEVICE_LIST_EVERY == 0 then readDevices(); readWans() end
+    readClients()
+    local gw = gatewayId()
+    if gw then readDeviceStats(gw) end
+    if selDeviceId and selDeviceId ~= gw then readDeviceStats(selDeviceId) end
+    if selDeviceId then readDeviceDetails(selDeviceId) end
+    if portDeviceId and portDeviceId ~= selDeviceId then readDeviceDetails(portDeviceId) end
+    -- one more device's statistics per poll so the device list shows uptime and CPU for all
+    if #deviceOrder > 0 then
+      statsCursor = statsCursor % #deviceOrder + 1
+      local id = deviceOrder[statsCursor]
+      if id ~= gw and id ~= selDeviceId then readDeviceStats(id) end
+    end
+    readLegacy(pollCount % LEGACY_DEVICES_EVERY == 1)
+  end
+
+  local function discover()
+    get(INT .. "/info", function(code, t, resp, err)
+      if code == 200 and type(t) == "table" then
+        Controls.AppVersion.String = "UniFi Network " .. str(t.applicationVersion)
+      else
+        intError("Application info", code, resp, err)
+        if code == nil or code == 0 then markFailure("No response from console") end
+      end
+    end)
+    getAll(INT .. "/sites", "Site list", function(items)
+      local want = lower(trim(Controls.SiteName.String))
+      local pick = nil
+      for _, s in ipairs(items) do
+        if want == "" or lower(s.name) == want or lower(s.internalReference) == want then pick = pick or s end
+      end
+      if not pick then
+        local names = {}
+        for _, s in ipairs(items) do table.insert(names, str(s.name)) end
+        setStatus(2, "Site not found")
+        setError("No site named '" .. trim(Controls.SiteName.String) .. "'. Sites: " .. table.concat(names, ", "))
+        return
+      end
+      site = { id = str(pick.id), ref = str(pick.internalReference), name = str(pick.name) }
+      if site.ref == "" then site.ref = "default" end
+      markOnline()
+      setError("")
+      Controls.ConsoleName.String = site.name
+      renderSetup()
+      readDevices(function() readWans(); pollCycle() end)
+    end)
+  end
+
+  local function Poll()
+    if not configured() then
+      setStatus(3, "Enter IP address and API key")
+      Controls.Online.Boolean = false
+      return
+    end
+    if busy or #queue > 0 then return end     -- previous round still running
+    if not site then discover() else pollCycle() end
+  end
+
+  local pollTimer = Timer.New()
+  pollTimer.EventHandler = Poll
+
+  local function restart()
+    generation = generation + 1
+    queue, busy = {}, false
+    pollTimer:Stop()
+    site = nil
+    devices, deviceOrder, deviceByMac, clients, legacyClients, legacyDevices, health, wans = {}, {}, {}, {}, {}, {}, {}, {}
+    legacy = { state = EXTENDED and "try" or "off", cookie = nil, csrf = nil, failedAt = 0, note = "" }
+    pollCount, failCount = 0, 0
+    Controls.Online.Boolean = false
+    setError("")
+    renderAll()
+    if not configured() then
+      setStatus(3, "Enter IP address and API key")
+      return
+    end
+    setStatus(5, "Connecting")
+    Poll()
+    pollTimer:Start(POLL)
+  end
+
+  ---------------------------------------------------------------------
+  -- Actions
+  ---------------------------------------------------------------------
+  -- Actions that change something need two presses within 5 s.
+  local function confirm(key, statusCtl, what)
+    local t = armed[key]
+    if t and now() - t < CONFIRM then
+      armed[key] = nil
+      return true
+    end
+    armed = { [key] = now() }
+    statusCtl.String = "Press again within 5 s to " .. what
+    Timer.CallAfter(function()
+      if armed[key] and now() - armed[key] >= CONFIRM - 0.1 then armed[key] = nil; statusCtl.String = "" end
+    end, CONFIRM)
+    return false
+  end
+
+  Controls.DevRestart.EventHandler = function()
+    local d = selDeviceId and devices[selDeviceId]
+    if not d or not site then return end
+    if not confirm("restart " .. d.id, Controls.DevActionStatus, "restart " .. d.name) then return end
+    Controls.DevActionStatus.String = "Restarting " .. d.name .. "..."
+    post(sitePath("/devices/" .. d.id .. "/actions"), { action = "RESTART" }, function(code, t, resp, err)
+      if code == 200 or code == 201 or code == 204 then
+        Controls.DevActionStatus.String = "Restart sent to " .. d.name
+      else
+        intError("Restart", code, resp, err)
+        Controls.DevActionStatus.String = "Restart failed (HTTP " .. tostring(code) .. ")"
+      end
+    end)
+  end
+
+  Controls.PortPowerCycle.EventHandler = function()
+    local d = portDeviceId and devices[portDeviceId]
+    if not d or not selPortIdx or not site then return end
+    local key = "poe " .. d.id .. " " .. selPortIdx
+    if not confirm(key, Controls.PortActionStatus, string.format("power cycle port %d", selPortIdx)) then return end
+    Controls.PortActionStatus.String = string.format("Power cycling port %d...", selPortIdx)
+    post(sitePath("/devices/" .. d.id .. "/interfaces/ports/" .. selPortIdx .. "/actions"), { action = "POWER_CYCLE" }, function(code, t, resp, err)
+      if code == 200 or code == 201 or code == 204 then
+        Controls.PortActionStatus.String = string.format("PoE power cycle sent to port %d", selPortIdx)
+      else
+        intError("PoE power cycle", code, resp, err)
+        Controls.PortActionStatus.String = "Power cycle failed (HTTP " .. tostring(code) .. ")"
+      end
+    end)
+  end
+
+  local function guestAction(action)
+    local c = nil
+    for _, x in ipairs(clients) do if x.id == selClientId then c = x end end
+    if not c or not site then return end
+    local body = { action = action }
+    if action == "AUTHORIZE_GUEST_ACCESS" then body.timeLimitMinutes = math.floor(Controls.GuestMinutes.Value) end
+    post(sitePath("/clients/" .. c.id .. "/actions"), body, function(code, t, resp, err)
+      if code == 200 or code == 201 then
+        c.authorized = (action == "AUTHORIZE_GUEST_ACCESS")
+        renderSelectedClient()
+        setError("")
+      else
+        intError("Guest access", code, resp, err)
+      end
+    end)
+  end
+  Controls.GuestAuthorize.EventHandler = function() guestAction("AUTHORIZE_GUEST_ACCESS") end
+  Controls.GuestUnauthorize.EventHandler = function() guestAction("UNAUTHORIZE_GUEST_ACCESS") end
+
+  Controls.RunSpeedTest.EventHandler = function()
+    if not site then return end
+    if legacy.state ~= "ok" then
+      Controls.SpeedStatus.String = "Speed test needs Extended Stats"
+      return
+    end
+    Controls.SpeedStatus.String = "Starting speed test..."
+    post(legacyPath("/cmd/devmgr"), { cmd = "speedtest" }, function(code)
+      if code == 200 then
+        Controls.SpeedStatus.String = "Speed test running (results in about a minute)"
+      else
+        Controls.SpeedStatus.String = "Speed test refused (HTTP " .. tostring(code) .. ")"
+      end
+    end, { legacy = true })
+  end
+
+  ---------------------------------------------------------------------
+  -- List controls
+  ---------------------------------------------------------------------
+  Controls.ClientScroll.EventHandler = function(c)
+    clientOffset = offsetFromScroll(c, #clientView, CLIENT_ROWS); renderClients()
+  end
+  Controls.ClientScrollUp.EventHandler = function() clientOffset = clientOffset - math.floor(CLIENT_ROWS / 2); renderClients() end
+  Controls.ClientScrollDown.EventHandler = function() clientOffset = clientOffset + math.floor(CLIENT_ROWS / 2); renderClients() end
+  Controls.ClientFilter.EventHandler = function() clientOffset = 0; renderClients() end
+  Controls.ClientSort.EventHandler = function() clientOffset = 0; renderClients() end
+  Controls.ClientSearch.EventHandler = function() clientOffset = 0; renderClients() end
+  for i = 1, CLIENT_ROWS do
+    Controls.ClientSel[i].EventHandler = function()
+      local c = clientView[clientOffset + i]
+      selClientId = c and c.id or nil
+      Controls.ClientSelectMAC.String = c and c.mac or ""
+      renderClients()
+    end
+  end
+  -- pin: pick a client by MAC address (or IP / name)
+  Controls.ClientSelectMAC.EventHandler = function(ctl)
+    local q = lower(trim(ctl.String))
+    for _, c in ipairs(clients) do
+      if c.mac == q or lower(c.ip) == q or lower(c.name) == q then selClientId = c.id end
+    end
+    renderClients()
+  end
+
+  Controls.DeviceScroll.EventHandler = function(c)
+    deviceOffset = offsetFromScroll(c, #deviceView, DEVICE_ROWS); renderDevices()
+  end
+  Controls.DeviceScrollUp.EventHandler = function() deviceOffset = deviceOffset - math.floor(DEVICE_ROWS / 2); renderDevices() end
+  Controls.DeviceScrollDown.EventHandler = function() deviceOffset = deviceOffset + math.floor(DEVICE_ROWS / 2); renderDevices() end
+  Controls.DeviceFilter.EventHandler = function() deviceOffset = 0; renderDevices() end
+  for i = 1, DEVICE_ROWS do
+    Controls.DeviceSel[i].EventHandler = function()
+      local d = deviceView[deviceOffset + i]
+      selDeviceId = d and d.id or nil
+      Controls.DevActionStatus.String = ""
+      renderDevices()
+      if d and site then readDeviceDetails(d.id); readDeviceStats(d.id) end
+    end
+  end
+
+  Controls.PortScroll.EventHandler = function(c)
+    portOffset = offsetFromScroll(c, #portView, PORT_ROWS); renderPorts()
+  end
+  Controls.PortScrollUp.EventHandler = function() portOffset = portOffset - math.floor(PORT_ROWS / 2); renderPorts() end
+  Controls.PortScrollDown.EventHandler = function() portOffset = portOffset + math.floor(PORT_ROWS / 2); renderPorts() end
+  Controls.PortDevice.EventHandler = function(c)
+    portDeviceId = nil
+    for _, id in ipairs(deviceOrder) do if devices[id].name == c.String and not portDeviceId then portDeviceId = id end end
+    portOffset, selPortIdx = 0, nil
+    Controls.PortActionStatus.String = ""
+    renderPorts()
+    if portDeviceId and site then
+      readDeviceDetails(portDeviceId)
+      local d = devices[portDeviceId]
+      if legacy.state == "ok" then
+        get(legacyPath("/stat/device/" .. d.mac), function(code, t)
+          if not legacyOk(code, t, "stat/device") then return end
+          for _, s in ipairs(list(t.data)) do legacyDevices[lower(s.mac)] = s end
+          renderPorts()
+        end, { legacy = true })
+      end
+    end
+  end
+  for i = 1, PORT_ROWS do
+    Controls.PortSel[i].EventHandler = function()
+      local r = portView[portOffset + i]
+      selPortIdx = r and num(r.p.idx) or nil
+      Controls.PortActionStatus.String = ""
+      renderPorts()
+    end
+  end
+
+  -- setup -----------------------------------------------------------
+  Controls.Connect.EventHandler = restart
+  Controls.IPAddress.EventHandler = restart
+  Controls.ApiKey.EventHandler = restart
+  Controls.SiteName.EventHandler = restart
+  Controls.Username.EventHandler = function() legacy.cookie = nil; if EXTENDED then legacy.state = "try" end; renderSetup() end
+  Controls.Password.EventHandler = Controls.Username.EventHandler
+
+  -- startup ----------------------------------------------------------
+  Controls.ClientFilter.Choices = CLIENT_FILTERS
+  Controls.ClientSort.Choices = CLIENT_SORTS
+  Controls.DeviceFilter.Choices = DEVICE_FILTERS
+  if Controls.ClientFilter.String == "" then Controls.ClientFilter.String = "All" end
+  if Controls.ClientSort.String == "" then Controls.ClientSort.String = "Name" end
+  if Controls.DeviceFilter.String == "" then Controls.DeviceFilter.String = "All" end
+  Controls.SpeedStatus.String = ""
+  Controls.DevActionStatus.String = ""
+  Controls.PortActionStatus.String = ""
+  restart()
+end
