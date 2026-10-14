@@ -1,0 +1,1482 @@
+--[[ Philips Hue control plugin for Q-SYS
+  Controls Philips Hue lights, rooms, zones and scenes through a Hue Bridge
+  over the local Hue CLIP API v2 (HTTPS, port 443).
+
+  References:
+    Philips Hue developer documentation  - https://developers.meethue.com/develop/hue-api-v2/
+    Hue CLIP API v2 OpenAPI description  - https://github.com/openhue/openhue-api
+    Hue RGB to xy color conversion       - https://github.com/johnciech/PhilipsHueSDK/blob/master/ApplicationDesignNotes/RGB%20to%20xy%20Color%20conversion.md
+    Q-SYS Plugin / Lua documentation     - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/HttpClient.htm
+]]
+
+PluginInfo = {
+  Name = "Lighting~Philips Hue Bridge",
+  Version = "1.0",
+  BuildVersion = "1.0.0.0",
+  Id = "f2c92329-cf36-419e-86f0-ca471e887fdb",
+  Author = "AV Programming",
+  Description = "Control Philips Hue lights, rooms, zones and scenes (power, brightness, color, color temperature, scenes, effects) through a Hue Bridge over the local CLIP API v2.",
+  ShowDebug = true,
+}
+
+-- Palette ---------------------------------------------------------------
+local C = {
+  bg      = {22, 24, 29},
+  panel   = {34, 37, 44},
+  tile    = {27, 30, 36},
+  stroke  = {58, 63, 74},
+  accent  = {84, 132, 240},   -- Hue blue
+  accentD = {38, 58, 108},
+  text    = {232, 234, 238},
+  sub     = {150, 157, 170},
+  btn     = {52, 56, 66},
+  red     = {214, 69, 65},
+  amber   = {240, 165, 40},
+  green   = {62, 181, 74},
+}
+
+local QuickColors = {
+  {"Red",    {255, 0, 0}},     {"Orange", {255, 110, 0}},
+  {"Yellow", {255, 210, 0}},   {"Green",  {0, 220, 60}},
+  {"Cyan",   {0, 210, 230}},   {"Blue",   {0, 70, 255}},
+  {"Purple", {150, 40, 255}},  {"Pink",   {255, 60, 170}},
+}
+-- The color temperatures of the Hue app's white recipes
+local WhitePresets = { {"Relax", 2237}, {"Read", 2890}, {"Neutral", 4000}, {"Concentrate", 4292}, {"Energize", 6410} }
+local SCENE_BUTTONS = 12
+local GROUP_TILES = 8
+local LIGHT_TILES = 8
+
+function GetColor(props)
+  return C.accent
+end
+
+function GetPrettyName(props)
+  return "Philips Hue Bridge v" .. PluginInfo.Version
+end
+
+local PageNames = { "Control", "Rooms", "Lights", "Scenes", "Setup" }
+
+function GetPages(props)
+  local pages = {}
+  for _, name in ipairs(PageNames) do table.insert(pages, { name = name }) end
+  return pages
+end
+
+function GetProperties()
+  return {
+    { Name = "Poll Interval (s)", Type = "integer", Min = 1, Max = 60, Value = 2 },
+    { Name = "Group Command Interval (ms)", Type = "integer", Min = 100, Max = 2000, Value = 1000 },
+    { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
+  }
+end
+
+function RectifyProperties(props)
+  return props
+end
+
+function GetControls(props)
+  local ctrls = {
+    -- status
+    { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true },
+    { Name = "Online", ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true },
+    { Name = "BridgeName", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    -- target
+    { Name = "TargetSelect", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "TargetInfo", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "Identify", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    -- power
+    { Name = "Power", ControlType = "Button", ButtonType = "Toggle", PinStyle = "Both", UserPin = true },
+    { Name = "PowerOn", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "PowerOff", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    -- brightness
+    { Name = "Brightness", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, PinStyle = "Both", UserPin = true },
+    { Name = "BrightnessUp", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "BrightnessDown", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "BrightnessStep", ControlType = "Knob", ControlUnit = "Integer", Min = 1, Max = 50, DefaultValue = 10, PinStyle = "Input", UserPin = true },
+    { Name = "FadeTime", ControlType = "Knob", ControlUnit = "Seconds", Min = 0, Max = 60, DefaultValue = 0.4, PinStyle = "Input", UserPin = true },
+    -- color
+    { Name = "Hue", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 360, PinStyle = "Both", UserPin = true },
+    { Name = "Saturation", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 100, PinStyle = "Both", UserPin = true },
+    { Name = "Red", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, PinStyle = "Both", UserPin = true },
+    { Name = "Green", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, PinStyle = "Both", UserPin = true },
+    { Name = "Blue", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, PinStyle = "Both", UserPin = true },
+    { Name = "HexColor", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "ColorSwatch", ControlType = "Indicator", IndicatorType = "Led", PinStyle = "None", UserPin = false },
+    { Name = "ColorMode", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "QuickColor", ControlType = "Button", ButtonType = "Trigger", Count = #QuickColors, PinStyle = "Input", UserPin = true },
+    -- white
+    { Name = "ColorTemp", ControlType = "Knob", ControlUnit = "Integer", Min = 2000, Max = 6500, PinStyle = "Both", UserPin = true },
+    { Name = "WhitePreset", ControlType = "Button", ButtonType = "Trigger", Count = #WhitePresets, PinStyle = "Input", UserPin = true },
+    -- rooms & zones
+    { Name = "AllOn", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "AllOff", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "AllInfo", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "GroupName", ControlType = "Indicator", IndicatorType = "Text", Count = GROUP_TILES, PinStyle = "Output", UserPin = true },
+    { Name = "GroupInfo", ControlType = "Indicator", IndicatorType = "Text", Count = GROUP_TILES, PinStyle = "None", UserPin = false },
+    { Name = "GroupPower", ControlType = "Button", ButtonType = "Toggle", Count = GROUP_TILES, PinStyle = "Both", UserPin = true },
+    { Name = "GroupBrightness", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, Count = GROUP_TILES, PinStyle = "Both", UserPin = true },
+    { Name = "GroupControl", ControlType = "Button", ButtonType = "Trigger", Count = GROUP_TILES, PinStyle = "Input", UserPin = true },
+    { Name = "GroupPageUp", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "GroupPageDown", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "GroupPageLabel", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "None", UserPin = false },
+    -- lights
+    { Name = "LightFilter", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "LightName", ControlType = "Indicator", IndicatorType = "Text", Count = LIGHT_TILES, PinStyle = "Output", UserPin = true },
+    { Name = "LightInfo", ControlType = "Indicator", IndicatorType = "Text", Count = LIGHT_TILES, PinStyle = "None", UserPin = false },
+    { Name = "LightSwatch", ControlType = "Indicator", IndicatorType = "Led", Count = LIGHT_TILES, PinStyle = "None", UserPin = false },
+    { Name = "LightPower", ControlType = "Button", ButtonType = "Toggle", Count = LIGHT_TILES, PinStyle = "Both", UserPin = true },
+    { Name = "LightBrightness", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, Count = LIGHT_TILES, PinStyle = "Both", UserPin = true },
+    { Name = "LightControl", ControlType = "Button", ButtonType = "Trigger", Count = LIGHT_TILES, PinStyle = "Input", UserPin = true },
+    { Name = "LightPageUp", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "LightPageDown", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "LightPageLabel", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "None", UserPin = false },
+    -- scenes
+    { Name = "SceneGroup", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "SceneSelect", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "SceneActive", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "SceneButton", ControlType = "Button", ButtonType = "Toggle", Count = SCENE_BUTTONS, PinStyle = "Both", UserPin = true },
+    { Name = "ScenePageUp", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "ScenePageDown", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "ScenePageLabel", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "None", UserPin = false },
+    { Name = "SceneTransition", ControlType = "Knob", ControlUnit = "Seconds", Min = 0, Max = 60, DefaultValue = 0.4, PinStyle = "Input", UserPin = true },
+    { Name = "SceneDynamic", ControlType = "Button", ButtonType = "Toggle", PinStyle = "Both", UserPin = true },
+    { Name = "SceneGroupOff", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    -- effects
+    { Name = "EffectSelect", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "EffectStatus", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    -- setup
+    { Name = "IPAddress", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "AppKey", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "Pair", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "ForgetKey", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "Connect", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "BridgeId", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "Model", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "Software", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "Counts", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "LastError", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+  }
+  return ctrls
+end
+
+function GetControlLayout(props)
+  local layout, graphics = {}, {}
+  local page = PageNames[props["page_index"].Value]
+  local W = 640
+
+  local function box(text, x, y, w, h)
+    table.insert(graphics, { Type = "GroupBox", Text = text, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold",
+      Color = C.accent, Fill = C.panel, StrokeColor = C.stroke, StrokeWidth = 1, CornerRadius = 8,
+      Position = { x, y }, Size = { w, h } })
+  end
+  local function tile(x, y, w, h)
+    table.insert(graphics, { Type = "GroupBox", Fill = C.tile, StrokeColor = C.stroke, StrokeWidth = 1, CornerRadius = 6,
+      Position = { x, y }, Size = { w, h } })
+  end
+  local function label(text, x, y, w, h, align, size, color)
+    table.insert(graphics, { Type = "Label", Text = text, HTextAlign = align or "Right", FontSize = size or 12,
+      Color = color or C.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+  local function button(name, legend, x, y, w, h, color, extra)
+    local b = { PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
+      Color = color or C.accent, OffColor = C.btn, UnlinkOffColor = true, FontSize = 12, FontColor = C.text,
+      CornerRadius = 6, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0 }
+    for k, v in pairs(extra or {}) do b[k] = v end
+    layout[name] = b
+  end
+  local function textbox(name, pretty, x, y, w, h, extra)
+    local t = { PrettyName = pretty, Style = "Text", Position = { x, y }, Size = { w, h or 22 }, FontSize = 12,
+      Color = { 20, 22, 26 }, TextColor = C.text, HTextAlign = "Center", CornerRadius = 4, StrokeColor = C.stroke, StrokeWidth = 1 }
+    for k, v in pairs(extra or {}) do t[k] = v end
+    layout[name] = t
+  end
+  local function combo(name, pretty, x, y, w, h)
+    layout[name] = { PrettyName = pretty, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 }, FontSize = 12,
+      Color = { 20, 22, 26 }, TextColor = C.text }
+  end
+  local function fader(name, pretty, x, y, w, h, color)
+    layout[name] = { PrettyName = pretty, Style = "Fader", Position = { x, y }, Size = { w, h or 24 }, Color = color or C.accent }
+  end
+  local function led(name, pretty, x, y, s, color)
+    layout[name] = { PrettyName = pretty, Style = "Led", Position = { x, y }, Size = { s, s }, Color = color or C.accent,
+      OffColor = { 60, 60, 60 }, UnlinkOffColor = true, StrokeWidth = 1, StrokeColor = C.stroke, Margin = 2 }
+  end
+
+  -- page background + header (all pages)
+  local H = ({ Control = 724, Rooms = 584, Lights = 584, Scenes = 488, Setup = 476 })[page] or 600
+  table.insert(graphics, { Type = "GroupBox", Fill = C.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { W, H } })
+  table.insert(graphics, { Type = "GroupBox", Fill = C.panel, StrokeColor = C.accent, StrokeWidth = 1, CornerRadius = 8,
+    Position = { 8, 8 }, Size = { W - 16, 48 } })
+  label("hue", 20, 12, 70, 38, "Left", 28, C.text)
+  label(page:upper(), 150, 22, 110, 20, "Left", 12, C.sub)
+  textbox("BridgeName", "Bridge Name", 262, 20, 170, 24, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", FontSize = 13 })
+  layout["Status"] = { PrettyName = "Status", Style = "Text", Position = { 438, 20 }, Size = { 150, 24 }, FontSize = 11, CornerRadius = 4 }
+  led("Online", "Online", 598, 20, 24)
+
+  if page == "Control" then
+    -- Target
+    box("Target", 8, 64, 624, 76)
+    label("Control", 16, 94, 70, 20)
+    combo("TargetSelect", "Target~Select", 92, 92, 260, 26)
+    textbox("TargetInfo", "Target~Info", 360, 92, 160, 26, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", TextColor = C.sub, FontSize = 11 })
+    button("Identify", "Identify", 528, 92, 96, 26, C.amber, { OffColor = { 200, 135, 30 }, FontColor = { 20, 20, 20 }, FontStyle = "Bold" })
+    label("Pick All Lights, a room, a zone or one light. Everything on this page acts on it.", 16, 120, 600, 16, "Left", 10)
+
+    -- Power
+    box("Power", 8, 148, 200, 160)
+    button("Power", "POWER", 24, 176, 168, 64, C.accent, { FontSize = 18, FontStyle = "Bold" })
+    button("PowerOn", "On", 24, 252, 80, 36, C.accentD)
+    button("PowerOff", "Off", 112, 252, 80, 36, C.accentD)
+
+    -- Brightness
+    box("Brightness", 216, 148, 416, 160)
+    fader("Brightness", "Brightness~Level", 232, 180, 300, 28)
+    button("BrightnessDown", "-", 540, 180, 36, 28, C.accentD, { FontSize = 18 })
+    button("BrightnessUp", "+", 582, 180, 36, 28, C.accentD, { FontSize = 18 })
+    label("Step", 232, 224, 50, 20)
+    layout["BrightnessStep"] = { PrettyName = "Brightness~Step", Style = "Text", Position = { 288, 224 }, Size = { 56, 22 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
+    label("Fade Time (s)", 352, 224, 110, 20)
+    layout["FadeTime"] = { PrettyName = "Brightness~Fade Time", Style = "Text", Position = { 468, 224 }, Size = { 56, 22 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
+    label("Fade time applies to every change on this page (Hue 'dynamics.duration').", 232, 260, 390, 16, "Left", 10)
+    label("Brightness 0 turns the target off.", 232, 276, 390, 16, "Left", 10)
+
+    -- Color
+    box("Color", 8, 316, 624, 220)
+    local rows = { { "Hue", "Hue", { 230, 80, 200 } }, { "Saturation", "Saturation", C.accent },
+                   { "Red", "Red", C.red }, { "Green", "Green", { 60, 200, 80 } }, { "Blue", "Blue", { 60, 110, 240 } } }
+    for i, r in ipairs(rows) do
+      local y = 344 + (i - 1) * 34
+      label(r[2], 16, y + 2, 76, 20)
+      fader(r[1], "Color~" .. r[2], 100, y, 300, 24, r[3])
+    end
+    led("ColorSwatch", "Color~Swatch", 432, 344, 112, { 255, 255, 255 })
+    layout["ColorSwatch"].Margin = 0
+    label("Hex", 552, 346, 70, 20, "Left")
+    textbox("HexColor", "Color~Hex", 552, 368, 72, 24)
+    label("Mode", 552, 404, 70, 20, "Left")
+    textbox("ColorMode", "Color~Mode", 552, 426, 72, 24, { Color = C.panel, FontSize = 11 })
+    label("Hue / Sat change color only.", 432, 476, 194, 16, "Left", 10)
+    label("RGB and Hex also set brightness.", 432, 492, 194, 16, "Left", 10)
+
+    -- White
+    box("White (Color Temperature)", 8, 544, 624, 92)
+    label("Kelvin", 16, 574, 76, 20)
+    fader("ColorTemp", "White~Color Temp", 100, 572, 300, 24, C.amber)
+    for i, wp in ipairs(WhitePresets) do
+      local x = 100 + (i - 1) * 104
+      button("WhitePreset " .. i, wp[1], x, 602, 98, 24, C.amber, { Color = C.amber, OffColor = { 70, 60, 44 } })
+    end
+    label("2000 K - 6500 K (lamp limits apply)", 412, 574, 210, 20, "Left", 11)
+
+    -- Quick colors
+    box("Quick Colors", 8, 644, 624, 72)
+    for i, qc in ipairs(QuickColors) do
+      local x = 20 + (i - 1) * 76
+      button("QuickColor " .. i, qc[1], x, 674, 70, 32, qc[2],
+        { OffColor = { math.floor(qc[2][1] * 0.75), math.floor(qc[2][2] * 0.75), math.floor(qc[2][3] * 0.75) },
+          FontColor = { 20, 20, 20 }, FontStyle = "Bold" })
+    end
+
+  elseif page == "Rooms" then
+    box("All Lights", 8, 64, 624, 64)
+    button("AllOn", "All On", 20, 92, 120, 28, C.accent, { FontStyle = "Bold" })
+    button("AllOff", "All Off", 148, 92, 120, 28, C.accentD, { FontStyle = "Bold" })
+    textbox("AllInfo", "All~Info", 280, 94, 340, 24, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", TextColor = C.sub })
+
+    box("Rooms & Zones", 8, 136, 624, 440)
+    for i = 1, GROUP_TILES do
+      local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+      local x0, y0 = 20 + col * 308, 164 + row * 92
+      tile(x0, y0, 296, 84)
+      textbox("GroupName " .. i, "Rooms~Name " .. i, x0 + 8, y0 + 6, 172, 22,
+        { Color = C.tile, StrokeWidth = 0, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold" })
+      textbox("GroupInfo " .. i, "Rooms~Info " .. i, x0 + 8, y0 + 28, 172, 18,
+        { Color = C.tile, StrokeWidth = 0, HTextAlign = "Left", FontSize = 10, TextColor = C.sub })
+      fader("GroupBrightness " .. i, "Rooms~Brightness " .. i, x0 + 10, y0 + 54, 168, 22)
+      button("GroupPower " .. i, "Power", x0 + 188, y0 + 8, 98, 30, C.accent, { FontStyle = "Bold" })
+      button("GroupControl " .. i, "Control >", x0 + 188, y0 + 48, 98, 28, C.btn, { Color = C.accentD })
+    end
+    button("GroupPageDown", "< Page", 20, 536, 80, 28, C.btn)
+    textbox("GroupPageLabel", "Rooms~Page", 108, 538, 424, 24, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
+    button("GroupPageUp", "Page >", 540, 536, 80, 28, C.btn)
+
+  elseif page == "Lights" then
+    box("Filter", 8, 64, 624, 64)
+    label("Show", 16, 94, 70, 20)
+    combo("LightFilter", "Lights~Filter", 92, 92, 260, 26)
+    label("Control > makes a light the Control page target.", 364, 96, 260, 18, "Left", 10)
+
+    box("Lights", 8, 136, 624, 440)
+    for i = 1, LIGHT_TILES do
+      local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+      local x0, y0 = 20 + col * 308, 164 + row * 92
+      tile(x0, y0, 296, 84)
+      led("LightSwatch " .. i, "Lights~Swatch " .. i, x0 + 8, y0 + 8, 22, { 255, 255, 255 })
+      textbox("LightName " .. i, "Lights~Name " .. i, x0 + 34, y0 + 6, 146, 22,
+        { Color = C.tile, StrokeWidth = 0, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold" })
+      textbox("LightInfo " .. i, "Lights~Info " .. i, x0 + 8, y0 + 30, 172, 18,
+        { Color = C.tile, StrokeWidth = 0, HTextAlign = "Left", FontSize = 10, TextColor = C.sub })
+      fader("LightBrightness " .. i, "Lights~Brightness " .. i, x0 + 10, y0 + 54, 168, 22)
+      button("LightPower " .. i, "Power", x0 + 188, y0 + 8, 98, 30, C.accent, { FontStyle = "Bold" })
+      button("LightControl " .. i, "Control >", x0 + 188, y0 + 48, 98, 28, C.btn, { Color = C.accentD })
+    end
+    button("LightPageDown", "< Page", 20, 536, 80, 28, C.btn)
+    textbox("LightPageLabel", "Lights~Page", 108, 538, 424, 24, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
+    button("LightPageUp", "Page >", 540, 536, 80, 28, C.btn)
+
+  elseif page == "Scenes" then
+    box("Scenes", 8, 64, 624, 308)
+    label("Room", 16, 92, 70, 20)
+    combo("SceneGroup", "Scenes~Room or Zone", 92, 90, 220, 26)
+    label("Active", 318, 92, 50, 20)
+    textbox("SceneActive", "Scenes~Active", 374, 90, 250, 26, { Color = C.panel, TextColor = C.accent, FontSize = 13, FontStyle = "Bold" })
+    for i = 1, SCENE_BUTTONS do
+      local col, row = (i - 1) % 4, math.floor((i - 1) / 4)
+      button("SceneButton " .. i, "", 20 + col * 152, 128 + row * 54, 144, 46, C.accent, { FontSize = 12, WordWrap = true })
+    end
+    button("ScenePageDown", "< Page", 20, 292, 80, 28, C.btn)
+    textbox("ScenePageLabel", "Scenes~Page", 108, 294, 424, 24, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
+    button("ScenePageUp", "Page >", 540, 292, 80, 28, C.btn)
+    label("Transition (s)", 16, 334, 100, 20)
+    layout["SceneTransition"] = { PrettyName = "Scenes~Transition", Style = "Text", Position = { 122, 332 }, Size = { 56, 24 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
+    button("SceneDynamic", "Dynamic", 196, 330, 110, 28, C.accent, { FontStyle = "Bold" })
+    label("plays the scene's palette", 312, 334, 160, 20, "Left", 10)
+    button("SceneGroupOff", "Room Off", 500, 330, 120, 28, C.accentD)
+
+    box("Light Effects", 8, 380, 624, 100)
+    label("Effect", 16, 410, 70, 20)
+    combo("EffectSelect", "Effects~Select", 92, 408, 220, 26)
+    textbox("EffectStatus", "Effects~Status", 320, 408, 300, 26, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", TextColor = C.sub })
+    label("Effects (candle, fire, sparkle...) play on the Control page target. Lamps that", 16, 440, 600, 16, "Left", 10)
+    label("do not support an effect ignore it. Pick 'no_effect' to stop.", 16, 456, 600, 16, "Left", 10)
+
+  elseif page == "Setup" then
+    box("Connection", 8, 64, 624, 176)
+    label("Bridge IP", 16, 94, 100, 20)
+    textbox("IPAddress", "Setup~IP Address", 122, 92, 200, 26, { HTextAlign = "Left" })
+    button("Connect", "Connect / Refresh", 340, 92, 150, 26, C.accentD)
+    label("App Key", 16, 130, 100, 20)
+    textbox("AppKey", "Setup~App Key", 122, 128, 368, 26, { HTextAlign = "Left", FontSize = 11 })
+    button("Pair", "Pair", 500, 92, 120, 26, C.accent, { OffColor = { 64, 104, 200 }, FontStyle = "Bold" })
+    button("ForgetKey", "Forget Key", 500, 128, 120, 26, C.red, { OffColor = { 120, 44, 42 } })
+    label("To pair: press Pair, then press the round link button on the bridge within 30 s.", 16, 170, 600, 20, "Left", 11, C.text)
+    label("Last Error", 16, 202, 100, 20)
+    textbox("LastError", "Setup~Last Error", 122, 200, 498, 26, { Color = C.panel, HTextAlign = "Left", TextColor = C.amber })
+
+    box("Bridge Information", 8, 248, 624, 220)
+    local info = { { "BridgeId", "Bridge ID" }, { "Model", "Model" }, { "Software", "Software" }, { "Counts", "Contents" } }
+    for i, f in ipairs(info) do
+      local y = 278 + (i - 1) * 36
+      label(f[2], 16, y + 2, 100, 20)
+      textbox(f[1], "Setup~" .. f[2], 122, y, 300, 26, { Color = C.panel, HTextAlign = "Left" })
+    end
+    label("Poll interval and group command", 436, 282, 190, 16, "Left", 10)
+    label("interval are set in Properties.", 436, 298, 190, 16, "Left", 10)
+    label("Give the bridge a DHCP reservation so its IP address never changes.", 16, 428, 600, 16, "Left", 10)
+  end
+
+  return layout, graphics
+end
+
+--=====================================================================
+-- Runtime
+--=====================================================================
+if Controls then
+  local rapidjson = require("rapidjson")
+
+  local POLL = Properties["Poll Interval (s)"].Value
+  local GROUP_GAP = Properties["Group Command Interval (ms)"].Value / 1000
+  local LIGHT_GAP = 0.1       -- Hue guidance: about 10 commands per second to lights
+  local DEBUG = Properties["Debug Print"].Value
+  local FULL_EVERY = 30       -- re-read rooms, zones, scenes and devices every N polls
+
+  local function dbg(level, ...)
+    if DEBUG == "All" or (DEBUG == "Errors" and level == "err") then print(...) end
+  end
+
+  -- state ------------------------------------------------------------
+  local lights = {}          -- light id -> light record
+  local lightOrder = {}      -- light ids sorted by name
+  local groups = {}          -- room/zone/bridge_home id -> { id, kind, name, gl, lightIds }
+  local groupOrder = {}      -- room then zone ids sorted by name
+  local glState = {}         -- grouped_light id -> { on, bri }
+  local glOwner = {}         -- grouped_light id -> group id
+  local homeId = nil         -- bridge_home id ("All Lights")
+  local scenes = {}          -- scene id -> { id, name, group, active, palette }
+  local devices = {}         -- device id -> { name, model, product, sw, lights = {} }
+  local bridgeDevice = nil
+
+  local target = nil         -- { kind = "group" | "light", id = }
+  local targetLabels = {}    -- label -> target
+  local groupPage, lightPage, scenePage = 1, 1, 1
+  local groupTiles, lightTiles, sceneList = {}, {}, {}
+  local pollCount = 0
+  local failCount = 0
+  local userTouch = {}
+  local HOLD = 2.0
+  local DEFAULT_EFFECTS = { "no_effect", "candle", "fire", "sparkle", "prism", "opal", "glisten", "underwater", "cosmos", "sunbeam", "enchant" }
+
+  -- helpers ----------------------------------------------------------
+  local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+  local function round(v) return math.floor(v + 0.5) end
+  local function now() return os.clock() end
+  local function touched(key) return userTouch[key] and (now() - userTouch[key]) < HOLD end
+  local function touch(key) userTouch[key] = now() end
+  local function trim(s) return (s or ""):gsub("%s", "") end
+
+  local function rgbToHsv(r, g, b)
+    r, g, b = r / 255, g / 255, b / 255
+    local mx, mn = math.max(r, g, b), math.min(r, g, b)
+    local d = mx - mn
+    local h = 0
+    if d > 0 then
+      if mx == r then h = ((g - b) / d) % 6
+      elseif mx == g then h = (b - r) / d + 2
+      else h = (r - g) / d + 4 end
+      h = h * 60
+    end
+    local s = (mx == 0) and 0 or d / mx
+    return round(h) % 360, round(s * 100), round(mx * 100)
+  end
+
+  local function hsvToRgb(h, s, v)
+    h = h % 360
+    s, v = s / 100, v / 100
+    local c = v * s
+    local x = c * (1 - math.abs((h / 60) % 2 - 1))
+    local m = v - c
+    local r, g, b
+    if h < 60 then r, g, b = c, x, 0
+    elseif h < 120 then r, g, b = x, c, 0
+    elseif h < 180 then r, g, b = 0, c, x
+    elseif h < 240 then r, g, b = 0, x, c
+    elseif h < 300 then r, g, b = x, 0, c
+    else r, g, b = c, 0, x end
+    return round((r + m) * 255), round((g + m) * 255), round((b + m) * 255)
+  end
+
+  local function hex(r, g, b) return string.format("#%02X%02X%02X", r, g, b) end
+
+  -- Philips Hue "RGB to xy color conversion": gamma correction, then the
+  -- Wide RGB D65 matrix, then optional clipping to the lamp's color gamut.
+  local function gammaIn(c) return (c > 0.04045) and ((c + 0.055) / 1.055) ^ 2.4 or (c / 12.92) end
+  local function gammaOut(c) return (c <= 0.0031308) and (12.92 * c) or (1.055 * c ^ (1 / 2.4) - 0.055) end
+
+  local function closestOnLine(a, b, p)
+    local apx, apy = p.x - a.x, p.y - a.y
+    local abx, aby = b.x - a.x, b.y - a.y
+    local t = (apx * abx + apy * aby) / (abx * abx + aby * aby)
+    t = clamp(t, 0, 1)
+    return { x = a.x + abx * t, y = a.y + aby * t }
+  end
+
+  local function clipToGamut(p, gamut)
+    if not gamut or not gamut.red or not gamut.green or not gamut.blue then return p end
+    local R, G, B = gamut.red, gamut.green, gamut.blue
+    local function cross(ax, ay, bx, by) return ax * by - ay * bx end
+    local v1x, v1y = G.x - R.x, G.y - R.y
+    local v2x, v2y = B.x - R.x, B.y - R.y
+    local qx, qy = p.x - R.x, p.y - R.y
+    local den = cross(v1x, v1y, v2x, v2y)
+    if den ~= 0 then
+      local s = cross(qx, qy, v2x, v2y) / den
+      local t = cross(v1x, v1y, qx, qy) / den
+      if s >= 0 and t >= 0 and s + t <= 1 then return p end
+    end
+    local best, bestD = nil, math.huge
+    for _, e in ipairs({ { R, G }, { G, B }, { B, R } }) do
+      local c = closestOnLine(e[1], e[2], p)
+      local d = (c.x - p.x) ^ 2 + (c.y - p.y) ^ 2
+      if d < bestD then best, bestD = c, d end
+    end
+    return best
+  end
+
+  local function rgbToXy(r, g, b, gamut)
+    r, g, b = gammaIn(r / 255), gammaIn(g / 255), gammaIn(b / 255)
+    local X = r * 0.649926 + g * 0.103455 + b * 0.197109
+    local Y = r * 0.234327 + g * 0.743075 + b * 0.022598
+    local Z = r * 0.000000 + g * 0.053077 + b * 1.035763
+    local sum = X + Y + Z
+    if sum == 0 then return { x = 0.3227, y = 0.329 } end
+    local p = clipToGamut({ x = X / sum, y = Y / sum }, gamut)
+    return { x = math.floor(p.x * 10000 + 0.5) / 10000, y = math.floor(p.y * 10000 + 0.5) / 10000 }
+  end
+
+  local function xyToRgb(x, y)
+    if not y or y <= 0 then return 255, 255, 255 end
+    local Y = 1
+    local X = (Y / y) * x
+    local Z = (Y / y) * (1 - x - y)
+    local r = X * 1.612 - Y * 0.203 - Z * 0.302
+    local g = -X * 0.509 + Y * 1.412 + Z * 0.066
+    local b = X * 0.026 - Y * 0.072 + Z * 0.962
+    r, g, b = math.max(r, 0), math.max(g, 0), math.max(b, 0)
+    local mx = math.max(r, g, b, 1e-6)
+    r, g, b = gammaOut(r / mx), gammaOut(g / mx), gammaOut(b / mx)
+    return round(clamp(r, 0, 1) * 255), round(clamp(g, 0, 1) * 255), round(clamp(b, 0, 1) * 255)
+  end
+
+  local function kelvinToRgb(k)
+    -- approximation used only for the on-screen swatch
+    local t = k / 100
+    local r, g, b
+    if t <= 66 then r = 255 else r = 329.698727446 * ((t - 60) ^ -0.1332047592) end
+    if t <= 66 then g = 99.4708025861 * math.log(t) - 161.1195681661 else g = 288.1221695283 * ((t - 60) ^ -0.0755148492) end
+    if t >= 66 then b = 255 elseif t <= 19 then b = 0 else b = 138.5177312231 * math.log(t - 10) - 305.0447927307 end
+    return round(clamp(r, 0, 255)), round(clamp(g, 0, 255)), round(clamp(b, 0, 255))
+  end
+
+  local function mirekToKelvin(m) return round(1000000 / m) end
+  local function kelvinToMirek(k) return round(1000000 / k) end
+
+  local function setSwatch(r, g, b)
+    Controls.ColorSwatch.Color = hex(r, g, b)
+    Controls.ColorSwatch.Boolean = true
+    Controls.HexColor.String = hex(r, g, b)
+  end
+
+  local function setStatus(code, msg)
+    Controls.Status.Value = code
+    Controls.Status.String = msg or ""
+  end
+
+  local function setError(msg)
+    Controls.LastError.String = (msg or "") ~= "" and (os.date("%H:%M:%S ") .. msg) or ""
+    if msg and msg ~= "" then dbg("err", "Hue: " .. msg) end
+  end
+
+  local function host() return trim(Controls.IPAddress.String) end
+  local function appKey() return trim(Controls.AppKey.String) end
+  local function configured() return host() ~= "" and appKey() ~= "" end
+
+  -- HTTP queue -------------------------------------------------------
+  -- One request in flight at a time. Writes to the same resource are merged so
+  -- dragging a fader only sends the latest value. Commands are spaced to stay
+  -- inside Hue's guidance (about 10/s to lights, 1/s to groups).
+  local queue = {}
+  local busy = false
+  local waiting = false
+  local lastSent = { light = -100, group = -100 }
+  local generation = 0
+  local Poll, sendNext
+
+  local function gapFor(job)
+    if job.rate == "group" then return GROUP_GAP elseif job.rate == "light" then return LIGHT_GAP end
+    return 0
+  end
+
+  sendNext = function()
+    if busy or waiting or #queue == 0 then return end
+    local job = queue[1]
+    local wait = job.rate and (lastSent[job.rate] + gapFor(job) - now()) or 0
+    if wait > 0.005 then
+      waiting = true
+      Timer.CallAfter(function() waiting = false; sendNext() end, wait)
+      return
+    end
+    table.remove(queue, 1)
+    busy = true
+    if job.rate then lastSent[job.rate] = now() end
+    local gen = generation
+    local url = "https://" .. host() .. job.path
+    local data = job.body and rapidjson.encode(job.body) or ""
+    local headers = { ["Content-Type"] = "application/json" }
+    if not job.noKey then headers["hue-application-key"] = appKey() end
+    dbg("all", job.method .. " " .. url .. " " .. data)
+    local function done(tbl, code, resp, err, hdrs)
+      if gen ~= generation then return end   -- answer to a request from before a restart
+      busy = false
+      if code == 401 or code == 403 then
+        setStatus(2, "Unauthorized - pair again")
+        setError("HTTP " .. code .. ": the app key is not valid on this bridge")
+        Controls.Online.Boolean = false
+      elseif code == 429 and not job.retried then
+        job.retried = true
+        table.insert(queue, 1, job)
+        lastSent[job.rate or "group"] = now() + 1
+        setError("Bridge is busy (429), retrying")
+      elseif code ~= nil and code >= 400 and job.method ~= "GET" then
+        local detail = ""
+        local ok, t = pcall(rapidjson.decode, resp or "")
+        if ok and type(t) == "table" and type(t.errors) == "table" and t.errors[1] then detail = ": " .. tostring(t.errors[1].description) end
+        setError(string.format("%s %s returned HTTP %d%s", job.method, job.path, code, detail))
+      end
+      if job.callback then job.callback(code, resp, err) end
+      sendNext()
+    end
+    if job.method == "GET" then
+      HttpClient.Download { Url = url, Headers = headers, Timeout = 5, EventHandler = done }
+    else
+      HttpClient.Upload { Url = url, Method = job.method, Data = data, Headers = headers, Timeout = 5, EventHandler = done }
+    end
+  end
+
+  local function deepMerge(dst, src)
+    for k, v in pairs(src) do
+      if type(v) == "table" and type(dst[k]) == "table" then deepMerge(dst[k], v) else dst[k] = v end
+    end
+  end
+
+  local function enqueue(job)
+    if job.key then
+      for _, q in ipairs(queue) do
+        if q.key == job.key then
+          if job.merge and q.body and job.body then deepMerge(q.body, job.body) else q.body = job.body end
+          if job.callback then q.callback = job.callback end
+          return
+        end
+      end
+    end
+    table.insert(queue, job)
+    sendNext()
+  end
+
+  local function needConfig()
+    if configured() then return false end
+    setError("Set the bridge IP address and pair on the Setup page")
+    return true
+  end
+
+  local function putResource(rtype, id, body)
+    if needConfig() or not id then return end
+    enqueue({ key = rtype .. ":" .. id, method = "PUT", path = "/clip/v2/resource/" .. rtype .. "/" .. id, body = body,
+      merge = true, rate = (rtype == "light") and "light" or "group" })
+  end
+
+  -- model helpers ----------------------------------------------------
+  local function groupLights(gid)
+    local g = groups[gid]
+    if not g then return {} end
+    if g.kind == "Home" then return lightOrder end
+    return g.lightIds
+  end
+
+  local function groupOnCount(gid)
+    local n, on = 0, 0
+    for _, lid in ipairs(groupLights(gid)) do
+      local l = lights[lid]
+      if l then n = n + 1; if l.on then on = on + 1 end end
+    end
+    return on, n
+  end
+
+  local function targetLightIds()
+    if not target then return {} end
+    if target.kind == "light" then return lights[target.id] and { target.id } or {} end
+    return groupLights(target.id)
+  end
+
+  -- the light used for color feedback: the target light, or the first lit color light in the group
+  local function refLight()
+    local ids = targetLightIds()
+    local first
+    for _, lid in ipairs(ids) do
+      local l = lights[lid]
+      if l then
+        first = first or l
+        if l.on and (l.xy or l.mirek) then return l end
+      end
+    end
+    return first
+  end
+
+  local function targetGamut()
+    if target and target.kind == "light" and lights[target.id] then return lights[target.id].gamut end
+    return nil
+  end
+
+  local function fadeMs(ctrl) return round((ctrl or Controls.FadeTime).Value * 1000) end
+
+  -- send a state change to the current target (a light or the group's grouped_light)
+  local function sendTarget(body)
+    if not target then setError("Pick a target on the Control page"); return end
+    local ms = fadeMs()
+    if ms > 0 and (body.dimming or body.color or body.color_temperature or body.on) then body.dynamics = { duration = ms } end
+    if target.kind == "light" then
+      putResource("light", target.id, body)
+    else
+      local g = groups[target.id]
+      if g and g.gl then putResource("grouped_light", g.gl, body) else setError("This room has no grouped light") end
+    end
+  end
+
+  -- feedback ---------------------------------------------------------
+  local function lightLabel(l) return l.name end
+
+  local function lightInfo(l)
+    if not l then return "" end
+    if not l.on then return "Off" end
+    local s = string.format("%d%%", round(l.bri or 0))
+    if l.effect and l.effect ~= "no_effect" then s = s .. "  " .. l.effect
+    elseif l.ctMode and l.mirek then s = s .. string.format("  %d K", mirekToKelvin(l.mirek))
+    elseif l.xy then s = s .. "  color" end
+    return s
+  end
+
+  local function lightRgb(l)
+    if not l or not l.on then return 50, 50, 50 end
+    if l.ctMode and l.mirek then return kelvinToRgb(mirekToKelvin(l.mirek)) end
+    if l.xy then return xyToRgb(l.xy.x, l.xy.y) end
+    return 255, 236, 200
+  end
+
+  local function updateTargetFeedback()
+    if not target then Controls.TargetInfo.String = ""; return end
+    local on, bri
+    if target.kind == "light" then
+      local l = lights[target.id]
+      if not l then return end
+      on, bri = l.on, l.bri
+      Controls.TargetInfo.String = l.product or "Light"
+    else
+      local g = groups[target.id]
+      if not g then return end
+      local st = g.gl and glState[g.gl] or {}
+      on, bri = st.on, st.bri
+      local lit, n = groupOnCount(target.id)
+      Controls.TargetInfo.String = string.format("%s, %d of %d on", g.kind, lit, n)
+    end
+    if on ~= nil and not touched("power") then Controls.Power.Boolean = on end
+    if bri ~= nil and not touched("brightness") then Controls.Brightness.Value = on and bri or 0 end
+
+    local l = refLight()
+    if not l then Controls.ColorMode.String = ""; return end
+    if l.effect and l.effect ~= "no_effect" then
+      Controls.ColorMode.String = "Effect"
+    elseif l.ctMode then
+      Controls.ColorMode.String = "White"
+    elseif l.xy then
+      Controls.ColorMode.String = "Color"
+    else
+      Controls.ColorMode.String = "Dim only"
+    end
+    if l.mirek and not touched("ct") then Controls.ColorTemp.Value = clamp(mirekToKelvin(l.mirek), 2000, 6500) end
+    if l.ctMode and l.mirek then
+      if not touched("color") then setSwatch(kelvinToRgb(mirekToKelvin(l.mirek))) end
+    elseif l.xy and not touched("color") then
+      local r, g, b = xyToRgb(l.xy.x, l.xy.y)
+      local h, s = rgbToHsv(r, g, b)
+      Controls.Hue.Value, Controls.Saturation.Value = h, s
+      local rr, gg, bb = hsvToRgb(h, s, (l.bri or 100))
+      Controls.Red.Value, Controls.Green.Value, Controls.Blue.Value = rr, gg, bb
+      setSwatch(r, g, b)
+    end
+    if not touched("effect") then
+      Controls.EffectStatus.String = (l.effect and l.effect ~= "no_effect") and ("Playing on " .. l.name .. ": " .. l.effect) or "No effect playing"
+    end
+  end
+
+  local function pageText(page, pages, offset, per, total, what)
+    if total == 0 then return "No " .. what end
+    return string.format("Page %d of %d  (%d-%d of %d)", page, pages, offset + 1, math.min(offset + per, total), total)
+  end
+
+  local function updateGroupTiles()
+    local list = groupOrder
+    local pages = math.max(1, math.ceil(#list / GROUP_TILES))
+    groupPage = clamp(groupPage, 1, pages)
+    local offset = (groupPage - 1) * GROUP_TILES
+    groupTiles = {}
+    for i = 1, GROUP_TILES do
+      local gid = list[offset + i]
+      local g = gid and groups[gid]
+      groupTiles[i] = gid
+      Controls.GroupName[i].String = g and g.name or ""
+      Controls.GroupPower[i].IsDisabled = (g == nil)
+      Controls.GroupBrightness[i].IsDisabled = (g == nil)
+      Controls.GroupControl[i].IsDisabled = (g == nil)
+      if g then
+        local st = g.gl and glState[g.gl] or {}
+        local lit, n = groupOnCount(gid)
+        Controls.GroupInfo[i].String = string.format("%s  %d of %d on", g.kind, lit, n)
+        if not touched("gp" .. gid) then Controls.GroupPower[i].Boolean = st.on == true end
+        if not touched("gb" .. gid) then Controls.GroupBrightness[i].Value = st.on and (st.bri or 0) or 0 end
+      else
+        Controls.GroupInfo[i].String = ""
+        Controls.GroupPower[i].Boolean = false
+        Controls.GroupBrightness[i].Value = 0
+      end
+    end
+    Controls.GroupPageLabel.String = pageText(groupPage, pages, offset, GROUP_TILES, #list, "rooms or zones")
+    local lit = 0
+    for _, lid in ipairs(lightOrder) do if lights[lid].on then lit = lit + 1 end end
+    Controls.AllInfo.String = string.format("%d of %d lights on", lit, #lightOrder)
+  end
+
+  local function filteredLights()
+    local f = Controls.LightFilter.String
+    if f == "" or f == "All Lights" then return lightOrder end
+    for _, gid in ipairs(groupOrder) do
+      local g = groups[gid]
+      if (g.kind .. ": " .. g.name) == f then return g.lightIds end
+    end
+    return lightOrder
+  end
+
+  local function updateLightTiles()
+    local list = filteredLights()
+    local pages = math.max(1, math.ceil(#list / LIGHT_TILES))
+    lightPage = clamp(lightPage, 1, pages)
+    local offset = (lightPage - 1) * LIGHT_TILES
+    lightTiles = {}
+    for i = 1, LIGHT_TILES do
+      local lid = list[offset + i]
+      local l = lid and lights[lid]
+      lightTiles[i] = lid
+      Controls.LightName[i].String = l and l.name or ""
+      Controls.LightInfo[i].String = lightInfo(l)
+      Controls.LightPower[i].IsDisabled = (l == nil)
+      Controls.LightBrightness[i].IsDisabled = (l == nil)
+      Controls.LightControl[i].IsDisabled = (l == nil)
+      if l then
+        if not touched("lp" .. lid) then Controls.LightPower[i].Boolean = l.on end
+        if not touched("lb" .. lid) then Controls.LightBrightness[i].Value = l.on and (l.bri or 0) or 0 end
+        Controls.LightSwatch[i].Color = hex(lightRgb(l))
+        Controls.LightSwatch[i].Boolean = true
+      else
+        Controls.LightPower[i].Boolean = false
+        Controls.LightBrightness[i].Value = 0
+        Controls.LightSwatch[i].Boolean = false
+      end
+    end
+    Controls.LightPageLabel.String = pageText(lightPage, pages, offset, LIGHT_TILES, #list, "lights")
+  end
+
+  local function sceneGroupId()
+    local sel = Controls.SceneGroup.String
+    for _, gid in ipairs(groupOrder) do
+      local g = groups[gid]
+      if (g.kind .. ": " .. g.name) == sel then return gid end
+    end
+    return nil
+  end
+
+  local function updateSceneButtons()
+    local gid = sceneGroupId()
+    sceneList = {}
+    for _, s in pairs(scenes) do if s.group == gid then table.insert(sceneList, s) end end
+    table.sort(sceneList, function(a, b) return a.name:lower() < b.name:lower() end)
+    local pages = math.max(1, math.ceil(#sceneList / SCENE_BUTTONS))
+    scenePage = clamp(scenePage, 1, pages)
+    local offset = (scenePage - 1) * SCENE_BUTTONS
+    local active = {}
+    for _, s in ipairs(sceneList) do if s.active and s.active ~= "inactive" then table.insert(active, s.name) end end
+    for i = 1, SCENE_BUTTONS do
+      local s = sceneList[offset + i]
+      local b = Controls.SceneButton[i]
+      b.Legend = s and s.name or ""
+      b.IsDisabled = (s == nil)
+      b.Boolean = (s ~= nil and s.active ~= nil and s.active ~= "inactive")
+    end
+    Controls.SceneActive.String = (#active > 0) and table.concat(active, ", ") or "None"
+    Controls.ScenePageLabel.String = pageText(scenePage, pages, offset, SCENE_BUTTONS, #sceneList, "scenes for this room")
+    local names = {}
+    for _, s in ipairs(sceneList) do table.insert(names, s.name) end
+    Controls.SceneSelect.Choices = names
+  end
+
+  local function updateEffectChoices()
+    local seen, list = {}, {}
+    for _, lid in ipairs(targetLightIds()) do
+      local l = lights[lid]
+      for _, e in ipairs((l and l.effectValues) or {}) do
+        if not seen[e] then seen[e] = true; table.insert(list, e) end
+      end
+    end
+    if #list == 0 then list = DEFAULT_EFFECTS end
+    Controls.EffectSelect.Choices = list
+  end
+
+  local function updateAll()
+    updateTargetFeedback()
+    updateGroupTiles()
+    updateLightTiles()
+    updateSceneButtons()
+  end
+
+  -- target list ------------------------------------------------------
+  local function targetKey(t) return t and (t.kind .. ":" .. t.id) or "" end
+
+  local function rebuildChoices()
+    targetLabels = {}
+    local choices = {}
+    local function add(lbl, t) table.insert(choices, lbl); targetLabels[lbl] = t end
+    if homeId then add("All Lights", { kind = "group", id = homeId }) end
+    for _, gid in ipairs(groupOrder) do
+      local g = groups[gid]
+      add(g.kind .. ": " .. g.name, { kind = "group", id = gid })
+    end
+    for _, lid in ipairs(lightOrder) do add("Light: " .. lightLabel(lights[lid]), { kind = "light", id = lid }) end
+    Controls.TargetSelect.Choices = choices
+
+    local groupChoices = {}
+    for _, gid in ipairs(groupOrder) do table.insert(groupChoices, groups[gid].kind .. ": " .. groups[gid].name) end
+    Controls.SceneGroup.Choices = groupChoices
+    local filter = { "All Lights" }
+    for _, c in ipairs(groupChoices) do table.insert(filter, c) end
+    Controls.LightFilter.Choices = filter
+    if Controls.LightFilter.String == "" then Controls.LightFilter.String = "All Lights" end
+    if Controls.SceneGroup.String == "" and groupChoices[1] then Controls.SceneGroup.String = groupChoices[1] end
+
+    -- keep the current target if it still exists, otherwise default to All Lights
+    local cur = targetLabels[Controls.TargetSelect.String]
+    if cur then
+      target = cur
+    elseif target then
+      local still = false
+      for lbl, t in pairs(targetLabels) do
+        if targetKey(t) == targetKey(target) then Controls.TargetSelect.String = lbl; still = true end
+      end
+      if not still then target = nil end
+    end
+    if not target and choices[1] then
+      Controls.TargetSelect.String = choices[1]
+      target = targetLabels[choices[1]]
+    end
+    updateEffectChoices()
+  end
+
+  local function setTarget(t, lbl)
+    target = t
+    if lbl then Controls.TargetSelect.String = lbl end
+    for _, k in ipairs({ "power", "brightness", "color", "ct", "effect" }) do userTouch[k] = nil end
+    updateEffectChoices()
+    updateTargetFeedback()
+    -- default the Scenes page to the room/zone being controlled
+    if t and t.kind == "group" and groups[t.id] and groups[t.id].kind ~= "Home" then
+      Controls.SceneGroup.String = groups[t.id].kind .. ": " .. groups[t.id].name
+      scenePage = 1
+      updateSceneButtons()
+    end
+  end
+
+  -- parsing ----------------------------------------------------------
+  local function decode(resp)
+    local ok, t = pcall(rapidjson.decode, resp or "")
+    if ok and type(t) == "table" and type(t.data) == "table" then return t.data end
+    return nil
+  end
+
+  local function sortIds(tbl, ids)
+    table.sort(ids, function(a, b)
+      local na, nb = tbl[a].name:lower(), tbl[b].name:lower()
+      if na == nb then return a < b end
+      return na < nb
+    end)
+    return ids
+  end
+
+  local function parseLights(data)
+    local fresh, ids = {}, {}
+    for _, d in ipairs(data) do
+      local old = lights[d.id] or {}
+      local l = { id = d.id }
+      l.owner = d.owner and d.owner.rid
+      local dev = l.owner and devices[l.owner]
+      l.name = (d.metadata and d.metadata.name) or (dev and dev.name) or d.id
+      l.product = dev and dev.product
+      l.on = d.on and d.on.on == true
+      l.bri = d.dimming and d.dimming.brightness
+      l.dimmable = d.dimming ~= nil
+      if d.color_temperature then
+        l.mirek = d.color_temperature.mirek
+        l.ctMode = d.color_temperature.mirek_valid == true and l.mirek ~= nil
+        local sch = d.color_temperature.mirek_schema or {}
+        l.mirekMin, l.mirekMax = sch.mirek_minimum or 153, sch.mirek_maximum or 500
+      end
+      if d.color then
+        l.xy = d.color.xy
+        l.gamut = d.color.gamut
+      end
+      if d.effects then
+        l.effect = d.effects.status or d.effects.effect
+        l.effectValues = d.effects.status_values or d.effects.effect_values
+      end
+      -- keep the device's product name when the device list has not loaded yet
+      l.product = l.product or old.product
+      fresh[d.id] = l
+      table.insert(ids, d.id)
+    end
+    lights = fresh
+    lightOrder = sortIds(lights, ids)
+  end
+
+  local function parseDevices(data)
+    devices = {}
+    bridgeDevice = nil
+    for _, d in ipairs(data) do
+      local pd = d.product_data or {}
+      local dev = { name = d.metadata and d.metadata.name or "", model = pd.model_id or "", product = pd.product_name or "",
+        sw = pd.software_version or "", lights = {} }
+      for _, s in ipairs(d.services or {}) do
+        if s.rtype == "light" then table.insert(dev.lights, s.rid) end
+        if s.rtype == "bridge" then bridgeDevice = dev end
+      end
+      devices[d.id] = dev
+    end
+  end
+
+  local function parseGroups(rooms, zones, homes)
+    local fresh, ids = {}, {}
+    glOwner = {}
+    local function svcGl(d)
+      for _, s in ipairs(d.services or {}) do if s.rtype == "grouped_light" then return s.rid end end
+    end
+    for _, d in ipairs(rooms or {}) do
+      local g = { id = d.id, kind = "Room", name = d.metadata and d.metadata.name or "Room", gl = svcGl(d), lightIds = {} }
+      for _, c in ipairs(d.children or {}) do
+        if c.rtype == "device" and devices[c.rid] then
+          for _, lid in ipairs(devices[c.rid].lights) do table.insert(g.lightIds, lid) end
+        elseif c.rtype == "light" then
+          table.insert(g.lightIds, c.rid)
+        end
+      end
+      fresh[d.id] = g
+      table.insert(ids, d.id)
+    end
+    for _, d in ipairs(zones or {}) do
+      local g = { id = d.id, kind = "Zone", name = d.metadata and d.metadata.name or "Zone", gl = svcGl(d), lightIds = {} }
+      for _, c in ipairs(d.children or {}) do
+        if c.rtype == "light" then table.insert(g.lightIds, c.rid)
+        elseif c.rtype == "device" and devices[c.rid] then
+          for _, lid in ipairs(devices[c.rid].lights) do table.insert(g.lightIds, lid) end
+        end
+      end
+      fresh[d.id] = g
+      table.insert(ids, d.id)
+    end
+    homeId = nil
+    for _, d in ipairs(homes or {}) do
+      fresh[d.id] = { id = d.id, kind = "Home", name = "All Lights", gl = svcGl(d), lightIds = {} }
+      homeId = homeId or d.id
+    end
+    groups = fresh
+    for gid, g in pairs(groups) do if g.gl then glOwner[g.gl] = gid end end
+    table.sort(ids, function(a, b)
+      local ga, gb = groups[a], groups[b]
+      if ga.kind ~= gb.kind then return ga.kind == "Room" end
+      return ga.name:lower() < gb.name:lower()
+    end)
+    groupOrder = ids
+  end
+
+  local function parseGroupedLights(data)
+    glState = {}
+    for _, d in ipairs(data) do
+      glState[d.id] = { on = d.on and d.on.on == true, bri = d.dimming and d.dimming.brightness }
+    end
+  end
+
+  local function parseScenes(data)
+    local fresh = {}
+    for _, d in ipairs(data) do
+      fresh[d.id] = { id = d.id, name = d.metadata and d.metadata.name or "Scene", group = d.group and d.group.rid,
+        active = d.status and d.status.active or "inactive",
+        palette = d.palette ~= nil and ((#(d.palette.color or {}) + #(d.palette.color_temperature or {})) > 1) }
+    end
+    scenes = fresh
+  end
+
+  local function setOnline(ok, msg)
+    Controls.Online.Boolean = ok
+    if ok then
+      failCount = 0
+      setStatus(0, "OK")
+    else
+      failCount = failCount + 1
+      if failCount >= 2 then setStatus(2, msg or "No response") end
+    end
+  end
+
+  -- polling ----------------------------------------------------------
+  local function get(key, rtype, cb)
+    for _, q in ipairs(queue) do if q.key == key then return end end
+    enqueue({ key = key, method = "GET", path = "/clip/v2/resource/" .. rtype, callback = function(code, resp, err)
+      if code == 200 then
+        local data = decode(resp)
+        if data then cb(data); setOnline(true); return end
+        setOnline(false, "Bad JSON from bridge")
+      elseif code == 401 or code == 403 then
+        -- handled by the queue
+      else
+        setOnline(false, (code == nil or code == 0) and ("No response from bridge" .. (err and (": " .. tostring(err)) or "")) or ("HTTP " .. tostring(code)))
+      end
+    end })
+  end
+
+  local function fullRead()
+    local rooms, zones, homes
+    get("g:bridge", "bridge", function(data)
+      local b = data[1] or {}
+      Controls.BridgeId.String = b.bridge_id or ""
+    end)
+    get("g:device", "device", function(data)
+      parseDevices(data)
+      if bridgeDevice then
+        Controls.BridgeName.String = bridgeDevice.name
+        Controls.Model.String = bridgeDevice.product .. "  (" .. bridgeDevice.model .. ")"
+        Controls.Software.String = bridgeDevice.sw
+      end
+    end)
+    get("g:room", "room", function(data) rooms = data end)
+    get("g:zone", "zone", function(data) zones = data end)
+    get("g:home", "bridge_home", function(data) homes = data end)
+    get("g:light", "light", function(data) parseLights(data) end)
+    get("g:grouped", "grouped_light", function(data)
+      parseGroupedLights(data)
+      if rooms and zones then parseGroups(rooms, zones, homes) end
+    end)
+    get("g:scene", "scene", function(data)
+      parseScenes(data)
+      local nr, nz = 0, 0
+      for _, g in pairs(groups) do if g.kind == "Room" then nr = nr + 1 elseif g.kind == "Zone" then nz = nz + 1 end end
+      local ns = 0
+      for _ in pairs(scenes) do ns = ns + 1 end
+      Controls.Counts.String = string.format("%d lights, %d rooms, %d zones, %d scenes", #lightOrder, nr, nz, ns)
+      rebuildChoices()
+      updateAll()
+    end)
+  end
+
+  Poll = function()
+    if not configured() then
+      if host() == "" then setStatus(3, "Enter bridge IP") else setStatus(3, "Not paired - press Pair") end
+      Controls.Online.Boolean = false
+      return
+    end
+    pollCount = pollCount + 1
+    if pollCount == 1 or pollCount % FULL_EVERY == 0 or next(groups) == nil then
+      fullRead()
+    else
+      get("g:light", "light", function(data) parseLights(data) end)
+      get("g:grouped", "grouped_light", function(data) parseGroupedLights(data) end)
+      get("g:scene", "scene", function(data) parseScenes(data); updateAll() end)
+    end
+  end
+
+  local pollTimer = Timer.New()
+  pollTimer.EventHandler = Poll
+
+  local function restart()
+    generation = generation + 1
+    queue = {}
+    busy, waiting = false, false
+    failCount, pollCount = 0, 0
+    pollTimer:Stop()
+    setStatus(5, "Connecting")
+    Poll()
+    pollTimer:Start(POLL)
+  end
+
+  -- pairing ----------------------------------------------------------
+  -- POST /api with devicetype and generateclientkey. The bridge answers with
+  -- error 101 until its link button has been pressed, so the plugin retries
+  -- every 2 s for 30 s.
+  local pairUntil = nil
+  local function pairAttempt()
+    if not pairUntil then return end
+    local left = pairUntil - now()
+    if left <= 0 then
+      pairUntil = nil
+      setStatus(2, "Pairing timed out")
+      setError("Pairing timed out: press the link button on the bridge, then press Pair again")
+      return
+    end
+    setStatus(5, string.format("Press bridge link button (%d s)", math.ceil(left)))
+    enqueue({ method = "POST", path = "/api", noKey = true,
+      body = { devicetype = "qsys_hue#core", generateclientkey = true },
+      callback = function(code, resp, err)
+        if not pairUntil then return end
+        local ok, t = pcall(rapidjson.decode, resp or "")
+        local item = ok and type(t) == "table" and t[1] or nil
+        if code == 200 and item and item.success and item.success.username then
+          pairUntil = nil
+          Controls.AppKey.String = item.success.username
+          setError("")
+          print("Hue: paired, app key = " .. item.success.username)
+          restart()
+          return
+        end
+        if item and item.error and item.error.type ~= 101 then
+          pairUntil = nil
+          setStatus(2, "Pairing failed")
+          setError("Pairing failed: " .. tostring(item.error.description))
+          return
+        end
+        if code == nil or code == 0 or (code >= 400) then
+          setError("Pairing: " .. (err and tostring(err) or ("HTTP " .. tostring(code))))
+        end
+        Timer.CallAfter(pairAttempt, 2)
+      end })
+  end
+
+  Controls.Pair.EventHandler = function()
+    if host() == "" then setError("Enter the bridge IP address first"); return end
+    pollTimer:Stop()
+    generation = generation + 1
+    queue, busy, waiting = {}, false, false
+    pairUntil = now() + 30
+    setError("")
+    pairAttempt()
+  end
+
+  Controls.ForgetKey.EventHandler = function()
+    -- CLIP v2 has no local call to delete an app key; remove it in the Hue app
+    -- (Settings > Apps) if it should be revoked on the bridge as well.
+    pairUntil = nil
+    Controls.AppKey.String = ""
+    pollTimer:Stop()
+    generation = generation + 1
+    queue, busy, waiting = {}, false, false
+    Controls.Online.Boolean = false
+    setStatus(3, "Not paired - press Pair")
+    setError("")
+  end
+
+  Controls.Connect.EventHandler = restart
+  Controls.IPAddress.EventHandler = restart
+  Controls.AppKey.EventHandler = restart
+
+  -- target -----------------------------------------------------------
+  Controls.TargetSelect.EventHandler = function(c)
+    local t = targetLabels[c.String]
+    if t then setTarget(t) end
+  end
+
+  Controls.Identify.EventHandler = function()
+    sendTarget({ alert = { action = "breathe" } })
+  end
+
+  -- power ------------------------------------------------------------
+  local function setPower(on)
+    touch("power")
+    Controls.Power.Boolean = on
+    sendTarget({ on = { on = on } })
+  end
+  Controls.Power.EventHandler = function(c) setPower(c.Boolean) end
+  Controls.PowerOn.EventHandler = function() setPower(true) end
+  Controls.PowerOff.EventHandler = function() setPower(false) end
+
+  -- brightness -------------------------------------------------------
+  local function brightnessBody(v)
+    v = round(v)
+    if v <= 0 then return { on = { on = false } } end
+    return { on = { on = true }, dimming = { brightness = v } }
+  end
+
+  Controls.Brightness.EventHandler = function(c)
+    touch("brightness"); touch("power")
+    Controls.Power.Boolean = round(c.Value) > 0
+    sendTarget(brightnessBody(c.Value))
+  end
+  local function stepBrightness(dir)
+    touch("brightness")
+    local step = round(Controls.BrightnessStep.Value)
+    Controls.Brightness.Value = clamp(Controls.Brightness.Value + step * dir, 0, 100)
+    sendTarget({ dimming_delta = { action = dir > 0 and "up" or "down", brightness_delta = step } })
+  end
+  Controls.BrightnessUp.EventHandler = function() stepBrightness(1) end
+  Controls.BrightnessDown.EventHandler = function() stepBrightness(-1) end
+
+  -- color ------------------------------------------------------------
+  local function sendColorRgb(r, g, b, withBrightness)
+    touch("color"); touch("power")
+    Controls.Power.Boolean = true
+    local body = { on = { on = true }, color = { xy = rgbToXy(r, g, b, targetGamut()) } }
+    if withBrightness then
+      touch("brightness")
+      local _, _, v = rgbToHsv(r, g, b)
+      Controls.Brightness.Value = math.max(v, 1)
+      body.dimming = { brightness = math.max(v, 1) }
+    end
+    sendTarget(body)
+  end
+
+  local function hueSatChanged()
+    local h, s = round(Controls.Hue.Value), round(Controls.Saturation.Value)
+    local r, g, b = hsvToRgb(h, s, 100)
+    local rr, gg, bb = hsvToRgb(h, s, Controls.Brightness.Value)
+    Controls.Red.Value, Controls.Green.Value, Controls.Blue.Value = rr, gg, bb
+    setSwatch(r, g, b)
+    Controls.ColorMode.String = "Color"
+    sendColorRgb(r, g, b, false)
+  end
+  Controls.Hue.EventHandler = hueSatChanged
+  Controls.Saturation.EventHandler = hueSatChanged
+
+  local function rgbSet(r, g, b)
+    local h, s = rgbToHsv(r, g, b)
+    Controls.Hue.Value, Controls.Saturation.Value = h, s
+    setSwatch(hsvToRgb(h, s, 100))
+    Controls.ColorMode.String = "Color"
+    sendColorRgb(r, g, b, true)
+  end
+  local function rgbChanged()
+    rgbSet(round(Controls.Red.Value), round(Controls.Green.Value), round(Controls.Blue.Value))
+  end
+  Controls.Red.EventHandler = rgbChanged
+  Controls.Green.EventHandler = rgbChanged
+  Controls.Blue.EventHandler = rgbChanged
+
+  Controls.HexColor.EventHandler = function(c)
+    local hx = c.String:gsub("#", ""):gsub("%s", "")
+    if #hx == 6 and hx:match("^%x+$") then
+      local r, g, b = tonumber(hx:sub(1, 2), 16), tonumber(hx:sub(3, 4), 16), tonumber(hx:sub(5, 6), 16)
+      Controls.Red.Value, Controls.Green.Value, Controls.Blue.Value = r, g, b
+      rgbSet(r, g, b)
+    else
+      setError("Hex color must look like #FF8800")
+    end
+  end
+
+  for i, qc in ipairs(QuickColors) do
+    Controls.QuickColor[i].EventHandler = function()
+      -- quick colors keep the current brightness
+      local r, g, b = qc[2][1], qc[2][2], qc[2][3]
+      local h, s = rgbToHsv(r, g, b)
+      Controls.Hue.Value, Controls.Saturation.Value = h, s
+      local rr, gg, bb = hsvToRgb(h, s, Controls.Brightness.Value)
+      Controls.Red.Value, Controls.Green.Value, Controls.Blue.Value = rr, gg, bb
+      setSwatch(hsvToRgb(h, s, 100))
+      Controls.ColorMode.String = "Color"
+      sendColorRgb(r, g, b, false)
+    end
+  end
+
+  -- white ------------------------------------------------------------
+  local function sendCt(k)
+    touch("ct"); touch("color"); touch("power")
+    local mirek = kelvinToMirek(clamp(k, 2000, 6500))
+    local l = target and target.kind == "light" and lights[target.id]
+    mirek = clamp(mirek, (l and l.mirekMin) or 153, (l and l.mirekMax) or 500)
+    Controls.ColorTemp.Value = clamp(mirekToKelvin(mirek), 2000, 6500)
+    setSwatch(kelvinToRgb(mirekToKelvin(mirek)))
+    Controls.ColorMode.String = "White"
+    Controls.Power.Boolean = true
+    sendTarget({ on = { on = true }, color_temperature = { mirek = mirek } })
+  end
+  Controls.ColorTemp.EventHandler = function(c) sendCt(c.Value) end
+  for i, wp in ipairs(WhitePresets) do
+    Controls.WhitePreset[i].EventHandler = function() sendCt(wp[2]) end
+  end
+
+  -- rooms & zones ----------------------------------------------------
+  local function groupPut(gid, body)
+    local g = groups[gid]
+    if g and g.gl then putResource("grouped_light", g.gl, body) end
+  end
+
+  Controls.AllOn.EventHandler = function() if homeId then groupPut(homeId, { on = { on = true } }) end end
+  Controls.AllOff.EventHandler = function() if homeId then groupPut(homeId, { on = { on = false } }) end end
+
+  for i = 1, GROUP_TILES do
+    Controls.GroupPower[i].EventHandler = function(c)
+      local gid = groupTiles[i]
+      if not gid then c.Boolean = false; return end
+      touch("gp" .. gid)
+      groupPut(gid, { on = { on = c.Boolean } })
+    end
+    Controls.GroupBrightness[i].EventHandler = function(c)
+      local gid = groupTiles[i]
+      if not gid then return end
+      touch("gb" .. gid); touch("gp" .. gid)
+      Controls.GroupPower[i].Boolean = round(c.Value) > 0
+      groupPut(gid, brightnessBody(c.Value))
+    end
+    Controls.GroupControl[i].EventHandler = function()
+      local gid = groupTiles[i]
+      if not gid then return end
+      local g = groups[gid]
+      setTarget({ kind = "group", id = gid }, g.kind .. ": " .. g.name)
+    end
+  end
+  Controls.GroupPageUp.EventHandler = function() groupPage = groupPage + 1; updateGroupTiles() end
+  Controls.GroupPageDown.EventHandler = function() groupPage = groupPage - 1; updateGroupTiles() end
+
+  -- lights -----------------------------------------------------------
+  Controls.LightFilter.EventHandler = function() lightPage = 1; updateLightTiles() end
+  for i = 1, LIGHT_TILES do
+    Controls.LightPower[i].EventHandler = function(c)
+      local lid = lightTiles[i]
+      if not lid then c.Boolean = false; return end
+      touch("lp" .. lid)
+      putResource("light", lid, { on = { on = c.Boolean } })
+    end
+    Controls.LightBrightness[i].EventHandler = function(c)
+      local lid = lightTiles[i]
+      if not lid then return end
+      touch("lb" .. lid); touch("lp" .. lid)
+      Controls.LightPower[i].Boolean = round(c.Value) > 0
+      putResource("light", lid, brightnessBody(c.Value))
+    end
+    Controls.LightControl[i].EventHandler = function()
+      local lid = lightTiles[i]
+      if not lid or not lights[lid] then return end
+      setTarget({ kind = "light", id = lid }, "Light: " .. lightLabel(lights[lid]))
+    end
+  end
+  Controls.LightPageUp.EventHandler = function() lightPage = lightPage + 1; updateLightTiles() end
+  Controls.LightPageDown.EventHandler = function() lightPage = lightPage - 1; updateLightTiles() end
+
+  -- scenes -----------------------------------------------------------
+  local function recallScene(s)
+    if not s or needConfig() then return end
+    local action = (Controls.SceneDynamic.Boolean and s.palette) and "dynamic_palette" or "active"
+    local recall = { action = action }
+    local ms = fadeMs(Controls.SceneTransition)
+    if ms > 0 then recall.duration = ms end
+    -- show it as active straight away; the next poll confirms it
+    for _, o in pairs(scenes) do if o.group == s.group then o.active = "inactive" end end
+    s.active = (action == "dynamic_palette") and "dynamic_palette" or "static"
+    updateSceneButtons()
+    enqueue({ key = "scene", method = "PUT", path = "/clip/v2/resource/scene/" .. s.id, body = { recall = recall }, rate = "group" })
+  end
+
+  for i = 1, SCENE_BUTTONS do
+    Controls.SceneButton[i].EventHandler = function(c)
+      local s = sceneList[(scenePage - 1) * SCENE_BUTTONS + i]
+      if s then recallScene(s) else c.Boolean = false end
+    end
+  end
+  Controls.SceneSelect.EventHandler = function(c)
+    for _, s in ipairs(sceneList) do if s.name == c.String then recallScene(s); return end end
+    setError("No scene named '" .. c.String .. "' in " .. Controls.SceneGroup.String)
+  end
+  Controls.SceneGroup.EventHandler = function() scenePage = 1; updateSceneButtons() end
+  Controls.ScenePageUp.EventHandler = function() scenePage = scenePage + 1; updateSceneButtons() end
+  Controls.ScenePageDown.EventHandler = function() scenePage = scenePage - 1; updateSceneButtons() end
+  Controls.SceneGroupOff.EventHandler = function()
+    local gid = sceneGroupId()
+    if gid then groupPut(gid, { on = { on = false } }) end
+  end
+
+  -- effects ----------------------------------------------------------
+  Controls.EffectSelect.EventHandler = function(c)
+    local eff = c.String
+    if eff == "" then return end
+    touch("effect")
+    local n = 0
+    for _, lid in ipairs(targetLightIds()) do
+      local l = lights[lid]
+      local supported = false
+      for _, e in ipairs((l and l.effectValues) or {}) do if e == eff then supported = true end end
+      if supported then
+        local body = { effects = { effect = eff } }
+        if eff ~= "no_effect" then body.on = { on = true } end
+        putResource("light", lid, body)
+        n = n + 1
+      end
+    end
+    Controls.EffectStatus.String = (n == 0) and "No light in the target supports this effect"
+      or string.format("Sent '%s' to %d light%s", eff, n, n == 1 and "" or "s")
+  end
+
+  -- startup ----------------------------------------------------------
+  Controls.ColorSwatch.Boolean = true
+  Controls.EffectSelect.Choices = DEFAULT_EFFECTS
+  updateAll()
+  setError("")
+  restart()
+end

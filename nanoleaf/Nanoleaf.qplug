@@ -1,0 +1,941 @@
+--[[ Nanoleaf Open API control plugin for Q-SYS
+  Controls Nanoleaf Light Panels (Aurora), Canvas, Shapes, Elements and Lines
+  over the local Nanoleaf Open API (HTTP, port 16021).
+
+  References:
+    Nanoleaf Open API documentation  - https://forum.nanoleaf.me/docs/openapi
+    Q-SYS Plugin / Lua documentation - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/HttpClient.htm
+]]
+
+PluginInfo = {
+  Name = "Lighting~Nanoleaf Open API",
+  Version = "1.0",
+  BuildVersion = "1.0.0.0",
+  Id = "8ad083e0-b14d-4387-8671-9b4053ac46a4",
+  Author = "AV Programming",
+  Description = "Control Nanoleaf lights (power, brightness, color, color temperature, effects, rhythm, per-panel color) over the local Nanoleaf Open API.",
+  ShowDebug = true,
+}
+
+-- Palette ---------------------------------------------------------------
+local C = {
+  bg      = {22, 24, 29},
+  panel   = {34, 37, 44},
+  stroke  = {58, 63, 74},
+  accent  = {62, 181, 74},    -- Nanoleaf green
+  accentD = {30, 80, 38},
+  text    = {232, 234, 238},
+  sub     = {150, 157, 170},
+  btn     = {52, 56, 66},
+  red     = {214, 69, 65},
+  amber   = {240, 165, 40},
+  blue    = {64, 140, 230},
+}
+
+local QuickColors = {
+  {"Red",    {255, 0, 0}},     {"Orange", {255, 110, 0}},
+  {"Yellow", {255, 210, 0}},   {"Green",  {0, 220, 60}},
+  {"Cyan",   {0, 210, 230}},   {"Blue",   {0, 70, 255}},
+  {"Purple", {150, 40, 255}},  {"Pink",   {255, 60, 170}},
+}
+local WhitePresets = { {"Candle", 1900}, {"Warm", 2700}, {"Neutral", 4000}, {"Daylight", 5000}, {"Cool", 6500} }
+local EFFECT_BUTTONS = 12
+
+function GetColor(props)
+  return C.accent
+end
+
+function GetPrettyName(props)
+  return "Nanoleaf Open API v" .. PluginInfo.Version
+end
+
+local PageNames = { "Control", "Effects", "Panels", "Setup" }
+
+function GetPages(props)
+  local pages = {}
+  for _, name in ipairs(PageNames) do table.insert(pages, { name = name }) end
+  return pages
+end
+
+function GetProperties()
+  return {
+    { Name = "Port", Type = "integer", Min = 1, Max = 65535, Value = 16021 },
+    { Name = "Poll Interval (s)", Type = "integer", Min = 1, Max = 60, Value = 3 },
+    { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
+  }
+end
+
+function RectifyProperties(props)
+  return props
+end
+
+function GetControls(props)
+  local ctrls = {
+    -- status
+    { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true },
+    { Name = "Online", ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true },
+    { Name = "DeviceName", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    -- power
+    { Name = "Power", ControlType = "Button", ButtonType = "Toggle", PinStyle = "Both", UserPin = true },
+    { Name = "PowerOn", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "PowerOff", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    -- brightness
+    { Name = "Brightness", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, PinStyle = "Both", UserPin = true },
+    { Name = "BrightnessUp", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "BrightnessDown", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "BrightnessStep", ControlType = "Knob", ControlUnit = "Integer", Min = 1, Max = 50, DefaultValue = 10, PinStyle = "Input", UserPin = true },
+    { Name = "FadeTime", ControlType = "Knob", ControlUnit = "Seconds", Min = 0, Max = 60, DefaultValue = 0, PinStyle = "Input", UserPin = true },
+    -- color
+    { Name = "Hue", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 360, PinStyle = "Both", UserPin = true },
+    { Name = "Saturation", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 100, PinStyle = "Both", UserPin = true },
+    { Name = "Red", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, PinStyle = "Both", UserPin = true },
+    { Name = "Green", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, PinStyle = "Both", UserPin = true },
+    { Name = "Blue", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, PinStyle = "Both", UserPin = true },
+    { Name = "HexColor", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "ColorSwatch", ControlType = "Indicator", IndicatorType = "Led", PinStyle = "None", UserPin = false },
+    { Name = "ColorMode", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "QuickColor", ControlType = "Button", ButtonType = "Trigger", Count = #QuickColors, PinStyle = "Input", UserPin = true },
+    -- white
+    { Name = "ColorTemp", ControlType = "Knob", ControlUnit = "Integer", Min = 1200, Max = 6500, PinStyle = "Both", UserPin = true },
+    { Name = "WhitePreset", ControlType = "Button", ButtonType = "Trigger", Count = #WhitePresets, PinStyle = "Input", UserPin = true },
+    -- effects
+    { Name = "EffectSelect", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "EffectCurrent", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "EffectNext", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "EffectPrev", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "EffectRefresh", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "EffectCount", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "EffectButton", ControlType = "Button", ButtonType = "Toggle", Count = EFFECT_BUTTONS, PinStyle = "Both", UserPin = true },
+    { Name = "EffectPageUp", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "EffectPageDown", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "EffectPageLabel", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "None", UserPin = false },
+    -- rhythm
+    { Name = "RhythmConnected", ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true },
+    { Name = "RhythmActive", ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true },
+    { Name = "RhythmMode", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    -- panels
+    { Name = "PanelCount", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "Orientation", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 360, PinStyle = "Both", UserPin = true },
+    { Name = "Identify", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "PanelSelect", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "PanelInfo", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "None", UserPin = false },
+    { Name = "PanelRed", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, DefaultValue = 255, PinStyle = "Input", UserPin = true },
+    { Name = "PanelGreen", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, DefaultValue = 255, PinStyle = "Input", UserPin = true },
+    { Name = "PanelBlue", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 255, DefaultValue = 255, PinStyle = "Input", UserPin = true },
+    { Name = "PanelSwatch", ControlType = "Indicator", IndicatorType = "Led", PinStyle = "None", UserPin = false },
+    { Name = "PanelApply", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "PanelApplyAll", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "PanelTransition", ControlType = "Knob", ControlUnit = "Seconds", Min = 0, Max = 10, DefaultValue = 1, PinStyle = "Input", UserPin = true },
+    -- setup
+    { Name = "IPAddress", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "AuthToken", ControlType = "Text", PinStyle = "Both", UserPin = true },
+    { Name = "Pair", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "Unpair", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "Connect", ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true },
+    { Name = "Model", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "SerialNumber", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "Firmware", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "Manufacturer", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+    { Name = "LastError", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output", UserPin = true },
+  }
+  return ctrls
+end
+
+function GetControlLayout(props)
+  local layout, graphics = {}, {}
+  local page = PageNames[props["page_index"].Value]
+  local W = 640
+
+  local function box(text, x, y, w, h)
+    table.insert(graphics, { Type = "GroupBox", Text = text, HTextAlign = "Left", FontSize = 13, FontStyle = "Bold",
+      Color = C.accent, Fill = C.panel, StrokeColor = C.stroke, StrokeWidth = 1, CornerRadius = 8,
+      Position = { x, y }, Size = { w, h } })
+  end
+  local function label(text, x, y, w, h, align, size, color)
+    table.insert(graphics, { Type = "Label", Text = text, HTextAlign = align or "Right", FontSize = size or 12,
+      Color = color or C.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+  local function button(name, legend, x, y, w, h, color, extra)
+    local b = { PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
+      Color = color or C.accent, OffColor = C.btn, UnlinkOffColor = true, FontSize = 12, FontColor = C.text,
+      CornerRadius = 6, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0 }
+    for k, v in pairs(extra or {}) do b[k] = v end
+    layout[name] = b
+  end
+  local function textbox(name, pretty, x, y, w, h, extra)
+    local t = { PrettyName = pretty, Style = "Text", Position = { x, y }, Size = { w, h or 22 }, FontSize = 12,
+      Color = { 20, 22, 26 }, TextColor = C.text, HTextAlign = "Center", CornerRadius = 4, StrokeColor = C.stroke, StrokeWidth = 1 }
+    for k, v in pairs(extra or {}) do t[k] = v end
+    layout[name] = t
+  end
+  local function combo(name, pretty, x, y, w, h)
+    layout[name] = { PrettyName = pretty, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 }, FontSize = 12,
+      Color = { 20, 22, 26 }, TextColor = C.text }
+  end
+  local function led(name, pretty, x, y, s, color)
+    layout[name] = { PrettyName = pretty, Style = "Led", Position = { x, y }, Size = { s, s }, Color = color or C.accent,
+      OffColor = { 60, 60, 60 }, UnlinkOffColor = true, StrokeWidth = 1, StrokeColor = C.stroke, Margin = 2 }
+  end
+
+  -- page background + header (all pages)
+  local H = ({ Control = 640, Effects = 520, Panels = 470, Setup = 440 })[page] or 600
+  table.insert(graphics, { Type = "GroupBox", Fill = C.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { W, H } })
+  table.insert(graphics, { Type = "GroupBox", Fill = C.panel, StrokeColor = C.accent, StrokeWidth = 1, CornerRadius = 8,
+    Position = { 8, 8 }, Size = { W - 16, 48 } })
+  label("nanoleaf", 20, 14, 140, 36, "Left", 24, C.accent)
+  label(page:upper(), 150, 22, 110, 20, "Left", 12, C.sub)
+  textbox("DeviceName", "Device Name", 262, 20, 170, 24, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", FontSize = 13 })
+  layout["Status"] = { PrettyName = "Status", Style = "Text", Position = { 438, 20 }, Size = { 150, 24 }, FontSize = 11, CornerRadius = 4 }
+  led("Online", "Online", 598, 20, 24)
+
+  if page == "Control" then
+    -- Power
+    box("Power", 8, 64, 200, 160)
+    button("Power", "POWER", 24, 92, 168, 64, C.accent, { FontSize = 18, FontStyle = "Bold" })
+    button("PowerOn", "On", 24, 168, 80, 36, C.accentD)
+    button("PowerOff", "Off", 112, 168, 80, 36, C.accentD)
+
+    -- Brightness
+    box("Brightness", 216, 64, 416, 160)
+    layout["Brightness"] = { PrettyName = "Brightness~Level", Style = "Fader", Position = { 232, 96 }, Size = { 300, 28 }, Color = C.accent }
+    button("BrightnessDown", "-", 540, 96, 36, 28, C.accentD, { FontSize = 18 })
+    button("BrightnessUp", "+", 582, 96, 36, 28, C.accentD, { FontSize = 18 })
+    label("Step", 232, 140, 50, 20)
+    layout["BrightnessStep"] = { PrettyName = "Brightness~Step", Style = "Text", Position = { 288, 140 }, Size = { 56, 22 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
+    label("Fade Time (s)", 352, 140, 110, 20)
+    layout["FadeTime"] = { PrettyName = "Brightness~Fade Time", Style = "Text", Position = { 468, 140 }, Size = { 56, 22 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
+    label("Fade time applies to brightness changes (Nanoleaf 'duration').", 232, 184, 390, 20, "Left", 11)
+
+    -- Color
+    box("Color", 8, 232, 624, 220)
+    local rows = { { "Hue", "Hue", { 230, 80, 200 } }, { "Saturation", "Saturation", C.blue },
+                   { "Red", "Red", C.red }, { "Green", "Green", { 60, 200, 80 } }, { "Blue", "Blue", { 60, 110, 240 } } }
+    for i, r in ipairs(rows) do
+      local y = 260 + (i - 1) * 34
+      label(r[2], 16, y + 2, 76, 20)
+      layout[r[1]] = { PrettyName = "Color~" .. r[2], Style = "Fader", Position = { 100, y }, Size = { 300, 24 }, Color = r[3] }
+    end
+    led("ColorSwatch", "Color~Swatch", 432, 260, 112, { 255, 255, 255 })
+    layout["ColorSwatch"].Margin = 0
+    label("Hex", 552, 262, 70, 20, "Left")
+    textbox("HexColor", "Color~Hex", 552, 284, 72, 24)
+    label("Mode", 552, 320, 70, 20, "Left")
+    textbox("ColorMode", "Color~Mode", 552, 342, 72, 24, { Color = C.panel })
+    label("Hue / Sat change color only.", 432, 392, 194, 16, "Left", 10)
+    label("RGB and Hex also set brightness.", 432, 408, 194, 16, "Left", 10)
+
+    -- White
+    box("White (Color Temperature)", 8, 460, 624, 92)
+    label("Kelvin", 16, 490, 76, 20)
+    layout["ColorTemp"] = { PrettyName = "White~Color Temp", Style = "Fader", Position = { 100, 488 }, Size = { 300, 24 }, Color = C.amber }
+    for i, wp in ipairs(WhitePresets) do
+      local x = 100 + (i - 1) * 62
+      button("WhitePreset " .. i, wp[1], x, 518, 58, 24, C.amber, { Color = C.amber, OffColor = { 70, 60, 44 } })
+    end
+    label("1200 K - 6500 K (device limits apply)", 412, 490, 210, 20, "Left", 11)
+
+    -- Quick colors
+    box("Quick Colors", 8, 560, 624, 72)
+    for i, qc in ipairs(QuickColors) do
+      local x = 20 + (i - 1) * 76
+      button("QuickColor " .. i, qc[1], x, 590, 70, 32, qc[2],
+        { OffColor = { math.floor(qc[2][1] * 0.75), math.floor(qc[2][2] * 0.75), math.floor(qc[2][3] * 0.75) },
+          FontColor = { 20, 20, 20 }, FontStyle = "Bold" })
+    end
+
+  elseif page == "Effects" then
+    box("Scenes & Effects", 8, 64, 624, 104)
+    label("Select", 16, 92, 70, 20)
+    combo("EffectSelect", "Effects~Select", 92, 90, 330, 26)
+    button("EffectPrev", "< Prev", 430, 90, 64, 26, C.accentD)
+    button("EffectNext", "Next >", 500, 90, 64, 26, C.accentD)
+    button("EffectRefresh", "Refresh", 570, 90, 54, 26, C.btn)
+    label("Now Playing", 16, 128, 70, 20)
+    textbox("EffectCurrent", "Effects~Current", 92, 126, 330, 26, { Color = C.panel, TextColor = C.accent, FontSize = 14, FontStyle = "Bold" })
+    textbox("EffectCount", "Effects~Count", 430, 126, 194, 26, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
+
+    box("Effect Presets", 8, 176, 624, 236)
+    for i = 1, EFFECT_BUTTONS do
+      local col, row = (i - 1) % 4, math.floor((i - 1) / 4)
+      button("EffectButton " .. i, "", 20 + col * 152, 206 + row * 54, 144, 46, C.accent,
+        { FontSize = 12, WordWrap = true })
+    end
+    button("EffectPageDown", "< Page", 20, 372, 80, 28, C.btn)
+    textbox("EffectPageLabel", "Effects~Page", 108, 374, 424, 24, { Color = C.panel, StrokeWidth = 0, TextColor = C.sub })
+    button("EffectPageUp", "Page >", 540, 372, 80, 28, C.btn)
+
+    box("Rhythm (sound reactive)", 8, 420, 624, 92)
+    led("RhythmConnected", "Rhythm~Connected", 24, 452, 20)
+    label("Module / Mic Connected", 50, 452, 160, 20, "Left")
+    led("RhythmActive", "Rhythm~Active", 24, 480, 20, C.blue)
+    label("Rhythm Effect Active", 50, 480, 160, 20, "Left")
+    label("Input", 300, 466, 60, 20)
+    combo("RhythmMode", "Rhythm~Input", 366, 464, 160, 26)
+    label("Aurora Rhythm module only", 366, 492, 220, 16, "Left", 10)
+
+  elseif page == "Panels" then
+    box("Layout", 8, 64, 624, 100)
+    label("Panels", 16, 92, 70, 20)
+    textbox("PanelCount", "Panels~Count", 92, 90, 70, 24, { Color = C.panel })
+    label("Orientation", 170, 92, 90, 20)
+    layout["Orientation"] = { PrettyName = "Panels~Orientation", Style = "Text", Position = { 266, 90 }, Size = { 70, 24 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
+    label("deg", 340, 92, 30, 20, "Left")
+    button("Identify", "Identify (Flash)", 470, 88, 150, 30, C.amber, { Color = C.amber, OffColor = { 200, 135, 30 }, FontColor = { 20, 20, 20 }, FontStyle = "Bold" })
+    label("Orientation rotates how effects map onto the layout (0-360 degrees).", 16, 130, 600, 20, "Left", 11)
+
+    box("Individual Panel Color", 8, 172, 624, 290)
+    label("Panel", 16, 202, 70, 20)
+    combo("PanelSelect", "Panels~Select", 92, 200, 220, 26)
+    textbox("PanelInfo", "Panels~Info", 320, 200, 300, 26, { Color = C.panel, StrokeWidth = 0, HTextAlign = "Left", TextColor = C.sub })
+    local prow = { { "PanelRed", "Red", C.red }, { "PanelGreen", "Green", { 60, 200, 80 } }, { "PanelBlue", "Blue", { 60, 110, 240 } } }
+    for i, r in ipairs(prow) do
+      local y = 244 + (i - 1) * 36
+      label(r[2], 16, y + 2, 70, 20)
+      layout[r[1]] = { PrettyName = "Panels~" .. r[2], Style = "Fader", Position = { 92, y }, Size = { 300, 24 }, Color = r[3] }
+    end
+    led("PanelSwatch", "Panels~Swatch", 420, 240, 96, { 255, 255, 255 })
+    layout["PanelSwatch"].Margin = 0
+    label("Transition (s)", 16, 356, 100, 20)
+    layout["PanelTransition"] = { PrettyName = "Panels~Transition", Style = "Text", Position = { 122, 354 }, Size = { 56, 24 }, FontSize = 12, Color = { 20, 22, 26 }, TextColor = C.text }
+    button("PanelApply", "Apply to Panel", 92, 394, 180, 36, C.accent, { OffColor = { 46, 140, 56 }, FontStyle = "Bold" })
+    button("PanelApplyAll", "Apply to All Panels", 284, 394, 180, 36, C.accentD)
+    label("Per-panel colors are sent as a static custom effect; selecting any scene clears them.", 16, 436, 600, 20, "Left", 10)
+
+  elseif page == "Setup" then
+    box("Connection", 8, 64, 624, 176)
+    label("IP Address", 16, 94, 100, 20)
+    textbox("IPAddress", "Setup~IP Address", 122, 92, 200, 26, { HTextAlign = "Left" })
+    button("Connect", "Connect / Refresh", 340, 92, 150, 26, C.accentD)
+    label("Auth Token", 16, 130, 100, 20)
+    textbox("AuthToken", "Setup~Auth Token", 122, 128, 368, 26, { HTextAlign = "Left", FontSize = 11 })
+    button("Pair", "Pair", 500, 92, 120, 26, C.accent, { OffColor = { 46, 140, 56 }, FontStyle = "Bold" })
+    button("Unpair", "Unpair", 500, 128, 120, 26, C.red, { OffColor = { 120, 44, 42 } })
+    label("To pair: hold the controller power button 5-7 s until the LEDs flash, then press Pair within 30 s.", 16, 170, 600, 20, "Left", 11, C.text)
+    label("Last Error", 16, 202, 100, 20)
+    textbox("LastError", "Setup~Last Error", 122, 200, 498, 26, { Color = C.panel, HTextAlign = "Left", TextColor = C.amber })
+
+    box("Device Information", 8, 248, 624, 182)
+    local info = { { "Model", "Model" }, { "SerialNumber", "Serial Number" }, { "Firmware", "Firmware" }, { "Manufacturer", "Manufacturer" } }
+    for i, f in ipairs(info) do
+      local y = 278 + (i - 1) * 36
+      label(f[2], 16, y + 2, 100, 20)
+      textbox(f[1], "Setup~" .. f[2], 122, y, 300, 26, { Color = C.panel, HTextAlign = "Left" })
+    end
+    label("Port and poll interval are", 436, 282, 190, 16, "Left", 10)
+    label("set in the plugin Properties.", 436, 298, 190, 16, "Left", 10)
+  end
+
+  return layout, graphics
+end
+
+--=====================================================================
+-- Runtime
+--=====================================================================
+if Controls then
+  local rapidjson = require("rapidjson")
+
+  local PORT = Properties["Port"].Value
+  local POLL = Properties["Poll Interval (s)"].Value
+  local DEBUG = Properties["Debug Print"].Value
+
+  local function dbg(level, ...)
+    if DEBUG == "All" or (DEBUG == "Errors" and level == "err") then print(...) end
+  end
+
+  -- state ------------------------------------------------------------
+  local effects = {}          -- effect names from the device
+  local effectPage = 1
+  local currentEffect = ""
+  local panels = {}           -- { id=, x=, y=, o=, shape=, r=, g=, b= }
+  local devState = {}         -- last state table from the device
+  local failCount = 0
+  local userTouch = {}        -- control group -> os.clock() of last user change
+  local HOLD = 2.0            -- seconds poll feedback is ignored after a user change
+
+  local NON_LIT = { [1] = true, [12] = true, [16] = true, [19] = true, [20] = true }
+  local SHAPE_NAMES = {
+    [0] = "Light Panel Triangle", [1] = "Rhythm Module", [2] = "Canvas Square", [3] = "Canvas Control Square",
+    [4] = "Canvas Square", [7] = "Shapes Hexagon", [8] = "Shapes Triangle", [9] = "Shapes Mini Triangle",
+    [12] = "Shapes Controller", [14] = "Elements Hexagon", [15] = "Elements Hex Corner", [16] = "Lines Connector",
+    [17] = "Light Line", [18] = "Light Line (single zone)", [19] = "Controller Cap", [20] = "Power Connector",
+  }
+
+  -- helpers ----------------------------------------------------------
+  local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+  local function round(v) return math.floor(v + 0.5) end
+  local function touched(group) return userTouch[group] and (os.clock() - userTouch[group]) < HOLD end
+  local function touch(group) userTouch[group] = os.clock() end
+
+  local function rgbToHsv(r, g, b)
+    r, g, b = r / 255, g / 255, b / 255
+    local mx, mn = math.max(r, g, b), math.min(r, g, b)
+    local d = mx - mn
+    local h = 0
+    if d > 0 then
+      if mx == r then h = ((g - b) / d) % 6
+      elseif mx == g then h = (b - r) / d + 2
+      else h = (r - g) / d + 4 end
+      h = h * 60
+    end
+    local s = (mx == 0) and 0 or d / mx
+    return round(h) % 360, round(s * 100), round(mx * 100)
+  end
+
+  local function hsvToRgb(h, s, v)
+    s, v = s / 100, v / 100
+    local c = v * s
+    local x = c * (1 - math.abs((h / 60) % 2 - 1))
+    local m = v - c
+    local r, g, b
+    if h < 60 then r, g, b = c, x, 0
+    elseif h < 120 then r, g, b = x, c, 0
+    elseif h < 180 then r, g, b = 0, c, x
+    elseif h < 240 then r, g, b = 0, x, c
+    elseif h < 300 then r, g, b = x, 0, c
+    else r, g, b = c, 0, x end
+    return round((r + m) * 255), round((g + m) * 255), round((b + m) * 255)
+  end
+
+  local function hex(r, g, b) return string.format("#%02X%02X%02X", r, g, b) end
+
+  local function kelvinToRgb(k)
+    -- approximation used only for the on-screen swatch
+    local t = k / 100
+    local r, g, b
+    if t <= 66 then r = 255 else r = 329.698727446 * ((t - 60) ^ -0.1332047592) end
+    if t <= 66 then g = 99.4708025861 * math.log(t) - 161.1195681661 else g = 288.1221695283 * ((t - 60) ^ -0.0755148492) end
+    if t >= 66 then b = 255 elseif t <= 19 then b = 0 else b = 138.5177312231 * math.log(t - 10) - 305.0447927307 end
+    return round(clamp(r, 0, 255)), round(clamp(g, 0, 255)), round(clamp(b, 0, 255))
+  end
+
+  local function setSwatch(r, g, b)
+    Controls.ColorSwatch.Color = hex(r, g, b)
+    Controls.ColorSwatch.Boolean = true
+    Controls.HexColor.String = hex(r, g, b)
+  end
+
+  local function setStatus(code, msg)
+    Controls.Status.Value = code
+    Controls.Status.String = msg or ""
+  end
+
+  local function setError(msg)
+    Controls.LastError.String = (msg or "") ~= "" and (os.date("%H:%M:%S ") .. msg) or ""
+    if msg and msg ~= "" then dbg("err", "Nanoleaf: " .. msg) end
+  end
+
+  local function baseUrl(withToken)
+    local ip = Controls.IPAddress.String:gsub("%s", "")
+    local url = string.format("http://%s:%d/api/v1", ip, PORT)
+    if withToken then url = url .. "/" .. Controls.AuthToken.String:gsub("%s", "") end
+    return url
+  end
+
+  local function configured()
+    return Controls.IPAddress.String:gsub("%s", "") ~= "" and Controls.AuthToken.String:gsub("%s", "") ~= ""
+  end
+
+  -- HTTP queue -------------------------------------------------------
+  -- One request in flight at a time. Writes to the same endpoint are coalesced
+  -- so dragging a fader only ever sends the latest value.
+  local queue = {}     -- ordered list of { key, method, path, body }
+  local busy = false
+  local Poll           -- forward declaration
+
+  local function sendNext()
+    if busy or #queue == 0 then return end
+    local job = table.remove(queue, 1)
+    busy = true
+    local url = (job.noToken and baseUrl(false) or baseUrl(true)) .. (job.path or "")
+    local data = job.body and rapidjson.encode(job.body) or ""
+    dbg("all", job.method .. " " .. url .. " " .. data)
+    local function done(tbl, code, resp, err, headers)
+      busy = false
+      if job.callback then job.callback(code, resp, err) end
+      if code == 401 then
+        setStatus(2, "Unauthorized - pair again")
+        setError("401 Unauthorized: auth token is not valid")
+      elseif code ~= nil and code >= 400 and job.method ~= "GET" and not job.callback then
+        setError(string.format("%s %s returned HTTP %d", job.method, job.path or "/", code))
+      end
+      sendNext()
+    end
+    if job.method == "GET" then
+      HttpClient.Download { Url = url, Timeout = 4, EventHandler = done }
+    elseif job.method == "DELETE" and HttpClient.Delete then
+      HttpClient.Delete { Url = url, Timeout = 4, EventHandler = done }
+    else
+      HttpClient.Upload { Url = url, Method = job.method, Data = data, Timeout = 4,
+        Headers = { ["Content-Type"] = "application/json" }, EventHandler = done }
+    end
+  end
+
+  local function enqueue(job)
+    if job.key then
+      for _, q in ipairs(queue) do
+        if q.key == job.key then
+          -- merge state bodies (e.g. hue + sat), replace everything else
+          if job.merge and q.body then
+            for k, v in pairs(job.body) do q.body[k] = v end
+          else
+            q.body = job.body
+          end
+          return
+        end
+      end
+    end
+    table.insert(queue, job)
+    sendNext()
+  end
+
+  local function putState(body)
+    if not configured() then setError("Set the IP address and auth token on the Setup page"); return end
+    enqueue({ key = "state", method = "PUT", path = "/state", body = body, merge = true })
+  end
+
+  local function putEffects(body, key)
+    if not configured() then setError("Set the IP address and auth token on the Setup page"); return end
+    enqueue({ key = key or "effects", method = "PUT", path = "/effects", body = body })
+  end
+
+  -- feedback ---------------------------------------------------------
+  local function updateEffectButtons()
+    local pages = math.max(1, math.ceil(#effects / EFFECT_BUTTONS))
+    effectPage = clamp(effectPage, 1, pages)
+    local offset = (effectPage - 1) * EFFECT_BUTTONS
+    for i = 1, EFFECT_BUTTONS do
+      local name = effects[offset + i]
+      local b = Controls.EffectButton[i]
+      b.Legend = name or ""
+      b.IsDisabled = (name == nil)
+      b.Boolean = (name ~= nil and name == currentEffect)
+    end
+    if #effects == 0 then
+      Controls.EffectPageLabel.String = "No effects loaded"
+    else
+      Controls.EffectPageLabel.String = string.format("Page %d of %d  (%d-%d of %d)", effectPage, pages,
+        offset + 1, math.min(offset + EFFECT_BUTTONS, #effects), #effects)
+    end
+  end
+
+  local function prettyEffect(name)
+    if name == "*Solid*" then return "Solid Color"
+    elseif name == "*Static*" then return "Static (per-panel)"
+    elseif name == "*Dynamic*" then return "Dynamic"
+    elseif name == "*ExtControl*" then return "External Control" end
+    return name or ""
+  end
+
+  local function setEffectList(list)
+    local changed = #list ~= #effects
+    if not changed then
+      for i, v in ipairs(list) do if effects[i] ~= v then changed = true break end end
+    end
+    if changed then
+      effects = list
+      Controls.EffectSelect.Choices = effects
+      updateEffectButtons()
+    end
+    Controls.EffectCount.String = string.format("%d effects on device", #effects)
+  end
+
+  local function setCurrentEffect(name)
+    currentEffect = name or ""
+    Controls.EffectCurrent.String = prettyEffect(currentEffect)
+    if not touched("effect") then
+      Controls.EffectSelect.String = currentEffect:sub(1, 1) == "*" and "" or currentEffect
+    end
+    updateEffectButtons()
+  end
+
+  local function updatePanelInfo()
+    local sel = Controls.PanelSelect.String
+    for _, p in ipairs(panels) do
+      if p.label == sel then
+        Controls.PanelInfo.String = string.format("%s  x=%d y=%d  rot=%d", SHAPE_NAMES[p.shape] or ("Shape " .. tostring(p.shape)), p.x, p.y, p.o)
+        Controls.PanelRed.Value, Controls.PanelGreen.Value, Controls.PanelBlue.Value = p.r, p.g, p.b
+        Controls.PanelSwatch.Color = hex(p.r, p.g, p.b)
+        Controls.PanelSwatch.Boolean = true
+        return p
+      end
+    end
+    Controls.PanelInfo.String = ""
+    return nil
+  end
+
+  local function setLayout(pl)
+    if not pl then return end
+    if pl.globalOrientation and pl.globalOrientation.value and not touched("orientation") then
+      Controls.Orientation.Value = pl.globalOrientation.value
+    end
+    local layoutData = pl.layout or {}
+    local pos = layoutData.positionData or {}
+    local newPanels, changed = {}, (#pos ~= #panels)
+    -- default per-panel color = current solid color
+    local r, g, b = hsvToRgb(Controls.Hue.Value, Controls.Saturation.Value, 100)
+    for i, p in ipairs(pos) do
+      local old = panels[i]
+      if not old or old.id ~= p.panelId then changed = true end
+      table.insert(newPanels, {
+        id = p.panelId, x = p.x or 0, y = p.y or 0, o = p.o or 0, shape = p.shapeType or 0,
+        r = (old and old.id == p.panelId) and old.r or r,
+        g = (old and old.id == p.panelId) and old.g or g,
+        b = (old and old.id == p.panelId) and old.b or b,
+        label = string.format("Panel %d  (ID %d)", i, p.panelId),
+      })
+    end
+    if changed then
+      panels = newPanels
+      local choices, lit = {}, 0
+      for _, p in ipairs(panels) do
+        if not NON_LIT[p.shape] then table.insert(choices, p.label); lit = lit + 1 end
+      end
+      Controls.PanelSelect.Choices = choices
+      if Controls.PanelSelect.String == "" and choices[1] then Controls.PanelSelect.String = choices[1] end
+      Controls.PanelCount.String = tostring(lit)
+      updatePanelInfo()
+    end
+  end
+
+  local function setRhythm(rh)
+    if type(rh) ~= "table" then
+      Controls.RhythmConnected.Boolean = false
+      Controls.RhythmActive.Boolean = false
+      return
+    end
+    Controls.RhythmConnected.Boolean = rh.rhythmConnected == true
+    Controls.RhythmActive.Boolean = rh.rhythmActive == true
+    if rh.rhythmMode ~= nil and not touched("rhythm") then
+      local m = type(rh.rhythmMode) == "table" and rh.rhythmMode.value or rh.rhythmMode
+      Controls.RhythmMode.String = (m == 1) and "AUX In" or "Microphone"
+    end
+  end
+
+  local function setState(st)
+    devState = st
+    if st.on and not touched("power") then Controls.Power.Boolean = st.on.value == true end
+    if st.brightness and not touched("brightness") then Controls.Brightness.Value = st.brightness.value end
+    if st.ct and not touched("ct") then Controls.ColorTemp.Value = st.ct.value end
+    if not touched("color") then
+      if st.hue then Controls.Hue.Value = st.hue.value end
+      if st.sat then Controls.Saturation.Value = st.sat.value end
+    end
+    Controls.ColorMode.String = st.colorMode == "hs" and "Color" or st.colorMode == "ct" and "White"
+      or st.colorMode == "effect" and "Effect" or (st.colorMode or "")
+    -- swatch + RGB feedback
+    if st.colorMode == "ct" then
+      setSwatch(kelvinToRgb(Controls.ColorTemp.Value))
+    elseif not touched("color") then
+      local bri = (st.brightness and st.brightness.value) or 100
+      local r, g, b = hsvToRgb(Controls.Hue.Value, Controls.Saturation.Value, bri)
+      Controls.Red.Value, Controls.Green.Value, Controls.Blue.Value = r, g, b
+      setSwatch(hsvToRgb(Controls.Hue.Value, Controls.Saturation.Value, 100))
+    end
+  end
+
+  local function setOnline(ok, msg)
+    Controls.Online.Boolean = ok
+    if ok then
+      failCount = 0
+      setStatus(0, Controls.DeviceName.String)
+    else
+      failCount = failCount + 1
+      if failCount >= 2 then setStatus(2, msg or "No response") end
+    end
+  end
+
+  -- polling ----------------------------------------------------------
+  Poll = function()
+    if not configured() then
+      if Controls.IPAddress.String == "" then setStatus(3, "Enter IP address")
+      else setStatus(3, "Not paired - press Pair") end
+      Controls.Online.Boolean = false
+      return
+    end
+    -- skip if a GET is already queued
+    for _, q in ipairs(queue) do if q.key == "poll" then return end end
+    enqueue({ key = "poll", method = "GET", path = "/", callback = function(code, resp, err)
+      if code == 200 and resp then
+        local ok, info = pcall(rapidjson.decode, resp)
+        if not ok or type(info) ~= "table" then setOnline(false, "Bad JSON from device"); return end
+        Controls.DeviceName.String = info.name or ""
+        Controls.Model.String = info.model or ""
+        Controls.SerialNumber.String = info.serialNo or ""
+        Controls.Firmware.String = info.firmwareVersion or ""
+        Controls.Manufacturer.String = info.manufacturer or ""
+        if info.state then setState(info.state) end
+        if info.effects then
+          setEffectList(info.effects.effectsList or {})
+          setCurrentEffect(info.effects.select)
+        end
+        setLayout(info.panelLayout)
+        setRhythm(info.rhythm)
+        setOnline(true)
+      elseif code == 401 then
+        Controls.Online.Boolean = false
+      else
+        setOnline(false, (code == nil or code == 0) and "No response from device" or ("HTTP " .. tostring(code)))
+      end
+    end })
+  end
+
+  local pollTimer = Timer.New()
+  pollTimer.EventHandler = Poll
+
+  local function restart()
+    queue = {}
+    busy = false
+    failCount = 0
+    effects, panels = {}, {}
+    pollTimer:Stop()
+    setStatus(5, "Connecting")
+    Poll()
+    pollTimer:Start(POLL)
+  end
+
+  -- pairing ----------------------------------------------------------
+  Controls.Pair.EventHandler = function()
+    if Controls.IPAddress.String:gsub("%s", "") == "" then setError("Enter the IP address first"); return end
+    setStatus(5, "Pairing...")
+    enqueue({ method = "POST", path = "/new", noToken = true, callback = function(code, resp, err)
+      if code == 200 and resp then
+        local ok, t = pcall(rapidjson.decode, resp)
+        if ok and t and t.auth_token then
+          Controls.AuthToken.String = t.auth_token
+          setError("")
+          print("Nanoleaf: paired, auth token = " .. t.auth_token)
+          restart()
+          return
+        end
+      end
+      if code == 403 then
+        setError("Pairing refused (403): hold the power button 5-7 s until LEDs flash, then press Pair")
+      else
+        setError("Pairing failed: " .. (err and tostring(err) or ("HTTP " .. tostring(code))))
+      end
+      setStatus(2, "Pairing failed")
+    end })
+  end
+
+  Controls.Unpair.EventHandler = function()
+    if not configured() then return end
+    enqueue({ method = "DELETE", path = "", callback = function(code)
+      if code == 204 or code == 200 then
+        Controls.AuthToken.String = ""
+        setError("")
+        setStatus(3, "Unpaired")
+        Controls.Online.Boolean = false
+      else
+        setError("Unpair failed: HTTP " .. tostring(code))
+      end
+    end })
+  end
+
+  Controls.Connect.EventHandler = restart
+  Controls.IPAddress.EventHandler = restart
+  Controls.AuthToken.EventHandler = restart
+
+  -- power ------------------------------------------------------------
+  local function setPower(on)
+    touch("power")
+    Controls.Power.Boolean = on
+    putState({ on = { value = on } })
+  end
+  Controls.Power.EventHandler = function(c) setPower(c.Boolean) end
+  Controls.PowerOn.EventHandler = function() setPower(true) end
+  Controls.PowerOff.EventHandler = function() setPower(false) end
+
+  -- brightness -------------------------------------------------------
+  local function fade() return round(Controls.FadeTime.Value) end
+  Controls.Brightness.EventHandler = function(c)
+    touch("brightness")
+    local body = { brightness = { value = round(c.Value) } }
+    if fade() > 0 then body.brightness.duration = fade() end
+    putState(body)
+  end
+  local function stepBrightness(dir)
+    touch("brightness")
+    local step = round(Controls.BrightnessStep.Value) * dir
+    Controls.Brightness.Value = clamp(Controls.Brightness.Value + step, 0, 100)
+    putState({ brightness = { increment = step } })
+  end
+  Controls.BrightnessUp.EventHandler = function() stepBrightness(1) end
+  Controls.BrightnessDown.EventHandler = function() stepBrightness(-1) end
+
+  -- color ------------------------------------------------------------
+  local function sendHueSat()
+    touch("color")
+    local h, s = round(Controls.Hue.Value), round(Controls.Saturation.Value)
+    local r, g, b = hsvToRgb(h, s, Controls.Brightness.Value)
+    Controls.Red.Value, Controls.Green.Value, Controls.Blue.Value = r, g, b
+    setSwatch(hsvToRgb(h, s, 100))
+    putState({ hue = { value = h }, sat = { value = s } })
+  end
+  Controls.Hue.EventHandler = sendHueSat
+  Controls.Saturation.EventHandler = sendHueSat
+
+  local function sendRgb(r, g, b)
+    touch("color"); touch("brightness")
+    local h, s, v = rgbToHsv(r, g, b)
+    Controls.Hue.Value, Controls.Saturation.Value, Controls.Brightness.Value = h, s, v
+    setSwatch(hsvToRgb(h, s, 100))
+    local body = { hue = { value = h }, sat = { value = s }, brightness = { value = v } }
+    if fade() > 0 then body.brightness.duration = fade() end
+    putState(body)
+  end
+  local function rgbChanged()
+    sendRgb(round(Controls.Red.Value), round(Controls.Green.Value), round(Controls.Blue.Value))
+  end
+  Controls.Red.EventHandler = rgbChanged
+  Controls.Green.EventHandler = rgbChanged
+  Controls.Blue.EventHandler = rgbChanged
+
+  Controls.HexColor.EventHandler = function(c)
+    local hx = c.String:gsub("#", ""):gsub("%s", "")
+    if #hx == 6 and hx:match("^%x+$") then
+      local r, g, b = tonumber(hx:sub(1, 2), 16), tonumber(hx:sub(3, 4), 16), tonumber(hx:sub(5, 6), 16)
+      Controls.Red.Value, Controls.Green.Value, Controls.Blue.Value = r, g, b
+      sendRgb(r, g, b)
+    else
+      setError("Hex color must look like #FF8800")
+    end
+  end
+
+  for i, qc in ipairs(QuickColors) do
+    Controls.QuickColor[i].EventHandler = function()
+      local r, g, b = qc[2][1], qc[2][2], qc[2][3]
+      -- quick colors keep the current brightness
+      touch("color")
+      local h, s = rgbToHsv(r, g, b)
+      Controls.Hue.Value, Controls.Saturation.Value = h, s
+      local rr, gg, bb = hsvToRgb(h, s, Controls.Brightness.Value)
+      Controls.Red.Value, Controls.Green.Value, Controls.Blue.Value = rr, gg, bb
+      setSwatch(hsvToRgb(h, s, 100))
+      putState({ hue = { value = h }, sat = { value = s } })
+    end
+  end
+
+  -- white ------------------------------------------------------------
+  local function sendCt(k)
+    touch("ct")
+    local lo = (devState.ct and devState.ct.min) or 1200
+    local hi = (devState.ct and devState.ct.max) or 6500
+    k = clamp(round(k), lo, hi)
+    Controls.ColorTemp.Value = k
+    setSwatch(kelvinToRgb(k))
+    putState({ ct = { value = k } })
+  end
+  Controls.ColorTemp.EventHandler = function(c) sendCt(c.Value) end
+  for i, wp in ipairs(WhitePresets) do
+    Controls.WhitePreset[i].EventHandler = function() sendCt(wp[2]) end
+  end
+
+  -- effects ----------------------------------------------------------
+  local function selectEffect(name)
+    if not name or name == "" then return end
+    touch("effect")
+    currentEffect = name
+    Controls.EffectSelect.String = name
+    Controls.EffectCurrent.String = prettyEffect(name)
+    updateEffectButtons()
+    putEffects({ select = name })
+  end
+  Controls.EffectSelect.EventHandler = function(c) selectEffect(c.String) end
+  for i = 1, EFFECT_BUTTONS do
+    Controls.EffectButton[i].EventHandler = function(c)
+      local name = effects[(effectPage - 1) * EFFECT_BUTTONS + i]
+      if name then selectEffect(name) else c.Boolean = false end
+    end
+  end
+  local function stepEffect(dir)
+    if #effects == 0 then return end
+    local idx = 0
+    for i, n in ipairs(effects) do if n == currentEffect then idx = i end end
+    idx = ((idx - 1 + dir) % #effects) + 1
+    effectPage = math.ceil(idx / EFFECT_BUTTONS)
+    selectEffect(effects[idx])
+  end
+  Controls.EffectNext.EventHandler = function() stepEffect(1) end
+  Controls.EffectPrev.EventHandler = function() stepEffect(-1) end
+  Controls.EffectPageUp.EventHandler = function() effectPage = effectPage + 1; updateEffectButtons() end
+  Controls.EffectPageDown.EventHandler = function() effectPage = effectPage - 1; updateEffectButtons() end
+  Controls.EffectRefresh.EventHandler = function() effects = {}; Poll() end
+
+  -- rhythm -----------------------------------------------------------
+  Controls.RhythmMode.Choices = { "Microphone", "AUX In" }
+  Controls.RhythmMode.EventHandler = function(c)
+    touch("rhythm")
+    if not configured() then return end
+    enqueue({ key = "rhythm", method = "PUT", path = "/rhythm",
+      body = { rhythmMode = { value = (c.String == "AUX In") and 1 or 0 } } })
+  end
+
+  -- panels -----------------------------------------------------------
+  Controls.Orientation.EventHandler = function(c)
+    touch("orientation")
+    if not configured() then return end
+    enqueue({ key = "orientation", method = "PUT", path = "/panelLayout",
+      body = { globalOrientation = { value = round(c.Value) % 361 } } })
+  end
+
+  Controls.Identify.EventHandler = function()
+    if not configured() then return end
+    enqueue({ method = "PUT", path = "/identify", body = {} })
+  end
+
+  Controls.PanelSelect.EventHandler = updatePanelInfo
+
+  local function panelSwatch()
+    Controls.PanelSwatch.Color = hex(round(Controls.PanelRed.Value), round(Controls.PanelGreen.Value), round(Controls.PanelBlue.Value))
+    Controls.PanelSwatch.Boolean = true
+  end
+  Controls.PanelRed.EventHandler = panelSwatch
+  Controls.PanelGreen.EventHandler = panelSwatch
+  Controls.PanelBlue.EventHandler = panelSwatch
+
+  -- Static per-panel colors are written with the Open API "write" command,
+  -- animType "static". animData = numPanels, then per panel:
+  -- panelId numFrames R G B W transitionTime(1/10 s)
+  local function writeStatic()
+    local parts, n = {}, 0
+    local t = round(Controls.PanelTransition.Value * 10)
+    for _, p in ipairs(panels) do
+      if not NON_LIT[p.shape] then
+        n = n + 1
+        table.insert(parts, string.format("%d 1 %d %d %d 0 %d", p.id, p.r, p.g, p.b, t))
+      end
+    end
+    if n == 0 then setError("No panels found - check the connection"); return end
+    putEffects({ write = { command = "display", animType = "static", animData = n .. " " .. table.concat(parts, " "),
+      loop = false, palette = rapidjson.array and rapidjson.array({}) or nil } }, "static")
+    currentEffect = "*Static*"
+    Controls.EffectCurrent.String = prettyEffect(currentEffect)
+    updateEffectButtons()
+  end
+
+  Controls.PanelApply.EventHandler = function()
+    local sel = Controls.PanelSelect.String
+    for _, p in ipairs(panels) do
+      if p.label == sel then
+        p.r, p.g, p.b = round(Controls.PanelRed.Value), round(Controls.PanelGreen.Value), round(Controls.PanelBlue.Value)
+        writeStatic()
+        return
+      end
+    end
+    setError("Select a panel first")
+  end
+
+  Controls.PanelApplyAll.EventHandler = function()
+    local r, g, b = round(Controls.PanelRed.Value), round(Controls.PanelGreen.Value), round(Controls.PanelBlue.Value)
+    for _, p in ipairs(panels) do p.r, p.g, p.b = r, g, b end
+    writeStatic()
+  end
+
+  -- startup ----------------------------------------------------------
+  Controls.ColorSwatch.Boolean = true
+  Controls.PanelSwatch.Boolean = true
+  panelSwatch()
+  updateEffectButtons()
+  setError("")
+  restart()
+end
