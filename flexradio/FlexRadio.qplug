@@ -1,0 +1,1629 @@
+--[[ FlexRadio FLEX-6600 plugin for Q-SYS
+  Controls a FlexRadio FLEX-6000 series transceiver (written for the FLEX-6600 / 6600M) over the
+  SmartSDR TCP/IP API: slice receivers (frequency, band, mode, filter, AF gain, AGC, NB/NR/ANF/WNB,
+  squelch, RIT, antennas), the radio's line out and headphone levels, and guarded transmit
+  (MOX, TUNE, ATU, RF and tune power, TX audio source and mic level) with forward power, SWR, PA temperature and supply meters.
+
+  Transport:
+    TCP 4992 (radio)       ASCII command / response / status protocol      C<seq>|cmd  R<seq>|<hex>|msg  S<handle>|status
+    UDP <Meter UDP Port>   VITA-49 meter packets (class 0x8002) sent by the radio after "client udpport" + "sub meter all"
+  Audio and panadapter / waterfall streams are not used. Wire the radio's analog line out to a Q-SYS input for audio.
+
+  Transmit safety: transmit is OFF in Properties by default. When enabled, MOX, TUNE, PTT and ATU Start only
+  work while ARM is on (ARM times out), the radio's interlock reports it is ready, and every key-down has a
+  time limit and an optional SWR trip. STOP always unkeys.
+
+  References:
+    SmartSDR TCP/IP API (FlexRadio, official) - https://github.com/flexradio/smartsdr-api-docs/wiki/SmartSDR-TCPIP-API
+      slice, filt, xmit, transmit, atu, mixer, sub, meter, client, keepalive, ping, info, version, display pan pages,
+      Metering-Protocol, SmartSDR-Status-Responses, SmartSDR-Supported-Modes, Boolean-State
+    Status field names not listed on the wiki (audio_level, agc_mode, rit_on, ant_list, tune, ...) were checked
+      against xLib6000 (K3TZR), an open-source Swift port of FlexRadio's FlexLib - https://github.com/K3TZR/xLib6000
+    Q-SYS TcpSocket - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/TcpSocket.htm
+    Q-SYS UdpSocket - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/UdpSocket.htm
+]]
+
+PluginInfo = {
+  Name = "Radio~FlexRadio FLEX-6600 (SmartSDR)",
+  Version = "1.0",
+  BuildVersion = "1.0.0.0",
+  Id = "c4f1a2e8-6600-4b7d-9e3a-5f2d8a1c0b66",
+  Author = "AV Programming",
+  Description = "Control a FlexRadio FLEX-6600 (FLEX-6000 series) over the SmartSDR TCP/IP API: slices, band, mode, filter, AF gain, AGC, noise reduction, squelch, RIT, antennas, line out, guarded transmit with ATU, power, SWR and status meters.",
+  ShowDebug = true,
+}
+
+local ACCENT = { 31, 190, 219 }  -- FlexRadio cyan (from the logo on FlexRadio's API wiki). Red is kept for transmit.
+
+local MAX_SLICES = 4             -- FLEX-6600 / 6600M: 4 slice receivers
+local BANDS = { "160", "80", "60", "40", "30", "20", "17", "15", "12", "10", "6", "WWV" }
+local MODES = { "LSB", "USB", "CW", "AM", "SAM", "FM", "NFM", "DIGL", "DIGU", "RTTY" }
+local AGC_MODES = { "off", "slow", "med", "fast" }
+local DSP = { { "nb", "NB" }, { "nr", "NR" }, { "anf", "ANF" }, { "wnb", "WNB" } }
+local STEPS = { "10 Hz", "50 Hz", "100 Hz", "500 Hz", "1 kHz", "2.5 kHz", "5 kHz", "10 kHz", "100 kHz" }
+local FILTERS = 6
+
+function GetColor(props)
+  return ACCENT
+end
+
+function GetPrettyName(props)
+  return "FlexRadio FLEX-6600 v" .. PluginInfo.Version
+end
+
+local PageNames = { "Receive", "DSP", "Transmit", "Setup" }
+
+function GetPages(props)
+  local pages = {}
+  for _, name in ipairs(PageNames) do table.insert(pages, { name = name }) end
+  return pages
+end
+
+function GetProperties()
+  return {
+    { Name = "Client Mode", Type = "enum", Choices = { "Follow SmartSDR (non-GUI)", "Standalone (GUI client)" },
+      Value = "Follow SmartSDR (non-GUI)" },
+    { Name = "Meter UDP Port", Type = "integer", Min = 1024, Max = 65535, Value = 4993 },
+    { Name = "Transmit", Type = "enum", Choices = { "Disabled", "Enabled" }, Value = "Disabled" },
+    { Name = "Arm Timeout (s)", Type = "integer", Min = 5, Max = 600, Value = 30 },
+    { Name = "Max MOX Time (s)", Type = "integer", Min = 5, Max = 900, Value = 120 },
+    { Name = "Max Tune Time (s)", Type = "integer", Min = 2, Max = 60, Value = 15 },
+    { Name = "SWR Trip", Type = "enum", Choices = { "Off", "2.0", "2.5", "3.0", "5.0" }, Value = "3.0" },
+    { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
+  }
+end
+
+function RectifyProperties(props)
+  local tx = props["Transmit"].Value == "Enabled"
+  props["Arm Timeout (s)"].IsHidden = not tx
+  props["Max MOX Time (s)"].IsHidden = not tx
+  props["Max Tune Time (s)"].IsHidden = not tx
+  props["SWR Trip"].IsHidden = not tx
+  return props
+end
+
+function GetControls(props)
+  local function ind(name, count) return { Name = name, ControlType = "Indicator", IndicatorType = "Text", Count = count, PinStyle = "Output", UserPin = true } end
+  local function led(name, count) return { Name = name, ControlType = "Indicator", IndicatorType = "Led", Count = count, PinStyle = "Output", UserPin = true } end
+  local function meter(name, min, max) return { Name = name, ControlType = "Indicator", IndicatorType = "Meter", Min = min, Max = max, PinStyle = "Output", UserPin = true } end
+  local function num(name, min, max) return { Name = name, ControlType = "Knob", ControlUnit = "Float", Min = min, Max = max, PinStyle = "Output", UserPin = true } end
+  local function knob(name, min, max, def) return { Name = name, ControlType = "Knob", ControlUnit = "Integer", Min = min, Max = max, DefaultValue = def or min, PinStyle = "Both", UserPin = true } end
+  local function trig(name, count) return { Name = name, ControlType = "Button", ButtonType = "Trigger", Count = count, PinStyle = "Input", UserPin = true } end
+  local function tog(name, count) return { Name = name, ControlType = "Button", ButtonType = "Toggle", Count = count, PinStyle = "Both", UserPin = true } end
+  local function text(name) return { Name = name, ControlType = "Text", PinStyle = "Both", UserPin = true } end
+
+  return {
+    -- header
+    { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true },
+    led("Online"), ind("RadioName"),
+    -- receive: slices
+    tog("SliceSel", MAX_SLICES), ind("SliceFreq", MAX_SLICES), ind("SliceMode", MAX_SLICES), led("SliceTx", MAX_SLICES),
+    tog("FollowActive"), ind("SliceLetter"),
+    -- receive: frequency
+    text("Frequency"), text("TuneStep"),
+    trig("TuneUp"), trig("TuneDown"), trig("TuneUpFast"), trig("TuneDownFast"),
+    num("FrequencyMHz", 0, 100),
+    -- receive: band, mode, filter
+    tog("Band", #BANDS), tog("Mode", #MODES), tog("Filter", FILTERS), ind("FilterText"),
+    -- receive: S-meter
+    meter("SMeter", -130, -13), ind("SMeterText"), ind("SMeterDbm"), num("SignalDbm", -200, 50),
+    -- receive: audio and antenna
+    knob("AFGain", 0, 100, 50), ind("AFGainText"), tog("Mute"), text("RxAntenna"),
+    -- DSP
+    tog("Agc", #AGC_MODES), knob("AgcThreshold", 0, 100, 65), ind("AgcThresholdText"),
+    tog("DspOn", #DSP),
+    { Name = "DspLevel", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 100, DefaultValue = 50, Count = #DSP, PinStyle = "Both", UserPin = true }, ind("DspLevelText", #DSP),
+    tog("Squelch"), knob("SquelchLevel", 0, 100, 20), ind("SquelchLevelText"),
+    tog("Rit"), knob("RitOffset", -2000, 2000, 0), ind("RitOffsetText"), trig("RitClear"),
+    knob("LineoutGain", 0, 100, 50), tog("LineoutMute"), ind("LineoutGainText"),
+    knob("HeadphoneGain", 0, 100, 50), tog("HeadphoneMute"), ind("HeadphoneGainText"),
+    -- transmit: safety
+    tog("TxArm"), ind("ArmText"), trig("TxStop"), ind("TxGuard"), led("TxEnabled"),
+    -- transmit: keying
+    tog("Mox"), tog("Tune"),
+    { Name = "PTT", ControlType = "Button", ButtonType = "Momentary", PinStyle = "Input", UserPin = true },
+    trig("AtuStart"), trig("AtuBypass"), ind("AtuStatus"),
+    -- transmit: status
+    led("Transmitting"), led("TxAllowed"), ind("InterlockState"), ind("InterlockReason"),
+    ind("TxSlice"), trig("SetTxSlice"), text("TxAntenna"),
+    -- transmit: power and meters
+    text("TxAudioSource"), knob("MicLevel", 0, 100, 50), ind("MicLevelText"),
+    knob("RfPower", 0, 100, 50), ind("RfPowerText"), knob("TunePower", 0, 100, 10), ind("TunePowerText"),
+    meter("FwdMeter", 0, 120), ind("FwdText"), meter("SwrMeter", 1, 5), ind("SwrText"), ind("RefText"),
+    meter("MicMeter", -60, 0), ind("MicText"), ind("PaTempText"), ind("VoltsText"),
+    num("FwdWatts", 0, 2000), num("Swr", 0, 100),
+    -- setup
+    text("IPAddress"), trig("Connect"), ind("ClientModeText"), ind("UdpText"), ind("LastError"), ind("LastMessage"),
+    ind("ModelText"), ind("SerialText"), ind("FirmwareText"), ind("CallsignText"), ind("NicknameText"), ind("GpsText"),
+    ind("ClientsText"), trig("CreateSlice"), trig("RemoveSlice"),
+    { Name = "ClientId", ControlType = "Text", PinStyle = "None", UserPin = false },
+  }
+end
+
+--[[ Console theme for Q-SYS plugins, v1.0 (2026-10-14): copied unchanged from the project style guide (qsys-plugin-style-guide/theme.lua). ]]
+local Theme = {}
+
+Theme.W = 640   -- page width; every page is 640 wide
+Theme.GRID = 8  -- positions and sizes snap to 8 (4 for fine alignment inside a row)
+
+-- Neutrals: shared by every plugin. Never brand-tint these.
+Theme.N = {
+  bg      = { 22, 24, 29 },    -- chassis: page background
+  panel   = { 34, 37, 44 },    -- rack panel: sections
+  strip   = { 27, 30, 36 },    -- channel strip / tile inside a section
+  rowAlt  = { 31, 34, 41 },    -- alternate list row
+  well    = { 12, 13, 16 },    -- recessed display: readouts, fields, meters, hint bar
+  stroke  = { 58, 63, 74 },    -- 1 px outlines
+  btn     = { 52, 56, 66 },    -- button off state
+  btnOn   = { 78, 84, 98 },    -- utility button on state
+  ledOff  = { 46, 49, 56 },
+  text    = { 232, 234, 238 },
+  sub     = { 150, 157, 170 }, -- labels, section titles
+  dim     = { 104, 110, 122 }, -- units, captions
+}
+
+-- Semantic colors: same meaning in every plugin, never used as a brand accent.
+Theme.S = {
+  ok    = { 62, 181, 74 },   -- online, connected, healthy
+  warn  = { 240, 165, 40 },  -- attention, identify, solo-style latches
+  fault = { 214, 69, 65 },   -- offline, error, destructive actions
+}
+
+function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
+  return { math.floor(a[1] + (b[1] - a[1]) * t + 0.5),
+           math.floor(a[2] + (b[2] - a[2]) * t + 0.5),
+           math.floor(a[3] + (b[3] - a[3]) * t + 0.5) }
+end
+
+-- Derives the brand set from one accent RGB.
+function Theme.brand(accent)
+  return {
+    accent = accent,                              -- active state, fader fill, header outline, section tab
+    dim    = Theme.mix(accent, Theme.N.bg, 0.55),  -- secondary action off state
+    pad    = Theme.mix(accent, Theme.N.panel, 0.78), -- pad off state (lit-but-idle step button)
+    ink    = Theme.mix(accent, { 255, 255, 255 }, 0.35), -- accent-colored text on dark (page tab)
+  }
+end
+
+local FONT, MONO, DISPLAY = "Roboto", "Roboto Mono", "Montserrat"
+
+local function merge(t, extra)
+  for k, v in pairs(extra or {}) do t[k] = v end
+  return t
+end
+
+function Theme.kit(layout, graphics, accent)
+  local N, S, B = Theme.N, Theme.S, Theme.brand(accent)
+  local ui = { N = N, S = S, B = B }
+
+  local function g(t) table.insert(graphics, t) end
+
+  -- Static text. size: 10 hint, 11 label, 12 body, 13 emphasis
+  function ui.label(text, x, y, w, h, align, size, color, style)
+    g({ Type = "Label", Text = text, Font = FONT, FontStyle = style or "Regular", FontSize = size or 11,
+        HTextAlign = align or "Right", Color = color or N.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+
+  -- Page background. Call first so it sits behind everything.
+  function ui.page(h)
+    g({ Type = "GroupBox", Fill = N.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { Theme.W, h } })
+  end
+
+  -- Transport-bar header: wordmark, page tab, device name readout, Status, Online LED.
+  function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl)
+    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = B.accent, StrokeWidth = 1, CornerRadius = 6,
+        Position = { 8, 8 }, Size = { 624, 48 } })
+    g({ Type = "Label", Text = wordmark, Font = DISPLAY, FontStyle = "Bold", FontSize = 20, HTextAlign = "Left",
+        Color = N.text, Position = { 20, 16 }, Size = { 116, 32 } })
+    g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Bold", FontSize = 10,
+        HTextAlign = "Center", Color = B.ink, Fill = B.pad, CornerRadius = 10, StrokeWidth = 0,
+        Position = { 140, 22 }, Size = { 96, 20 } })
+    if nameCtl then ui.readout(nameCtl, nil, 248, 20, 196, 24) end
+    if statusCtl then
+      layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 452, 20 }, Size = { 140, 24 },
+        Font = FONT, FontSize = 11, CornerRadius = 3 }
+    end
+    if ledCtl then ui.led(ledCtl, "Online", 602, 22, 20, "ok") end
+  end
+
+  -- Rack panel with a color-tab title (uppercase, like a console channel label).
+  -- Content starts 32 px below y.
+  function ui.section(title, x, y, w, h)
+    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 6,
+        Position = { x, y }, Size = { w, h } })
+    if title and title ~= "" then
+      g({ Type = "GroupBox", Fill = B.accent, StrokeWidth = 0, CornerRadius = 1, Position = { x + 12, y + 10 }, Size = { 4, 12 } })
+      ui.label(string.upper(title), x + 22, y + 6, w - 34, 20, "Left", 11, N.sub, "Medium")
+    end
+  end
+
+  -- Channel strip / tile inside a section.
+  function ui.strip(x, y, w, h)
+    g({ Type = "GroupBox", Fill = N.strip, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 4,
+        Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Alternating list row background (i = row number).
+  function ui.row(x, y, w, h, i)
+    g({ Type = "GroupBox", Fill = (i % 2 == 0) and N.rowAlt or N.strip, StrokeWidth = 0, CornerRadius = 2,
+        Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Hint bar: one recessed line of help per page, bottom of the page.
+  function ui.hint(text, y)
+    g({ Type = "Label", Text = text, Font = FONT, FontSize = 10, HTextAlign = "Left", Color = N.sub, Fill = N.well,
+        CornerRadius = 4, StrokeWidth = 0, Margin = 0, Padding = 8, Position = { 8, y }, Size = { 624, 24 } })
+  end
+
+  -- Buttons. kind:
+  --   "primary" accent when on       "utility" neutral, lighter when on
+  --   "secondary" accent, dim off     "pad"     step-pad: tinted off, full accent on
+  --   "power" big primary, 16 bold   "warn" / "danger" / "ok" semantic
+  -- Pass ButtonStyle ("Toggle", "Momentary", "Trigger"...) in extra to match the control's ButtonType.
+  local KINDS = {
+    primary   = function() return B.accent, N.btn, 12, "Medium" end,
+    secondary = function() return B.accent, B.dim, 12, "Regular" end,
+    utility   = function() return N.btnOn, N.btn, 12, "Regular" end,
+    pad       = function() return B.accent, B.pad, 12, "Medium" end,
+    power     = function() return B.accent, N.btn, 16, "Bold" end,
+    warn      = function() return S.warn, Theme.mix(S.warn, N.panel, 0.7), 12, "Medium" end,
+    danger    = function() return S.fault, Theme.mix(S.fault, N.panel, 0.7), 12, "Medium" end,
+    ok        = function() return S.ok, Theme.mix(S.ok, N.panel, 0.7), 12, "Medium" end,
+  }
+  function ui.button(name, legend, x, y, w, h, kind, extra)
+    local on, off, size, style = (KINDS[kind or "primary"] or KINDS.primary)()
+    layout[name] = merge({ PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
+      Color = on, OffColor = off, UnlinkOffColor = true, TextColor = N.text, Font = FONT, FontStyle = style,
+      FontSize = size, CornerRadius = 4, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0, WordWrap = true }, extra)
+  end
+
+  -- Read-only readout: recessed well, mono digits, no outline.
+  function ui.readout(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = MONO, FontStyle = "Medium", FontSize = 12, HTextAlign = "Left",
+      CornerRadius = 3, StrokeWidth = 0, Padding = 4 }, extra)
+  end
+
+  -- Editable field: same well, plus a 1 px outline so it reads as typeable.
+  function ui.field(name, pretty, x, y, w, h, extra)
+    ui.readout(name, pretty, x, y, w, h, merge({ StrokeColor = N.stroke, StrokeWidth = 1 }, extra))
+  end
+
+  -- Plain value text on the panel (names, secondary info). No well.
+  function ui.value(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 20 },
+      Color = N.panel, TextColor = N.text, Font = FONT, FontSize = 12, HTextAlign = "Left", StrokeWidth = 0,
+      TextBoxStyle = "NoBackground" }, extra)
+  end
+
+  function ui.combo(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 12, StrokeColor = N.stroke, StrokeWidth = 1 }, extra)
+  end
+
+  -- Fader: horizontal when w > h, vertical (channel strip) when h > w.
+  function ui.fader(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Fader", Position = { x, y }, Size = { w, h },
+      Color = color or B.accent }, extra)
+  end
+
+  -- Knob: secondary parameters only (trim, fade time, step). 36 or 48 square.
+  function ui.knob(name, pretty, x, y, s, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Knob", Position = { x, y }, Size = { s or 36, s or 36 },
+      Color = color or B.accent }, extra)
+  end
+
+  -- LED. kind: "ok" | "warn" | "fault" | "accent" | an RGB table (e.g. a color swatch)
+  function ui.led(name, pretty, x, y, s, kind, extra)
+    local c = type(kind) == "table" and kind or (kind == "accent" and B.accent) or S[kind or "ok"] or S.ok
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Led", Position = { x, y }, Size = { s or 16, s or 16 },
+      Color = c, OffColor = N.ledOff, UnlinkOffColor = true, StrokeColor = N.stroke, StrokeWidth = 1, Margin = 2 }, extra)
+  end
+
+  -- Meter: bar on a recessed well, no built-in text box (put a readout next to it).
+  function ui.meter(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Meter", MeterStyle = "Standard", Position = { x, y },
+      Size = { w, h }, Color = color or B.accent, BackgroundColor = N.well, CornerRadius = 2, ShowTextbox = false,
+      StrokeWidth = 0 }, extra)
+  end
+
+  -- Hide a control but keep its pins.
+  function ui.hide(name, pretty)
+    layout[name] = { PrettyName = pretty or name, Style = "None", Position = { 0, 0 }, Size = { 0, 0 } }
+  end
+
+  return ui
+end
+
+function GetControlLayout(props)
+  local layout, graphics = {}, {}
+  local ui = Theme.kit(layout, graphics, ACCENT)
+  local N, S, B = ui.N, ui.S, ui.B
+  local page = PageNames[props["page_index"].Value]
+  local txEnabled = props["Transmit"].Value == "Enabled"
+  local WORD = "Flex"
+
+  local function cap(text, x, y, w, align) ui.label(text, x, y, w, 20, align or "Left", 10, N.dim, "Medium") end
+
+  if page == "Receive" then
+    ui.page(652)
+    ui.header(WORD, "Receive", "RadioName", "Status", "Online")
+
+    -- slices
+    ui.section("Slices", 8, 64, 624, 92)
+    ui.button("FollowActive", "FOLLOW ACTIVE", 504, 70, 116, 20, "secondary", { PrettyName = "Slices~Follow Active", FontSize = 9 })
+    for i = 1, MAX_SLICES do
+      local x = 20 + (i - 1) * 152
+      ui.strip(x, 96, 144, 48)
+      ui.button("SliceSel " .. i, string.char(64 + i), x + 6, 102, 36, 36, "pad",
+        { PrettyName = "Slices~Select " .. i, FontSize = 16, FontStyle = "Bold" })
+      ui.value("SliceFreq " .. i, "Slices~Frequency " .. i, x + 48, 102, 92, 18, { Font = "Roboto Mono", FontSize = 12 })
+      ui.value("SliceMode " .. i, "Slices~Mode " .. i, x + 48, 120, 64, 18, { TextColor = N.sub, FontSize = 11 })
+      ui.led("SliceTx " .. i, "Slices~TX " .. i, x + 120, 122, 14, "fault")
+    end
+
+    -- frequency
+    ui.section("Frequency", 8, 164, 400, 148)
+    ui.label("SLICE", 24, 196, 40, 20, "Left", 10, N.dim, "Medium")
+    ui.readout("SliceLetter", "Frequency~Slice", 24, 216, 40, 48,
+      { Font = "Montserrat", FontStyle = "Bold", FontSize = 24, HTextAlign = "Center", TextColor = B.accent })
+    ui.field("Frequency", "Frequency~Frequency (MHz)", 72, 196, 320, 68,
+      { FontSize = 34, FontStyle = "Medium", HTextAlign = "Right", Padding = 12 })
+    ui.button("TuneDownFast", "<<", 24, 272, 52, 28, "utility", { PrettyName = "Frequency~Down x10" })
+    ui.button("TuneDown", "<", 80, 272, 52, 28, "utility", { PrettyName = "Frequency~Down" })
+    ui.combo("TuneStep", "Frequency~Step", 140, 274, 112, 24)
+    ui.button("TuneUp", ">", 260, 272, 52, 28, "utility", { PrettyName = "Frequency~Up" })
+    ui.button("TuneUpFast", ">>", 316, 272, 76, 28, "utility", { PrettyName = "Frequency~Up x10" })
+    ui.hide("FrequencyMHz", "Frequency~Frequency MHz (pin)")
+
+    -- S-meter
+    ui.section("S-Meter", 416, 164, 216, 148)
+    ui.readout("SMeterText", "S-Meter~S Units", 432, 196, 184, 36,
+      { Font = "Montserrat", FontStyle = "Bold", FontSize = 20, HTextAlign = "Center" })
+    ui.meter("SMeter", "S-Meter~Meter", 432, 240, 184, 14)
+    local marks = { { "1", -121 }, { "3", -109 }, { "5", -97 }, { "7", -85 }, { "9", -73 }, { "+20", -53 }, { "+40", -33 } }
+    for _, m in ipairs(marks) do
+      local x = 432 + math.floor((m[2] + 130) / 117 * 184)
+      ui.label(m[1], x - 12, 254, 24, 16, "Center", 9, m[2] > -73 and S.fault or N.dim)
+    end
+    ui.readout("SMeterDbm", "S-Meter~dBm", 432, 276, 184, 24, { HTextAlign = "Center", TextColor = N.sub })
+    ui.hide("SignalDbm", "S-Meter~Signal dBm (pin)")
+
+    -- band
+    ui.section("Band", 8, 320, 624, 72)
+    for i, b in ipairs(BANDS) do
+      ui.button("Band " .. i, b, 22 + (i - 1) * 50, 352, 46, 28, "pad", { PrettyName = "Band~" .. b })
+    end
+
+    -- mode and filter
+    ui.section("Mode", 8, 400, 304, 132)
+    for i, m in ipairs(MODES) do
+      local r, c = math.floor((i - 1) / 5), (i - 1) % 5
+      ui.button("Mode " .. i, m, 22 + c * 56, 432 + r * 34, 52, 28, "pad", { PrettyName = "Mode~" .. m, FontSize = 11 })
+    end
+    cap("Modes the radio does not offer for this slice are dimmed.", 22, 500, 280)
+
+    ui.section("Filter", 320, 400, 312, 132)
+    for i = 1, FILTERS do
+      local r, c = math.floor((i - 1) / 3), (i - 1) % 3
+      ui.button("Filter " .. i, "", 334 + c * 96, 432 + r * 34, 92, 28, "pad", { PrettyName = "Filter~Preset " .. i })
+    end
+    ui.readout("FilterText", "Filter~Passband", 334, 500, 284, 22, { HTextAlign = "Center", TextColor = N.sub })
+
+    -- audio
+    ui.section("Audio", 8, 540, 624, 72)
+    ui.label("AF GAIN", 22, 574, 56, 20, "Left", 11, N.sub, "Medium")
+    ui.fader("AFGain", "Audio~AF Gain", 82, 572, 224, 24)
+    ui.readout("AFGainText", "Audio~AF Gain Text", 312, 572, 48, 24, { HTextAlign = "Center" })
+    ui.button("Mute", "MUTE", 368, 570, 72, 28, "danger", { PrettyName = "Audio~Mute" })
+    ui.label("RX ANT", 452, 574, 48, 20, "Left", 11, N.sub, "Medium")
+    ui.combo("RxAntenna", "Audio~RX Antenna", 504, 572, 116, 24)
+
+    ui.hint("Tap a slice to control it, type a frequency in MHz (or kHz), then pick band, mode and filter.", 620)
+
+  elseif page == "DSP" then
+    ui.page(524)
+    ui.header(WORD, "DSP", "RadioName", "Status", "Online")
+
+    ui.section("AGC", 8, 64, 304, 120)
+    for i, a in ipairs(AGC_MODES) do
+      ui.button("Agc " .. i, string.upper(a), 22 + (i - 1) * 70, 96, 66, 28, "pad", { PrettyName = "AGC~" .. a })
+    end
+    ui.label("THRESHOLD", 22, 138, 72, 20, "Left", 11, N.sub, "Medium")
+    ui.fader("AgcThreshold", "AGC~Threshold", 98, 136, 144, 24)
+    ui.readout("AgcThresholdText", "AGC~Threshold Text", 248, 136, 48, 24, { HTextAlign = "Center" })
+
+    ui.section("Squelch", 320, 64, 312, 120)
+    ui.button("Squelch", "SQUELCH", 334, 96, 96, 28, "primary", { PrettyName = "Squelch~On" })
+    ui.label("LEVEL", 334, 138, 48, 20, "Left", 11, N.sub, "Medium")
+    ui.fader("SquelchLevel", "Squelch~Level", 386, 136, 168, 24)
+    ui.readout("SquelchLevelText", "Squelch~Level Text", 560, 136, 56, 24, { HTextAlign = "Center" })
+
+    ui.section("Noise", 8, 192, 624, 176)
+    for i, d in ipairs(DSP) do
+      local y = 224 + (i - 1) * 34
+      ui.button("DspOn " .. i, d[2], 22, y, 80, 28, "primary", { PrettyName = "Noise~" .. d[2] })
+      ui.fader("DspLevel " .. i, "Noise~" .. d[2] .. " Level", 112, y + 2, 432, 24)
+      ui.readout("DspLevelText " .. i, "Noise~" .. d[2] .. " Level Text", 552, y + 2, 64, 24, { HTextAlign = "Center" })
+    end
+
+    ui.section("RIT", 8, 376, 304, 104)
+    ui.button("Rit", "RIT", 22, 408, 80, 28, "primary", { PrettyName = "RIT~On" })
+    ui.button("RitClear", "CLEAR", 110, 408, 80, 28, "utility", { PrettyName = "RIT~Clear" })
+    ui.readout("RitOffsetText", "RIT~Offset Text", 198, 410, 98, 24, { HTextAlign = "Center" })
+    ui.fader("RitOffset", "RIT~Offset (Hz)", 22, 446, 274, 24)
+
+    ui.section("Radio Outputs", 320, 376, 312, 104)
+    ui.label("LINE OUT", 334, 410, 64, 20, "Left", 11, N.sub, "Medium")
+    ui.fader("LineoutGain", "Outputs~Line Out Gain", 400, 408, 112, 24)
+    ui.readout("LineoutGainText", "Outputs~Line Out Text", 518, 408, 40, 24, { HTextAlign = "Center" })
+    ui.button("LineoutMute", "MUTE", 564, 406, 56, 28, "danger", { PrettyName = "Outputs~Line Out Mute" })
+    ui.label("PHONES", 334, 446, 64, 20, "Left", 11, N.sub, "Medium")
+    ui.fader("HeadphoneGain", "Outputs~Headphone Gain", 400, 444, 112, 24)
+    ui.readout("HeadphoneGainText", "Outputs~Headphone Text", 518, 444, 40, 24, { HTextAlign = "Center" })
+    ui.button("HeadphoneMute", "MUTE", 564, 442, 56, 28, "danger", { PrettyName = "Outputs~Headphone Mute" })
+
+    ui.hint("DSP settings apply to the selected slice. Line out and headphones are the radio's own outputs.", 492)
+
+  elseif page == "Transmit" then
+    ui.page(604)
+    ui.header(WORD, "Transmit", "RadioName", "Status", "Online")
+
+    ui.section("Safety", 8, 64, 624, 108)
+    ui.button("TxArm", "ARM", 22, 96, 120, 56, "warn", { PrettyName = "Safety~Arm", FontSize = 16, FontStyle = "Bold" })
+    ui.readout("ArmText", "Safety~Arm Text", 152, 96, 200, 24, { HTextAlign = "Center" })
+    ui.led("TxEnabled", "Safety~Transmit Enabled", 364, 100, 16, "warn")
+    ui.label("TRANSMIT ENABLED", 386, 98, 120, 20, "Left", 10, N.sub, "Medium")
+    ui.readout("TxGuard", "Safety~Message", 152, 128, 344, 24, { TextColor = S.warn, Font = "Roboto", FontSize = 11 })
+    ui.button("TxStop", "STOP", 508, 96, 112, 56, "danger",
+      { PrettyName = "Safety~Stop (unkey)", FontSize = 18, FontStyle = "Bold", OffColor = S.fault })
+
+    ui.section("Keying", 8, 180, 304, 196)
+    ui.button("Mox", "MOX", 22, 212, 132, 48, "danger", { PrettyName = "Keying~MOX", FontSize = 16, FontStyle = "Bold" })
+    ui.button("Tune", "TUNE", 164, 212, 132, 48, "warn", { PrettyName = "Keying~Tune", FontSize = 16, FontStyle = "Bold" })
+    ui.button("PTT", "PTT (HOLD)", 22, 268, 274, 32, "danger", { PrettyName = "Keying~PTT (hold)", ButtonStyle = "Momentary" })
+    ui.button("AtuStart", "ATU TUNE", 22, 308, 132, 28, "warn", { PrettyName = "Keying~ATU Start" })
+    ui.button("AtuBypass", "ATU BYPASS", 164, 308, 132, 28, "utility", { PrettyName = "Keying~ATU Bypass" })
+    ui.readout("AtuStatus", "Keying~ATU Status", 22, 344, 274, 24, { HTextAlign = "Center", TextColor = N.sub })
+
+    ui.section("Status", 320, 180, 312, 196)
+    ui.led("Transmitting", "Status~Transmitting", 336, 214, 20, "fault")
+    ui.label("ON AIR", 362, 214, 64, 20, "Left", 11, N.text, "Bold")
+    ui.led("TxAllowed", "Status~TX Allowed", 456, 214, 20, "ok")
+    ui.label("TX ALLOWED", 482, 214, 120, 20, "Left", 11, N.sub, "Medium")
+    cap("STATE", 336, 246, 56)
+    ui.readout("InterlockState", "Status~Interlock State", 392, 244, 224, 24)
+    cap("REASON", 336, 276, 56)
+    ui.readout("InterlockReason", "Status~Interlock Reason", 392, 274, 224, 24, { TextColor = S.warn })
+    cap("TX SLICE", 336, 306, 56)
+    ui.readout("TxSlice", "Status~TX Slice", 392, 304, 120, 24)
+    ui.button("SetTxSlice", "SET TX", 520, 302, 96, 28, "secondary", { PrettyName = "Status~Make Selected Slice TX" })
+    cap("TX ANT", 336, 338, 56)
+    ui.combo("TxAntenna", "Status~TX Antenna", 392, 336, 224, 24)
+
+    ui.section("Power and Audio", 8, 384, 304, 180)
+    ui.label("RF POWER", 22, 418, 72, 20, "Left", 11, N.sub, "Medium")
+    ui.fader("RfPower", "Power~RF Power", 98, 416, 144, 24, S.fault)
+    ui.readout("RfPowerText", "Power~RF Power Text", 248, 416, 48, 24, { HTextAlign = "Center" })
+    ui.label("TUNE PWR", 22, 454, 72, 20, "Left", 11, N.sub, "Medium")
+    ui.fader("TunePower", "Power~Tune Power", 98, 452, 144, 24, S.warn)
+    ui.readout("TunePowerText", "Power~Tune Power Text", 248, 452, 48, 24, { HTextAlign = "Center" })
+    ui.label("MIC LEVEL", 22, 490, 72, 20, "Left", 11, N.sub, "Medium")
+    ui.fader("MicLevel", "Power~Mic Level", 98, 488, 144, 24)
+    ui.readout("MicLevelText", "Power~Mic Level Text", 248, 488, 48, 24, { HTextAlign = "Center" })
+    ui.label("TX AUDIO", 22, 526, 72, 20, "Left", 11, N.sub, "Medium")
+    ui.combo("TxAudioSource", "Power~TX Audio Source", 98, 524, 198, 24)
+
+    ui.section("Meters", 320, 384, 312, 180)
+    local function mrow(label, mname, tname, y, color, pretty)
+      cap(label, 336, y, 52)
+      if mname then ui.meter(mname, "Meters~" .. pretty, 392, y + 4, 140, 12, color) end
+      ui.readout(tname, "Meters~" .. pretty .. " Text", 540, y, 76, 20, { FontSize = 11, HTextAlign = "Right" })
+    end
+    mrow("FWD", "FwdMeter", "FwdText", 416, S.fault, "Forward Power")
+    mrow("SWR", "SwrMeter", "SwrText", 440, S.warn, "SWR")
+    mrow("MIC", "MicMeter", "MicText", 464, S.ok, "Mic Peak")
+    cap("REF", 336, 488, 52)
+    ui.readout("RefText", "Meters~Reflected Power", 392, 488, 72, 20, { FontSize = 11 })
+    cap("PA", 472, 488, 24)
+    ui.readout("PaTempText", "Meters~PA Temperature", 496, 488, 120, 20, { FontSize = 11 })
+    cap("SUPPLY", 336, 512, 52)
+    ui.readout("VoltsText", "Meters~Supply Voltage", 392, 510, 72, 20, { FontSize = 11 })
+    ui.hide("FwdWatts", "Meters~Forward Watts (pin)")
+    ui.hide("Swr", "Meters~SWR (pin)")
+
+    ui.hint(txEnabled and "Check the antenna first. ARM, then MOX / TUNE within the arm time. STOP always unkeys."
+      or "Transmit is disabled. Enable it in the plugin Properties only when a proper antenna or load is connected.", 572)
+
+  else -- Setup
+    ui.page(500)
+    ui.header(WORD, "Setup", "RadioName", "Status", "Online")
+
+    ui.section("Connection", 8, 64, 624, 136)
+    cap("RADIO IP", 22, 98, 72)
+    ui.field("IPAddress", "Setup~Radio IP", 96, 96, 200, 24)
+    ui.button("Connect", "CONNECT", 304, 94, 96, 28, "primary", { PrettyName = "Setup~Connect" })
+    cap("MODE", 412, 98, 40)
+    ui.readout("ClientModeText", "Setup~Client Mode", 452, 96, 164, 24, { FontSize = 11 })
+    cap("METERS", 22, 132, 72)
+    ui.readout("UdpText", "Setup~Meter Stream", 96, 130, 304, 24, { FontSize = 11 })
+    cap("ERROR", 22, 166, 72)
+    ui.readout("LastError", "Setup~Last Error", 96, 164, 520, 24, { TextColor = S.fault, FontSize = 11 })
+
+    ui.section("Radio", 8, 208, 624, 168)
+    local rows = { { "MODEL", "ModelText" }, { "SERIAL", "SerialText" }, { "FIRMWARE", "FirmwareText" },
+                   { "CALLSIGN", "CallsignText" }, { "NICKNAME", "NicknameText" }, { "GPS", "GpsText" } }
+    for i, r in ipairs(rows) do
+      local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+      cap(r[1], 22 + col * 308, 242 + row * 32, 72)
+      ui.readout(r[2], "Radio~" .. r[1], 96 + col * 308, 240 + row * 32, 208, 24, { FontSize = 11 })
+    end
+    cap("CLIENTS", 22, 338, 72)
+    ui.readout("ClientsText", "Radio~GUI Clients", 96, 336, 520, 24, { FontSize = 11 })
+
+    ui.section("Slices and Messages", 8, 384, 624, 76)
+    ui.button("CreateSlice", "ADD SLICE", 22, 416, 104, 28, "secondary", { PrettyName = "Setup~Create Slice" })
+    ui.button("RemoveSlice", "REMOVE SLICE", 134, 416, 104, 28, "utility", { PrettyName = "Setup~Remove Selected Slice" })
+    ui.readout("LastMessage", "Setup~Last Radio Message", 248, 418, 368, 24, { FontSize = 11 })
+    ui.hide("ClientId", "Setup~Client ID")
+
+    ui.hint("The Core needs TCP 4992 to the radio, and the radio sends meters to the Core on the Meter UDP Port.", 468)
+  end
+
+  return layout, graphics
+end
+
+--=====================================================================
+-- Runtime
+--=====================================================================
+if Controls then
+  local API_PORT = 4992
+  local GUI_MODE = Properties["Client Mode"].Value == "Standalone (GUI client)"
+  local UDP_PORT = Properties["Meter UDP Port"].Value
+  local TX_ENABLED = Properties["Transmit"].Value == "Enabled"
+  local ARM_TIME = Properties["Arm Timeout (s)"].Value
+  local MAX_MOX = Properties["Max MOX Time (s)"].Value
+  local MAX_TUNE = Properties["Max Tune Time (s)"].Value
+  local SWR_TRIP = tonumber(Properties["SWR Trip"].Value)   -- nil when "Off"
+  local DEBUG = Properties["Debug Print"].Value
+  local TICK = 0.1             -- main timer period (s)
+  local HOLD = 2.0             -- ignore radio feedback on a control for this long after the user moves it
+  local SILENCE_LIMIT = 6      -- reconnect when nothing is heard for this many seconds (we ping every second)
+  local RECONNECT_EVERY = 5
+
+  local function dbg(level, ...)
+    if DEBUG == "All" or (DEBUG == "Errors" and level == "err") then print(...) end
+  end
+
+  -- state ------------------------------------------------------------
+  sock = TcpSocket.New()       -- global on purpose: Q-SYS docs say not to scope sockets locally
+  udp = UdpSocket.New()
+  mainTimer = Timer.New()
+
+  local tick = 0               -- seconds since start, advanced by mainTimer
+  local link = { state = "idle", handle = nil, version = "", lastRx = 0, lastTry = -100, udpOpen = false }
+  local seq = 0
+  local pending = {}           -- seq -> { cmd, cb }
+  local queue, queueOrder = {}, {}   -- coalesced setters: key -> command
+  local hold = {}              -- control key -> tick until which feedback is ignored
+
+  local slices = {}            -- slice index (number) -> { key = value }
+  local sel = nil              -- selected slice index
+  local meters = {}            -- meter id -> { src, num, nam, unit, value }
+  local meterByName = {}       -- "FWDPWR" / "SLC0:LEVEL" -> meter id
+  local meterPackets = 0
+  local interlock = {}
+  local transmit = {}
+  local atu = {}
+  local radio = {}
+  local info = {}
+  local clients = {}           -- handle -> { station, program }
+  local bandMemory = {}        -- band label -> MHz, last frequency used on that band through this plugin
+  local micInputs = { "MIC", "LINE", "ACC", "PC" }   -- replaced by the radio's "mic list" reply
+
+  local tx = { armedUntil = -1, ours = nil, startedAt = 0, swrCount = 0, unkeyOnConnect = false }
+
+  -- helpers ----------------------------------------------------------
+  local function trim(s) return ((s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+  local function n(v) return tonumber(v) end
+  local function truthy(v) return v == "1" or v == "on" or v == "T" or v == "+" or v == "true" end
+  local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi end return v end
+  local function round(v) return math.floor(v + 0.5) end
+
+  local function setText(c, s) if c and c.String ~= s then c.String = s end end
+  local function setBool(c, b) if c and c.Boolean ~= b then c.Boolean = b end end
+  local function held(key) return hold[key] and tick < hold[key] end
+  local function setV(c, v) if c and v and c.Value ~= v then c.Value = v end end
+  local choiceCache = {}
+  local function setChoices(name, list)
+    local joined = table.concat(list, "\n")
+    if choiceCache[name] ~= joined then Controls[name].Choices = list ; choiceCache[name] = joined end
+  end
+  local function setValue(c, key, v)
+    if c and v and not held(key) and c.Value ~= v then c.Value = v end
+  end
+
+  -- "14.2055" (MHz) -> "14.205.500"
+  local function fmtFreq(mhz)
+    if not mhz then return "" end
+    local hz = round(mhz * 1e6)
+    local m, k, h = math.floor(hz / 1e6), math.floor(hz / 1e3) % 1000, hz % 1000
+    return string.format("%d.%03d.%03d", m, k, h)
+  end
+
+  -- Typed frequency: < 100 = MHz, < 100000 = kHz, otherwise Hz. Dots used as thousands separators are accepted.
+  local function parseFreq(s)
+    s = trim(s or ""):gsub(",", ".")
+    local _, dots = s:gsub("%.", "")
+    if dots > 1 then s = s:gsub("%.", "") ; local v = n(s) ; return v and v / 1e6 end
+    local v = n((s:gsub("%s*[mMkK]?[hH]?[zZ]?$", "")))
+    if not v then return nil end
+    if s:lower():match("khz$") or s:lower():match("k$") then return v / 1e3 end
+    if s:lower():match("hz$") and not s:lower():match("mhz$") then return v / 1e6 end
+    if v < 100 then return v elseif v < 100000 then return v / 1e3 else return v / 1e6 end
+  end
+
+  local function stepHz()
+    local s = Controls.TuneStep.String
+    local v = n(s:match("^[%d%.]+"))
+    if not v then return 100 end
+    if s:find("kHz") then v = v * 1000 end
+    return v
+  end
+
+  local function setError(msg)
+    setText(Controls.LastError, msg or "")
+    if msg and msg ~= "" then dbg("err", "FlexRadio: " .. msg) end
+  end
+
+  local function guard(msg)
+    setText(Controls.TxGuard, msg or "")
+    if msg and msg ~= "" then dbg("all", "FlexRadio TX: " .. msg) end
+  end
+
+  -- key=value parser for status lines. Station names use 0x7F for spaces.
+  local function kv(s)
+    local t = {}
+    for k, v in s:gmatch("([%w_%-%.%+/]+)=(%S*)") do t[k:lower()] = v end
+    return t
+  end
+
+  -- info reply: model="FLEX-6600",chassis_serial="...",... (quoted values may contain commas)
+  local function parseInfo(s)
+    local t, i = {}, 1
+    while i <= #s do
+      local k, eq = s:match("^%s*([%w_]+)()=", i)
+      if not k then break end
+      i = eq + 1
+      local v
+      if s:sub(i, i) == '"' then
+        local close = s:find('"', i + 1, true) or (#s + 1)
+        v = s:sub(i + 1, close - 1)
+        i = close + 1
+      else
+        local comma = s:find(",", i, true) or (#s + 1)
+        v = s:sub(i, comma - 1)
+        i = comma
+      end
+      t[k:lower()] = v
+      if s:sub(i, i) == "," then i = i + 1 end
+    end
+    return t
+  end
+
+  local ERRORS = {
+    ["50000005"] = "wrong number or type of parameters", ["5000000C"] = "frequency out of range",
+    ["5000000D"] = "invalid slice", ["5000000F"] = "not available in this mode", ["50000016"] = "malformed command",
+    ["5000001D"] = "not enough receiver resources for that frequency", ["5000002C"] = "incorrect number of parameters",
+    ["5000002D"] = "bad field", ["50000032"] = "unrecognized mode", ["50000033"] = "parameter out of range",
+    ["5000003D"] = "transmit not supported", ["50000042"] = "not ready to transmit", ["50000043"] = "no transmitter",
+    ["50000001"] = "no receiver available", ["50000003"] = "license check failed", ["534C9999"] = "invalid slice",
+  }
+
+  -- connection -------------------------------------------------------
+  local render, renderAll, renderMeters, renderTx, renderArm
+
+  local function send(cmd, cb)
+    if link.state ~= "ready" and link.state ~= "handshake" then return false end
+    seq = seq + 1
+    pending[seq] = { cmd = cmd, cb = cb, at = tick }
+    dbg("all", "-> C" .. seq .. "|" .. cmd)
+    local ok, err = pcall(function() sock:Write("C" .. seq .. "|" .. cmd .. "\n") end)
+    if not ok then setError("Write failed: " .. tostring(err)) ; return false end
+    return true
+  end
+
+  -- coalesced send: only the latest command per key goes out on the next tick
+  local function queueCmd(key, cmd)
+    if not queue[key] then table.insert(queueOrder, key) end
+    queue[key] = cmd
+  end
+  local function flushQueue()
+    if link.state ~= "ready" then return end
+    local order = queueOrder
+    queueOrder = {}
+    for _, key in ipairs(order) do
+      local cmd = queue[key]
+      queue[key] = nil
+      if cmd then send(cmd, function(code, msg) if code ~= 0 then setError(cmd .. ": " .. msg) end end) end
+    end
+  end
+
+  local function resetState()
+    slices, meters, meterByName, interlock, transmit, atu, radio, clients = {}, {}, {}, {}, {}, {}, {}, {}
+    pending, queue, queueOrder = {}, {}, {}
+    link.handle = nil
+  end
+
+  local function setStatus(code, text)
+    Controls.Status.Value = code
+    Controls.Status.String = text
+    setBool(Controls.Online, code == 0)
+  end
+
+  local function closeLink(reason)
+    if tx.ours then tx.unkeyOnConnect = true end   -- make sure we unkey once we are back
+    tx.ours = nil
+    tx.armedUntil = -1                              -- losing the radio always disarms
+    link.state = "idle"
+    link.lastTry = tick                             -- next attempt after RECONNECT_EVERY
+    pcall(function() sock:Disconnect() end)
+    resetState()
+    if reason then setError(reason) end
+    setStatus(reason and 2 or 3, reason and "Disconnected" or "Not connected")
+    renderAll()
+  end
+
+  local function openUdp()
+    if link.udpOpen then return end
+    local ok, err = pcall(function() udp:Open(nil, UDP_PORT) end)
+    link.udpOpen = ok
+    if not ok then setText(Controls.UdpText, "Cannot open UDP " .. UDP_PORT .. ": " .. tostring(err)) end
+  end
+
+  local function connect()
+    local ip = trim(Controls.IPAddress.String)
+    if ip == "" then
+      closeLink(nil)
+      setStatus(3, "Enter the radio IP")
+      return
+    end
+    link.state = "idle"
+    if sock.IsConnected then pcall(function() sock:Disconnect() end) end
+    resetState()
+    link.state = "connecting"
+    link.lastTry = tick
+    link.lastRx = tick
+    setStatus(5, "Connecting")
+    openUdp()
+    dbg("all", "FlexRadio: connecting to " .. ip .. ":" .. API_PORT)
+    sock:Connect(ip, API_PORT)
+  end
+
+  -- slices -----------------------------------------------------------
+  local function sliceOrder()
+    local list = {}
+    for idx, s in pairs(slices) do if s.in_use ~= "0" then table.insert(list, idx) end end
+    table.sort(list)
+    return list
+  end
+
+  local function current() return sel and slices[sel] end
+
+  local function pickSlice()
+    if sel and slices[sel] then return end
+    sel = nil
+    local list = sliceOrder()
+    for _, idx in ipairs(list) do if slices[idx].active == "1" then sel = idx end end
+    if not sel then sel = list[1] end
+  end
+
+  local function sliceSet(param, value, key)
+    local s = current()
+    if not s then setError("No slice selected") ; return end
+    s[param] = tostring(value)
+    queueCmd((key or param) .. ":" .. sel, "slice s " .. sel .. " " .. param .. "=" .. tostring(value))
+  end
+
+  local function tuneTo(mhz)
+    local s = current()
+    if not s or not mhz then return end
+    mhz = clamp(mhz, 0.03, 54.0)
+    s.rf_frequency = string.format("%.6f", mhz)
+    queueCmd("tune:" .. sel, string.format("slice t %d %.6f autopan=1", sel, mhz))
+    render()
+  end
+
+  -- bands: SmartSDR band numbers for "display pan s <pan> band=<n>"; the plugin falls back to tuning the slice
+  -- to the frequency below when the slice has no panadapter or the radio refuses the band command.
+  local BAND_PLAN = {    -- label, low MHz, high MHz, fallback MHz, fallback mode (US / IARU Region 2 defaults)
+    { "160", 1.8, 2.0, 1.900, "LSB" }, { "80", 3.5, 4.0, 3.800, "LSB" }, { "60", 5.25, 5.45, 5.3305, "USB" },
+    { "40", 7.0, 7.3, 7.200, "LSB" }, { "30", 10.1, 10.15, 10.120, "DIGU" }, { "20", 14.0, 14.35, 14.200, "USB" },
+    { "17", 18.068, 18.168, 18.130, "USB" }, { "15", 21.0, 21.45, 21.300, "USB" }, { "12", 24.89, 24.99, 24.950, "USB" },
+    { "10", 28.0, 29.7, 28.400, "USB" }, { "6", 50.0, 54.0, 50.125, "USB" }, { "WWV", 9.999, 10.001, 10.000, "AM" },
+  }
+  local function bandOf(mhz)
+    if not mhz then return nil end
+    for i, b in ipairs(BAND_PLAN) do if mhz >= b[2] and mhz <= b[3] then return i end end
+    return nil
+  end
+
+  local function selectBand(i)
+    local s = current()
+    if not s then setError("No slice selected") ; return end
+    local b = BAND_PLAN[i]
+    local here = bandOf(n(s.rf_frequency))
+    if here then bandMemory[BAND_PLAN[here][1]] = n(s.rf_frequency) end
+    local function fallback()
+      local f = bandMemory[b[1]] or b[4]
+      if not bandMemory[b[1]] then sliceSet("mode", b[5]:lower()) end
+      tuneTo(f)
+      flushQueue()
+    end
+    if s.pan and s.pan ~= "" and s.pan ~= "0x00000000" and b[1] ~= "WWV" then
+      send("display pan s " .. s.pan .. " band=" .. b[1], function(code)
+        if code ~= 0 then fallback() end
+      end)
+    else
+      fallback()
+    end
+  end
+
+  -- filter presets (Hz). SSB: low edge 100 Hz; digital: 0 Hz; CW / AM: centred.
+  local FILTER_WIDTHS = {
+    SSB = { 1800, 2100, 2400, 2700, 2900, 3300 },
+    DIG = { 1000, 1500, 2000, 2500, 3000, 4000 },
+    CW  = { 50, 100, 250, 400, 500, 1000 },
+    AM  = { 5600, 6000, 8000, 10000, 12000, 16000 },
+  }
+  local function filterFamily(mode)
+    mode = (mode or ""):upper()
+    if mode == "USB" or mode == "LSB" then return "SSB"
+    elseif mode == "DIGU" or mode == "DIGL" then return "DIG"
+    elseif mode == "CW" then return "CW"
+    elseif mode == "AM" or mode == "SAM" then return "AM" end
+    return nil   -- FM, NFM, DFM, RTTY and waveforms: fixed or mode-specific filters, presets off
+  end
+  local function filterEdges(mode, width)
+    mode = (mode or ""):upper()
+    if mode == "USB" then return 100, 100 + width
+    elseif mode == "LSB" then return -(100 + width), -100
+    elseif mode == "DIGU" then return 0, width
+    elseif mode == "DIGL" then return -width, 0
+    else return -math.floor(width / 2), math.floor(width / 2) end
+  end
+  local function fmtWidth(hz)
+    if hz >= 1000 then
+      local k = hz / 1000
+      return (k == math.floor(k)) and string.format("%dk", k) or string.format("%.1fk", k)
+    end
+    return tostring(hz)
+  end
+
+  -- S units: S9 = -73 dBm, 6 dB per S unit (HF convention)
+  local function sUnits(dbm)
+    if not dbm then return "", "" end
+    local text
+    if dbm > -73 then
+      text = string.format("S9+%d", round(dbm + 73))
+    else
+      text = string.format("S%d", clamp(math.floor(9 + (dbm + 73) / 6 + 0.5), 0, 9))
+    end
+    return text, string.format("%.1f dBm", dbm)
+  end
+
+  -- meters -----------------------------------------------------------
+  local function meterKey(m)
+    if m.src and m.src:upper():sub(1, 3) == "SLC" then return "SLC" .. (m.num or "") .. ":" .. (m.nam or "") end
+    return m.nam or ""
+  end
+  local function rebuildMeterIndex()
+    meterByName = {}
+    for id, m in pairs(meters) do if m.nam then meterByName[meterKey(m)] = id end end
+  end
+  local function meterValue(key)
+    local id = meterByName[key]
+    return id and meters[id] and meters[id].value
+  end
+
+  local function parseMeterDefs(s)
+    -- "1.src=COD-#1.num=1#1.nam=MICPEAK#..." or "15 removed"
+    local rid = s:match("^%s*(%d+)%s+removed")
+    if rid then meters[n(rid)] = nil ; rebuildMeterIndex() ; return end
+    for id, key, value in s:gmatch("(%d+)%.([%a_]+)=([^#]*)") do
+      id = n(id)
+      meters[id] = meters[id] or {}
+      meters[id][key:lower()] = trim(value):gsub('^"', ""):gsub('"$', "")
+    end
+    rebuildMeterIndex()
+  end
+
+  local function scaleMeter(unit, raw)
+    unit = (unit or ""):lower()
+    if unit == "dbm" or unit == "dbfs" or unit == "db" or unit == "swr" then return raw / 128
+    elseif unit == "volts" or unit == "amps" then return raw / 256
+    elseif unit == "degc" or unit == "degf" then return raw / 64 end
+    return raw
+  end
+
+  -- VITA-49 meter packet: header word, stream id, class id (2 words), optional timestamps, then (uint16 id, int16 value) pairs
+  local function parseVita(data)
+    if #data < 28 then return end
+    local b1, b2 = data:byte(1, 2)
+    local ptype = math.floor(b1 / 16)
+    local hasClass = math.floor(b1 / 8) % 2 == 1
+    local hasTrailer = math.floor(b1 / 4) % 2 == 1
+    local tsi, tsf = math.floor(b2 / 64) % 4, math.floor(b2 / 16) % 4
+    local pos = 5
+    if ptype == 1 or ptype == 3 then pos = pos + 4 end
+    if hasClass then
+      local c1, c2 = data:byte(pos + 6, pos + 7)
+      if c1 * 256 + c2 ~= 0x8002 then return end
+      pos = pos + 8
+    else
+      return
+    end
+    if tsi ~= 0 then pos = pos + 4 end
+    if tsf ~= 0 then pos = pos + 8 end
+    local last = #data - (hasTrailer and 4 or 0)
+    meterPackets = meterPackets + 1
+    while pos + 3 <= last do
+      local i1, i2, v1, v2 = data:byte(pos, pos + 3)
+      local id = i1 * 256 + i2
+      local raw = v1 * 256 + v2
+      if raw >= 0x8000 then raw = raw - 0x10000 end
+      local m = meters[id]
+      if m then m.value = scaleMeter(m.unit, raw) end
+      pos = pos + 4
+    end
+  end
+
+  udp.Data = function(_, packet)
+    local ok, err = pcall(parseVita, packet.Data or "")
+    if not ok then dbg("err", "FlexRadio: meter packet error " .. tostring(err)) end
+  end
+
+  -- transmit guard -----------------------------------------------------
+  local function armed() return TX_ENABLED and tick < tx.armedUntil end
+  local function onAir()
+    return interlock.state == "TRANSMITTING" or interlock.state == "PTT_REQUESTED"
+  end
+
+  local function unkey(reason)
+    -- always allowed, even with transmit disabled in Properties
+    send("xmit 0")
+    send("transmit tune off")
+    tx.ours = nil
+    tx.swrCount = 0
+    tx.armedUntil = -1
+    setBool(Controls.Mox, false) ; setBool(Controls.Tune, false) ; setBool(Controls.TxArm, false)
+    guard(reason or "Unkeyed")
+    renderTx()
+  end
+
+  local function canKey(what)
+    if not TX_ENABLED then return false, "Transmit is disabled in Properties" end
+    if link.state ~= "ready" then return false, "Not connected" end
+    if not armed() then return false, "ARM first, then " .. what .. " within " .. ARM_TIME .. " s" end
+    if interlock.state == nil then return false, "Waiting for the radio's interlock status" end
+    if interlock.tx_allowed == "0" then return false, "Radio says transmit is not allowed (" .. (interlock.reason or interlock.state) .. ")" end
+    if interlock.state ~= "READY" and not onAir() then return false, "Radio not ready: " .. interlock.state end
+    return true
+  end
+
+  local function key(kind)   -- kind = "mox" | "tune" | "ptt" | "atu"
+    local ok, why = canKey(kind == "atu" and "ATU TUNE" or kind:upper())
+    if not ok then
+      guard(why)
+      setBool(Controls.Mox, false) ; setBool(Controls.Tune, false)
+      return
+    end
+    if kind == "tune" then send("transmit tune on")
+    elseif kind == "atu" then send("atu start")
+    else send("xmit 1") end
+    tx.ours = kind
+    tx.startedAt = tick
+    tx.swrCount = 0
+    tx.armedUntil = math.huge   -- stay armed while keyed; re-armed for ARM_TIME after unkey
+    guard(kind == "atu" and "ATU tuning at tune power" or (kind:upper() .. " keyed"))
+    renderTx()
+  end
+
+  local function release(kind)
+    if kind == "tune" then send("transmit tune off") else send("xmit 0") end
+    if tx.ours == kind then tx.ours = nil end
+    if TX_ENABLED and tx.armedUntil == math.huge then tx.armedUntil = tick + ARM_TIME end
+    guard("")
+    renderTx()
+  end
+
+  local function watchdog()
+    if not tx.ours then return end
+    local limit = (tx.ours == "tune" or tx.ours == "atu") and MAX_TUNE or MAX_MOX
+    if tick - tx.startedAt > limit then
+      if tx.ours == "atu" then
+        tx.ours = nil ; tx.armedUntil = tick + ARM_TIME
+      else
+        unkey(string.upper(tx.ours) .. " stopped: " .. limit .. " s limit")
+      end
+      return
+    end
+    local swr, fwd = meterValue("SWR"), meterValue("FWDPWR")
+    if SWR_TRIP and swr and fwd and onAir() and (10 ^ ((fwd - 30) / 10)) > 1 and swr >= SWR_TRIP then
+      tx.swrCount = tx.swrCount + 1
+      if tx.swrCount >= 5 and tx.ours ~= "atu" then
+        unkey(string.format("Stopped: SWR %.1f above the %.1f trip", swr, SWR_TRIP))
+      end
+    else
+      tx.swrCount = 0
+    end
+  end
+
+  -- status parsing ---------------------------------------------------
+  local function onStatus(body)
+    local word, rest = body:match("^(%S+)%s*(.*)$")
+    if not word then return end
+    if word == "slice" then
+      local idx, fields = rest:match("^(%d+)%s*(.*)$")
+      idx = n(idx)
+      if not idx then return end
+      local t = kv(fields)
+      if t.in_use == "0" then
+        slices[idx] = nil
+        if sel == idx then sel = nil end
+      else
+        slices[idx] = slices[idx] or {}
+        for k, v in pairs(t) do slices[idx][k] = v end
+        if t.active == "1" and Controls.FollowActive.Boolean then sel = idx end
+      end
+      render()
+    elseif word == "interlock" then
+      local t = kv(rest)
+      for k, v in pairs(t) do interlock[k] = v end
+      if t.state and t.state ~= "TRANSMITTING" and t.state ~= "PTT_REQUESTED" then
+        if not t.reason then interlock.reason = nil end
+        if not t.source then interlock.source = nil end
+      end
+      renderTx()
+    elseif word == "transmit" then
+      if rest:match("^band") then return end   -- per-band settings, not used
+      local t = kv(rest)
+      for k, v in pairs(t) do transmit[k] = v end
+      renderTx()
+    elseif word == "atu" then
+      local t = kv(rest)
+      for k, v in pairs(t) do atu[k] = v end
+      if tx.ours == "atu" and atu.status and atu.status ~= "TUNE_IN_PROGRESS" and atu.status ~= "TUNE_NOT_STARTED" then
+        tx.ours = nil
+        if TX_ENABLED then tx.armedUntil = tick + ARM_TIME end
+      end
+      renderTx()
+    elseif word == "radio" then
+      local t = kv(rest)
+      for k, v in pairs(t) do radio[k] = v end
+      renderAll()
+    elseif word == "meter" then
+      parseMeterDefs(rest)
+    elseif word == "client" then
+      local handle, what, fields = rest:match("^(%S+)%s+(%S+)%s*(.*)$")
+      if handle then
+        if what == "disconnected" then clients[handle] = nil
+        else
+          local t = kv(fields)
+          clients[handle] = clients[handle] or {}
+          for k, v in pairs(t) do clients[handle][k] = (v:gsub("\127", " ")) end
+        end
+        renderAll()
+      end
+    end
+  end
+
+  local function onResponse(s, code, msg)
+    local p = pending[s]
+    pending[s] = nil
+    if not p then return end
+    if code ~= 0 then
+      local hex = string.format("%08X", code)
+      msg = (msg ~= "" and msg) or ERRORS[hex] or ("error 0x" .. hex)
+      dbg("err", "FlexRadio: '" .. p.cmd .. "' -> " .. hex .. " " .. msg)
+    end
+    if p.cb then p.cb(code, msg) end
+  end
+
+  local function afterHandshake()
+    link.state = "ready"
+    setStatus(5, "Initializing")
+    if GUI_MODE then
+      local id = trim(Controls.ClientId.String)
+      send("client gui" .. (id ~= "" and (" " .. id) or ""), function(code, msg)
+        if code ~= 0 then setError("client gui refused: " .. msg) ; return end
+        local newId = trim((msg or ""):match("^([%x%-]+)") or "")
+        if #newId >= 32 then Controls.ClientId.String = newId end
+        send("client station Q-SYS")
+      end)
+    end
+    send("client udpport " .. UDP_PORT, function(code, msg)
+      setText(Controls.UdpText, code == 0 and ("Listening on UDP " .. UDP_PORT) or ("udpport refused: " .. msg))
+    end)
+    send("keepalive enable")
+    send("info", function(code, msg) if code == 0 then info = parseInfo(msg) ; renderAll() end end)
+    send("version", function(code, msg)
+      if code == 0 then
+        for k, v in msg:gmatch("([^#=]+)=([^#]*)") do if k == "SmartSDR-MB" then info.firmware = v end end
+        renderAll()
+      end
+    end)
+    for _, what in ipairs({ "radio all", "slice all", "tx all", "atu all", "client all", "meter all" }) do
+      send("sub " .. what, function(code, msg) if code ~= 0 then setError("sub " .. what .. ": " .. msg) end end)
+    end
+    send("mic list", function(code, msg)
+      if code ~= 0 then return end
+      local list = {}
+      for m in msg:gmatch("[^,%s]+") do
+        local u = m:upper()
+        if u ~= "GEN" and u ~= "NOISE" then table.insert(list, u) end   -- test-signal generators left out on purpose
+      end
+      if #list > 0 then micInputs = list ; renderTx() end
+    end)
+    send("meter list", function(code, msg) if code == 0 then parseMeterDefs((msg:gsub("^meter%s*", ""))) end end)
+    if tx.unkeyOnConnect then
+      tx.unkeyOnConnect = false
+      unkey("Unkeyed after reconnect")
+    end
+    send("ping", function(code)
+      if code == 0 and link.state == "ready" then setStatus(0, "OK") ; setError("") end
+    end)
+  end
+
+  local function onLine(line)
+    link.lastRx = tick
+    if line == "" then return end
+    local c = line:sub(1, 1)
+    if c == "S" then
+      local body = line:match("^S[%x]*|(.*)$")
+      if body then
+        local ok, err = pcall(onStatus, body)
+        if not ok then dbg("err", "FlexRadio: status parse error " .. tostring(err) .. " in " .. line) end
+      end
+    elseif c == "R" then
+      local s, code, msg = line:match("^R(%d+)|(%x+)|?(.*)$")
+      if s then onResponse(n(s), tonumber(code, 16) or -1, (msg or ""):gsub("|.*$", "")) end
+    elseif c == "M" then
+      local text = line:match("^M%x+|(.*)$")
+      if text then setText(Controls.LastMessage, text) end
+    elseif c == "V" then
+      link.version = line:sub(2)
+    elseif c == "H" then
+      link.handle = line:sub(2)
+      afterHandshake()
+    end
+    if c ~= "S" then dbg("all", "<- " .. line) end
+  end
+
+  sock.ReconnectTimeout = 0     -- reconnects are handled by mainTimer
+  sock.EventHandler = function(s, evt, err)
+    if evt == TcpSocket.Events.Connected then
+      link.state = "handshake"
+      link.lastRx = tick
+      setStatus(5, "Connected, waiting for handle")
+    elseif evt == TcpSocket.Events.Data then
+      while true do
+        local line = s:ReadLine(TcpSocket.EOL.Any)
+        if not line then break end
+        onLine(line)
+      end
+    elseif link.state == "idle" then
+      return   -- a late event from a socket we already dropped
+    elseif evt == TcpSocket.Events.Closed then
+      closeLink("Radio closed the connection")
+    elseif evt == TcpSocket.Events.Error then
+      closeLink("Socket error: " .. tostring(err))
+    elseif evt == TcpSocket.Events.Timeout then
+      closeLink("Socket timeout")
+    end
+  end
+
+  -- rendering --------------------------------------------------------
+  function render()
+    pickSlice()
+    local list = sliceOrder()
+    for i = 1, MAX_SLICES do
+      local idx = list[i]
+      local s = idx and slices[idx]
+      local selBtn = Controls.SliceSel[i]
+      if s then
+        selBtn.Legend = s.index_letter or string.char(65 + idx)
+        setText(Controls.SliceFreq[i], fmtFreq(n(s.rf_frequency)))
+        setText(Controls.SliceMode[i], (s.mode or ""):upper() .. ((s.client_handle and clients[s.client_handle] and clients[s.client_handle].station) and ("  " .. clients[s.client_handle].station) or ""))
+        setBool(Controls.SliceTx[i], s.tx == "1")
+        setBool(selBtn, idx == sel)
+        selBtn.IsDisabled = false
+      else
+        selBtn.Legend = ""
+        setText(Controls.SliceFreq[i], "")
+        setText(Controls.SliceMode[i], "")
+        setBool(Controls.SliceTx[i], false)
+        setBool(selBtn, false)
+        selBtn.IsDisabled = true
+      end
+    end
+
+    local s = current()
+    local f = s and n(s.rf_frequency)
+    setText(Controls.SliceLetter, s and (s.index_letter or string.char(65 + sel)) or "-")
+    setText(Controls.Frequency, f and fmtFreq(f) or "")
+    setV(Controls.FrequencyMHz, f or 0)
+
+    local b = bandOf(f)
+    for i = 1, #BANDS do setBool(Controls.Band[i], i == b) end
+
+    local mode = s and (s.mode or ""):upper() or ""
+    local allowed = {}
+    if s and s.mode_list then for m in s.mode_list:gmatch("[^,]+") do allowed[m:upper()] = true end end
+    for i, m in ipairs(MODES) do
+      setBool(Controls.Mode[i], m == mode)
+      Controls.Mode[i].IsDisabled = (s == nil) or (s.mode_list ~= nil and not allowed[m])
+    end
+
+    local fam = filterFamily(mode)
+    local lo, hi = s and n(s.filter_lo), s and n(s.filter_hi)
+    local width = lo and hi and (hi - lo)
+    for i = 1, FILTERS do
+      local btn = Controls.Filter[i]
+      if fam then
+        local w = FILTER_WIDTHS[fam][i]
+        btn.Legend = fmtWidth(w)
+        btn.IsDisabled = false
+        setBool(btn, width ~= nil and math.abs(width - w) < 15)
+      else
+        btn.Legend = "-"
+        btn.IsDisabled = true
+        setBool(btn, false)
+      end
+    end
+    if lo and hi then
+      setText(Controls.FilterText, string.format("%d to %d Hz  (%s)", lo, hi, fmtWidth(hi - lo)))
+    else
+      setText(Controls.FilterText, s and (fam and "" or "Filter fixed by mode") or "")
+    end
+
+    local af = s and n(s.audio_level)
+    setValue(Controls.AFGain, "af", af)
+    setText(Controls.AFGainText, af and tostring(af) or "")
+    setBool(Controls.Mute, s ~= nil and s.audio_mute == "1")
+
+    local ants = {}
+    if s and s.ant_list then for a in s.ant_list:gmatch("[^,]+") do table.insert(ants, a) end end
+    setChoices("RxAntenna", ants)
+    setText(Controls.RxAntenna, s and s.rxant or "")
+
+    -- DSP page
+    for i, a in ipairs(AGC_MODES) do setBool(Controls.Agc[i], s ~= nil and (s.agc_mode or ""):lower() == a) end
+    local th = s and n(s.agc_threshold)
+    setValue(Controls.AgcThreshold, "agc", th)
+    setText(Controls.AgcThresholdText, th and tostring(th) or "")
+    for i, d in ipairs(DSP) do
+      setBool(Controls.DspOn[i], s ~= nil and truthy(s[d[1]] or ""))
+      local lv = s and n(s[d[1] .. "_level"])
+      setValue(Controls.DspLevel[i], "dsp" .. i, lv)
+      setText(Controls.DspLevelText[i], lv and tostring(lv) or "")
+    end
+    setBool(Controls.Squelch, s ~= nil and truthy(s.squelch or ""))
+    local sq = s and n(s.squelch_level)
+    setValue(Controls.SquelchLevel, "sq", sq)
+    setText(Controls.SquelchLevelText, sq and tostring(sq) or "")
+    setBool(Controls.Rit, s ~= nil and truthy(s.rit_on or ""))
+    local rit = s and n(s.rit_freq)
+    setValue(Controls.RitOffset, "rit", rit and clamp(rit, -2000, 2000))
+    setText(Controls.RitOffsetText, rit and string.format("%+d Hz", rit) or "")
+
+    renderTx()
+  end
+
+  function renderTx()
+    local txSlice
+    for idx, s in pairs(slices) do if s.tx == "1" then txSlice = idx end end
+    local ts = txSlice and slices[txSlice]
+    setText(Controls.TxSlice, ts and ((ts.index_letter or string.char(65 + txSlice)) .. "  " .. fmtFreq(n(ts.rf_frequency))) or "none")
+    local tants = {}
+    if ts and ts.tx_ant_list then for a in ts.tx_ant_list:gmatch("[^,]+") do table.insert(tants, a) end end
+    setChoices("TxAntenna", tants)
+    setText(Controls.TxAntenna, ts and ts.txant or "")
+
+    local state = interlock.state or ""
+    local air = onAir()
+    setText(Controls.InterlockState, state .. ((air and interlock.source) and ("  (" .. interlock.source .. ")") or ""))
+    setText(Controls.InterlockReason, interlock.reason or "")
+    setBool(Controls.Transmitting, air)
+    setBool(Controls.TxAllowed, interlock.tx_allowed == "1")
+    setBool(Controls.Mox, tx.ours == "mox" or (air and transmit.tune ~= "1" and tx.ours ~= "atu" and tx.ours ~= "ptt"))
+    setBool(Controls.Tune, tx.ours == "tune" or transmit.tune == "1")
+
+    setChoices("TxAudioSource", micInputs)
+    setText(Controls.TxAudioSource, (transmit.mic_selection or ""):upper())
+    local ml = n(transmit.mic_level)
+    setValue(Controls.MicLevel, "mic", ml)
+    setText(Controls.MicLevelText, ml and tostring(ml) or "")
+
+    local rf, tp = n(transmit.rfpower), n(transmit.tunepower)
+    setValue(Controls.RfPower, "rf", rf)
+    setText(Controls.RfPowerText, rf and tostring(rf) or "")
+    setValue(Controls.TunePower, "tp", tp)
+    setText(Controls.TunePowerText, tp and tostring(tp) or "")
+
+    local st = atu.status or ""
+    local ATU = { TUNE_IN_PROGRESS = "Tuning", TUNE_SUCCESSFUL = "Tuned", TUNE_OK = "Tuned", TUNE_BYPASS = "Tuned (bypass)",
+      TUNE_FAIL = "Tune failed", TUNE_FAIL_BYPASS = "Failed, bypassed", TUNE_ABORTED = "Aborted",
+      TUNE_MANUAL_BYPASS = "Bypassed", TUNE_NOT_STARTED = "Ready", NONE = "Ready" }
+    setText(Controls.AtuStatus, st ~= "" and ("ATU: " .. (ATU[st] or st)) or (atu.atu_enabled == "0" and "ATU off" or ""))
+
+    renderArm()
+  end
+
+  function renderArm()
+    setBool(Controls.TxEnabled, TX_ENABLED)
+    for _, c in ipairs({ Controls.TxArm, Controls.Mox, Controls.Tune, Controls.PTT, Controls.AtuStart }) do
+      c.IsDisabled = not TX_ENABLED
+    end
+    if not TX_ENABLED then
+      setText(Controls.ArmText, "Transmit disabled")
+      setBool(Controls.TxArm, false)
+    elseif tx.ours then
+      setText(Controls.ArmText, string.format("KEYED  %ds", math.floor(tick - tx.startedAt)))
+      setBool(Controls.TxArm, true)
+    elseif armed() and tx.armedUntil ~= math.huge then
+      setText(Controls.ArmText, string.format("ARMED  %ds", math.ceil(tx.armedUntil - tick)))
+      setBool(Controls.TxArm, true)
+    else
+      setText(Controls.ArmText, "Safe")
+      setBool(Controls.TxArm, false)
+    end
+  end
+
+  function renderMeters()
+    local s = current()
+    local dbm = sel and meterValue("SLC" .. sel .. ":LEVEL")
+    if s and dbm then
+      local su, db = sUnits(dbm)
+      setV(Controls.SMeter, clamp(dbm, -130, -13))
+      setV(Controls.SignalDbm, dbm)
+      setText(Controls.SMeterText, su)
+      setText(Controls.SMeterDbm, db)
+    else
+      setV(Controls.SMeter, -130)
+      setText(Controls.SMeterText, s and "S0" or "")
+      setText(Controls.SMeterDbm, s and "no meter data" or "")
+    end
+
+    local fwd = meterValue("FWDPWR")
+    local w = fwd and 10 ^ ((fwd - 30) / 10) or 0
+    if w < 0.5 then w = 0 end
+    setV(Controls.FwdMeter, clamp(w, 0, 120))
+    setV(Controls.FwdWatts, w)
+    setText(Controls.FwdText, fwd and string.format("%.0f W", w) or "")
+    local swr = meterValue("SWR")
+    if swr and w > 0 then
+      setV(Controls.SwrMeter, clamp(swr, 1, 5))
+      setV(Controls.Swr, swr)
+      setText(Controls.SwrText, string.format("%.2f", swr))
+    else
+      setV(Controls.SwrMeter, 1)
+      setText(Controls.SwrText, swr and "-" or "")
+    end
+    local ref = meterValue("REFPWR")
+    local rw = ref and 10 ^ ((ref - 30) / 10) or 0
+    setText(Controls.RefText, ref and string.format("%.1f W", rw >= 0.05 and rw or 0) or "")
+    local mic = meterValue("MICPEAK")
+    setV(Controls.MicMeter, mic and clamp(mic, -60, 0) or -60)
+    setText(Controls.MicText, mic and string.format("%.0f dBFS", mic) or "")
+    local pa = meterValue("PATEMP")
+    setText(Controls.PaTempText, pa and string.format("%.0f C", pa) or "")
+    local v = meterValue("+13.8B") or meterValue("+13.8A")
+    setText(Controls.VoltsText, v and string.format("%.1f V", v) or "")
+  end
+
+  function renderAll()
+    local model = info.model or ""
+    local nick = radio.nickname or info.nickname or info.name or ""
+    setText(Controls.RadioName, (nick ~= "" and nick ~= model) and (nick .. "  " .. model) or model)
+    setText(Controls.ModelText, model)
+    setText(Controls.SerialText, info.chassis_serial or "")
+    setText(Controls.FirmwareText, info.firmware or info.software_ver or "")
+    setText(Controls.CallsignText, radio.callsign or info.callsign or "")
+    setText(Controls.NicknameText, nick)
+    setText(Controls.GpsText, info.gps or "")
+    local names = {}
+    for h, c in pairs(clients) do
+      if c.station or c.program then table.insert(names, (c.station or "?") .. " (" .. (c.program or "") .. ")") end
+    end
+    table.sort(names)
+    setText(Controls.ClientsText, table.concat(names, ", "))
+    setText(Controls.ClientModeText, GUI_MODE and "Standalone GUI client" or "Follows SmartSDR")
+    Controls.CreateSlice.IsDisabled = not GUI_MODE
+    Controls.RemoveSlice.IsDisabled = not GUI_MODE   -- in follow mode the slices belong to SmartSDR
+
+    local lg, hg = n(radio.lineout_gain), n(radio.headphone_gain)
+    setValue(Controls.LineoutGain, "lo", lg)
+    setText(Controls.LineoutGainText, lg and tostring(lg) or "")
+    setBool(Controls.LineoutMute, truthy(radio.lineout_mute or ""))
+    setValue(Controls.HeadphoneGain, "hp", hg)
+    setText(Controls.HeadphoneGainText, hg and tostring(hg) or "")
+    setBool(Controls.HeadphoneMute, truthy(radio.headphone_mute or ""))
+    render()
+  end
+
+  -- main timer -------------------------------------------------------
+  local pingEvery, nextPing, lastMeterCount, meterQuiet = 1.0, 0, 0, 0
+  mainTimer.EventHandler = function()
+    tick = tick + TICK
+    flushQueue()
+    if link.state == "ready" then
+      if tick >= nextPing then
+        nextPing = tick + pingEvery
+        send("ping")
+        -- meter stream health, once a second
+        if meterPackets ~= lastMeterCount then
+          meterQuiet = 0
+          setText(Controls.UdpText, string.format("Receiving on UDP %d (%d meters)", UDP_PORT, (function() local c = 0 for _ in pairs(meters) do c = c + 1 end return c end)()))
+        else
+          meterQuiet = meterQuiet + 1
+          if meterQuiet == 5 then setText(Controls.UdpText, "No meter packets on UDP " .. UDP_PORT .. " (firewall / port in use?)") end
+        end
+        lastMeterCount = meterPackets
+      end
+      if tick - link.lastRx > SILENCE_LIMIT then closeLink("No reply from the radio for " .. SILENCE_LIMIT .. " s") end
+    elseif link.state == "connecting" or link.state == "handshake" then
+      if tick - link.lastTry > 10 then closeLink("Could not connect to " .. trim(Controls.IPAddress.String) .. ":" .. API_PORT) end
+    elseif link.state == "idle" and trim(Controls.IPAddress.String) ~= "" and tick - link.lastTry >= RECONNECT_EVERY then
+      connect()
+    end
+    watchdog()
+    if TX_ENABLED and not tx.ours and tx.armedUntil > 0 and tx.armedUntil ~= math.huge and tick >= tx.armedUntil then
+      tx.armedUntil = -1
+      guard("Disarmed (timeout)")
+    end
+    renderMeters()
+    renderArm()
+  end
+
+  -- control handlers -------------------------------------------------
+  local function touch(key) hold[key] = tick + HOLD end
+
+  for i = 1, MAX_SLICES do
+    Controls.SliceSel[i].EventHandler = function()
+      local idx = sliceOrder()[i]
+      if idx then
+        sel = idx
+        Controls.FollowActive.Boolean = false
+        if GUI_MODE then send("slice s " .. idx .. " active=1") end
+      end
+      render() ; renderMeters()
+    end
+  end
+  Controls.FollowActive.EventHandler = function(c)
+    if c.Boolean then for idx, s in pairs(slices) do if s.active == "1" then sel = idx end end end
+    render()
+  end
+
+  Controls.Frequency.EventHandler = function(c)
+    local f = parseFreq(c.String)
+    if f then tuneTo(f) else setError("Cannot read frequency '" .. c.String .. "'") ; render() end
+  end
+  local function stepTune(dir, mult)
+    local s = current()
+    local f = s and n(s.rf_frequency)
+    if not f then return end
+    local step = stepHz() * mult
+    local hz = round(f * 1e6)
+    local snapped
+    if dir > 0 then snapped = math.floor(hz / step) * step + step
+    else snapped = math.ceil(hz / step) * step - step end
+    tuneTo(snapped / 1e6)
+  end
+  Controls.TuneUp.EventHandler = function() stepTune(1, 1) end
+  Controls.TuneDown.EventHandler = function() stepTune(-1, 1) end
+  Controls.TuneUpFast.EventHandler = function() stepTune(1, 10) end
+  Controls.TuneDownFast.EventHandler = function() stepTune(-1, 10) end
+
+  for i = 1, #BANDS do Controls.Band[i].EventHandler = function() selectBand(i) ; render() end end
+  for i, m in ipairs(MODES) do
+    Controls.Mode[i].EventHandler = function() sliceSet("mode", m:lower()) ; render() end
+  end
+  for i = 1, FILTERS do
+    Controls.Filter[i].EventHandler = function()
+      local s = current()
+      local fam = s and filterFamily(s.mode)
+      if not fam then render() ; return end
+      local lo, hi = filterEdges(s.mode, FILTER_WIDTHS[fam][i])
+      s.filter_lo, s.filter_hi = tostring(lo), tostring(hi)
+      queueCmd("filt:" .. sel, "filt " .. sel .. " " .. lo .. " " .. hi)
+      render()
+    end
+  end
+
+  Controls.AFGain.EventHandler = function(c) touch("af") ; sliceSet("audio_level", round(c.Value)) ; setText(Controls.AFGainText, tostring(round(c.Value))) end
+  Controls.Mute.EventHandler = function(c) sliceSet("audio_mute", c.Boolean and 1 or 0) end
+  Controls.RxAntenna.EventHandler = function(c) sliceSet("rxant", c.String) end
+
+  for i, a in ipairs(AGC_MODES) do Controls.Agc[i].EventHandler = function() sliceSet("agc_mode", a) ; render() end end
+  Controls.AgcThreshold.EventHandler = function(c) touch("agc") ; sliceSet("agc_threshold", round(c.Value)) ; setText(Controls.AgcThresholdText, tostring(round(c.Value))) end
+  for i, d in ipairs(DSP) do
+    Controls.DspOn[i].EventHandler = function(c) sliceSet(d[1], c.Boolean and 1 or 0) end
+    Controls.DspLevel[i].EventHandler = function(c)
+      touch("dsp" .. i) ; sliceSet(d[1] .. "_level", round(c.Value)) ; setText(Controls.DspLevelText[i], tostring(round(c.Value)))
+    end
+  end
+  Controls.Squelch.EventHandler = function(c) sliceSet("squelch", c.Boolean and 1 or 0) end
+  Controls.SquelchLevel.EventHandler = function(c) touch("sq") ; sliceSet("squelch_level", round(c.Value)) ; setText(Controls.SquelchLevelText, tostring(round(c.Value))) end
+  Controls.Rit.EventHandler = function(c) sliceSet("rit_on", c.Boolean and 1 or 0) end
+  Controls.RitOffset.EventHandler = function(c) touch("rit") ; sliceSet("rit_freq", round(c.Value)) ; setText(Controls.RitOffsetText, string.format("%+d Hz", round(c.Value))) end
+  Controls.RitClear.EventHandler = function() hold.rit = nil ; sliceSet("rit_freq", 0) ; render() end
+
+  local function mixer(key, cmd, value) touch(key) ; queueCmd("mixer:" .. key, "mixer " .. cmd .. " " .. value) end
+  Controls.LineoutGain.EventHandler = function(c) mixer("lo", "lineout gain", round(c.Value)) ; radio.lineout_gain = tostring(round(c.Value)) ; setText(Controls.LineoutGainText, radio.lineout_gain) end
+  Controls.HeadphoneGain.EventHandler = function(c) mixer("hp", "headphone gain", round(c.Value)) ; radio.headphone_gain = tostring(round(c.Value)) ; setText(Controls.HeadphoneGainText, radio.headphone_gain) end
+  Controls.LineoutMute.EventHandler = function(c) radio.lineout_mute = c.Boolean and "1" or "0" ; queueCmd("mixer:lom", "mixer lineout mute " .. (c.Boolean and "on" or "off")) end
+  Controls.HeadphoneMute.EventHandler = function(c) radio.headphone_mute = c.Boolean and "1" or "0" ; queueCmd("mixer:hpm", "mixer headphone mute " .. (c.Boolean and "on" or "off")) end
+
+  -- transmit
+  Controls.TxArm.EventHandler = function(c)
+    if not TX_ENABLED then setBool(c, false) ; guard("Transmit is disabled in Properties") ; return end
+    if c.Boolean then
+      tx.armedUntil = tick + ARM_TIME
+      guard("Armed. MOX, TUNE, PTT or ATU TUNE within " .. ARM_TIME .. " s")
+    else
+      if tx.ours or onAir() then unkey("Disarmed and unkeyed") else tx.armedUntil = -1 ; guard("Disarmed") end
+    end
+    renderTx()
+  end
+  Controls.TxStop.EventHandler = function() unkey("STOP pressed") end
+  Controls.Mox.EventHandler = function(c) if c.Boolean then key("mox") else release("mox") end end
+  Controls.Tune.EventHandler = function(c) if c.Boolean then key("tune") else release("tune") end end
+  Controls.PTT.EventHandler = function(c) if c.Boolean then key("ptt") else release("ptt") end end
+  Controls.AtuStart.EventHandler = function() key("atu") end
+  Controls.AtuBypass.EventHandler = function() send("atu bypass") end   -- bypass does not transmit
+  Controls.SetTxSlice.EventHandler = function() sliceSet("tx", 1) end    -- assigns the transmitter, does not key
+  Controls.TxAntenna.EventHandler = function(c)
+    for idx, s in pairs(slices) do
+      if s.tx == "1" then s.txant = c.String ; queueCmd("txant:" .. idx, "slice s " .. idx .. " txant=" .. c.String) end
+    end
+  end
+  -- TX audio: choosing the source and level never keys the radio
+  Controls.TxAudioSource.EventHandler = function(c)
+    transmit.mic_selection = c.String
+    queueCmd("micinput", "mic input " .. c.String:lower())
+  end
+  Controls.MicLevel.EventHandler = function(c)
+    touch("mic") ; transmit.mic_level = tostring(round(c.Value))
+    setText(Controls.MicLevelText, transmit.mic_level)
+    queueCmd("miclevel", "transmit set miclevel=" .. round(c.Value))
+  end
+  Controls.RfPower.EventHandler = function(c) touch("rf") ; transmit.rfpower = tostring(round(c.Value)) ; queueCmd("rfpower", "transmit set rfpower=" .. round(c.Value)) end
+  Controls.TunePower.EventHandler = function(c) touch("tp") ; transmit.tunepower = tostring(round(c.Value)) ; queueCmd("tunepower", "transmit set tunepower=" .. round(c.Value)) end
+
+  -- setup
+  Controls.Connect.EventHandler = function() setError("") ; connect() end
+  Controls.IPAddress.EventHandler = function() setError("") ; connect() end
+  Controls.CreateSlice.EventHandler = function()
+    send("slice create freq=14.200000 mode=usb", function(code, msg)
+      if code ~= 0 then setError("slice create: " .. msg) else sel = n(msg:match("^(%d+)")) or sel end
+    end)
+  end
+  Controls.RemoveSlice.EventHandler = function()
+    if GUI_MODE and sel then send("slice r " .. sel, function(code, msg) if code ~= 0 then setError("slice remove: " .. msg) end end) end
+  end
+
+  -- startup ----------------------------------------------------------
+  Controls.TuneStep.Choices = STEPS
+  if Controls.TuneStep.String == "" then Controls.TuneStep.String = "100 Hz" end
+  Controls.FollowActive.Boolean = true
+  setBool(Controls.Mox, false) ; setBool(Controls.Tune, false) ; setBool(Controls.TxArm, false)
+  guard(TX_ENABLED and "" or "Transmit is disabled in Properties")
+  setText(Controls.UdpText, "")
+  setText(Controls.LastMessage, "")
+  setError("")
+  closeLink(nil)
+  link.lastTry = -100
+  mainTimer:Start(TICK)
+  connect()
+end
