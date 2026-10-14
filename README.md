@@ -9,6 +9,7 @@ Each plugin lives in its own folder with the `.qplug` file, a README covering se
 |---|---|---|---|---|
 | [Nanoleaf Open API](nanoleaf/) | 1.0 | Nanoleaf Light Panels, Canvas, Shapes, Elements and Lines: power, brightness, color, white, effects, per-panel color | Local Nanoleaf Open API, HTTP port 16021 | [Nanoleaf.qplug](nanoleaf/Nanoleaf.qplug?raw=1) |
 | [Philips Hue Bridge](philips-hue/) | 1.0 | Hue lights, rooms, zones and scenes: power, brightness, color, color temperature, scenes, effects | Local Hue API v2 (CLIP), HTTPS port 443 | [Hue.qplug](philips-hue/Hue.qplug?raw=1) |
+| [FlexRadio FLEX-6600](flexradio/) | 1.0 | FLEX-6600 / FLEX-6000 transceivers: slices, frequency, band, mode, filter, AF gain, AGC, noise reduction, squelch, RIT, line out, guarded transmit (MOX, tune, ATU, power, TX audio source), meters | SmartSDR TCP/IP API, TCP port 4992, VITA-49 meters over UDP | [FlexRadio.qplug](flexradio/FlexRadio.qplug?raw=1) |
 
 ## Install a plugin
 
@@ -25,4 +26,4 @@ These plugins were tested in a Lua 5.3 harness against simulated devices, not ye
 
 ## Disclaimer
 
-Not affiliated with or endorsed by QSC, Nanoleaf or Signify (Philips Hue). Product names are trademarks of their owners.
+Not affiliated with or endorsed by QSC, Nanoleaf, Signify (Philips Hue) or FlexRadio Systems. Product names are trademarks of their owners.
