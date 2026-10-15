@@ -25,15 +25,15 @@
 
 PluginInfo = {
   Name = "Radio~FlexRadio FLEX-6600 (SmartSDR)",
-  Version = "1.0",
-  BuildVersion = "1.0.0.0",
+  Version = "1.1",
+  BuildVersion = "1.1.0.0",
   Id = "c4f1a2e8-6600-4b7d-9e3a-5f2d8a1c0b66",
   Author = "AV Programming",
   Description = "Control a FlexRadio FLEX-6600 (FLEX-6000 series) over the SmartSDR TCP/IP API: slices, band, mode, filter, AF gain, AGC, noise reduction, squelch, RIT, antennas, line out, guarded transmit with ATU, power, SWR and status meters.",
   ShowDebug = true,
 }
 
-local ACCENT = { 31, 190, 219 }  -- FlexRadio cyan (from the logo on FlexRadio's API wiki). Red is kept for transmit.
+local ACCENT = { 31, 190, 219 }  -- FlexRadio cyan (from the logo on FlexRadio's API wiki). Red is kept for transmit. (schematic block color only; pages use the shared theme)
 
 local MAX_SLICES = 4             -- FLEX-6600 / 6600M: 4 slice receivers
 local BANDS = { "160", "80", "60", "40", "30", "20", "17", "15", "12", "10", "6", "WWV" }
@@ -140,33 +140,60 @@ function GetControls(props)
   }
 end
 
---[[ Console theme for Q-SYS plugins, v1.0 (2026-10-14): copied unchanged from the project style guide (qsys-plugin-style-guide/theme.lua). ]]
+--[[ Deep Ocean theme for Q-SYS plugins, v2.0 (2026-10-15)
+     The home-dash design system (thomas-nelson23/home-dashboard, web/src/styles.css + theme.css)
+     translated into what GetControlLayout can draw. Paste this block into a .qplug above
+     GetControlLayout, then:
+
+       function GetControlLayout(props)
+         local layout, graphics = {}, {}
+         local ui = Theme.kit(layout, graphics)
+         ui.page(600)
+         ui.header("PHILIPS|HUE", "Control", "BridgeName", "Status", "Online", 1)
+         ui.section("Power", 8, 64, 200, 160)
+         ui.button("Power", "POWER", 24, 96, 168, 48, "power")
+         ...
+         ui.hint("Pick a room, then use the pads.", 568)
+         return layout, graphics
+       end
+
+     Every property used here is a documented GetControlLayout property:
+     https://help.qsys.com/DeveloperHelp/Content/Standards_Definitions/Reserved_Functions.htm
+     Guide: design/README.md in thomas-nelson23/qsys-plugins.
+]]
 local Theme = {}
 
 Theme.W = 640   -- page width; every page is 640 wide
 Theme.GRID = 8  -- positions and sizes snap to 8 (4 for fine alignment inside a row)
 
--- Neutrals: shared by every plugin. Never brand-tint these.
+-- home-dash tokens. Glass and hairline colors are pre-blended over the panel or the
+-- field, because Q-SYS draws solid fills (comments give the CSS each one comes from).
 Theme.N = {
-  bg      = { 22, 24, 29 },    -- chassis: page background
-  panel   = { 34, 37, 44 },    -- rack panel: sections
-  strip   = { 27, 30, 36 },    -- channel strip / tile inside a section
-  rowAlt  = { 31, 34, 41 },    -- alternate list row
-  well    = { 12, 13, 16 },    -- recessed display: readouts, fields, meters, hint bar
-  stroke  = { 58, 63, 74 },    -- 1 px outlines
-  btn     = { 52, 56, 66 },    -- button off state
-  btnOn   = { 78, 84, 98 },    -- utility button on state
-  ledOff  = { 46, 49, 56 },
-  text    = { 232, 234, 238 },
-  sub     = { 150, 157, 170 }, -- labels, section titles
-  dim     = { 104, 110, 122 }, -- units, captions
+  bg      = { 2, 29, 46 },     -- --field #021d2e: the one flat deep-blue field
+  panel   = { 6, 18, 27 },     -- .panel/.tile: rgba(--ink 4,12,18, .62-.93) glass over the field
+  strip   = { 8, 27, 37 },     -- --surface-hi rgba(cyan, .045): a tile or row inside a panel
+  rowAlt  = { 12, 24, 33 },    -- rgba(255,255,255,.025): alternate list row
+  well    = { 4, 13, 19 },     -- .field input rgba(0,0,0,.3): readouts, fields, meters, hint bar
+  stroke  = { 25, 41, 50 },    -- --glass-edge rgba(200,245,255,.1): panel and input edges
+  hair    = { 20, 31, 40 },    -- --hair rgba(255,255,255,.055): dividers
+  line    = { 10, 37, 50 },    -- --line rgba(cyan,.1)
+  lineStrong = { 16, 72, 91 }, -- --line-strong rgba(cyan,.28): button and field outlines
+  btn     = { 12, 24, 33 },    -- .btn background rgba(255,255,255,.025)
+  btnOn   = { 25, 41, 50 },    -- .btn:hover, lifted
+  ledOff  = { 0, 0, 0, 0 },    -- .led-off: hollow, only the ring shows
+  white   = { 255, 255, 255 }, -- headings and big values (#fff)
+  text    = { 217, 238, 242 }, -- --text #d9eef2
+  sub     = { 156, 199, 207 }, -- --text-soft #9cc7cf: labels, secondary values
+  dim     = { 95, 114, 122 },  -- --text-dim #5f727a: section titles, notes, units
+  off     = { 58, 70, 80 },    -- --off #3a4650
+  ink     = { 11, 15, 28 },    -- #0b0f1c: text on a solid cyan or white fill
 }
 
--- Semantic colors: same meaning in every plugin, never used as a brand accent.
+-- Semantic colors: same meaning in every plugin. Cyan is also the only accent.
 Theme.S = {
-  ok    = { 62, 181, 74 },   -- online, connected, healthy
-  warn  = { 240, 165, 40 },  -- attention, identify, solo-style latches
-  fault = { 214, 69, 65 },   -- offline, error, destructive actions
+  ok    = { 42, 212, 255 },  -- --cyan #2ad4ff (Deep Ocean): good, online, on, the accent
+  warn  = { 255, 176, 32 },  -- --warn #ffb020: attention only, always with a label
+  fault = { 255, 42, 79 },   -- --red #ff2a4f: bad/offline, destructive actions, small signals
 }
 
 function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
@@ -175,118 +202,188 @@ function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
            math.floor(a[3] + (b[3] - a[3]) * t + 0.5) }
 end
 
--- Derives the brand set from one accent RGB.
-function Theme.brand(accent)
+-- home-dash has one accent, cyan. Theme.brand keeps the v1 field names so plugin code that
+-- reads ui.B still works; the accent argument is accepted and ignored.
+function Theme.brand()
+  local cyan, panel = Theme.S.ok, Theme.N.panel
   return {
-    accent = accent,                              -- active state, fader fill, header outline, section tab
-    dim    = Theme.mix(accent, Theme.N.bg, 0.55),  -- secondary action off state
-    pad    = Theme.mix(accent, Theme.N.panel, 0.78), -- pad off state (lit-but-idle step button)
-    ink    = Theme.mix(accent, { 255, 255, 255 }, 0.35), -- accent-colored text on dark (page tab)
+    accent = cyan,                        -- fader/knob/meter fill, on state of solid controls
+    on     = Theme.mix(panel, cyan, 0.45), -- lit button fill (cyan at 45% over the panel)
+    soft   = Theme.mix(panel, cyan, 0.08), -- --cyan-soft: .btn-accent and pad off state
+    edge   = Theme.mix(panel, cyan, 0.45), -- rgba(cyan,.45): .btn-accent border
+    dim    = Theme.mix(panel, cyan, 0.08), -- v1 name for soft
+    pad    = Theme.mix(panel, cyan, 0.08), -- v1 name for soft
+    ink    = cyan,                        -- cyan text (.lcd-inline, .bar-rest)
   }
 end
 
-local FONT, MONO, DISPLAY = "Roboto", "Roboto Mono", "Montserrat"
+-- Fonts. Q-SYS ships a fixed font list; these are the closest stand-ins for home-dash's
+-- Sora (text), JetBrains Mono (numbers, ids) and Michroma (wordmark, display).
+local FONT, MONO, DISPLAY = "Poppins", "Roboto Mono", "Montserrat"
+
+local CUBE_SVG = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0xMDAgLTEwMCAyMDAgMjAwIj48ZyBm"
+  .. "aWxsPSJub25lIiBzdHJva2U9IiMyYWQ0ZmYiIHN0cm9rZS13aWR0aD0iNy4wIiBzdHJva2UtbGluZWNhcD0icm91bmQiPjxw"
+  .. "YXRoIHN0cm9rZS1vcGFjaXR5PSIwLjE3NiIgZD0iTS0wLjAsODAuM0wtNzAuNyw0Mi4xTS0wLjAsODAuM0w3MC43LDQyLjFN"
+  .. "MjMuNiw2Ny41TC00Ny4xLDI5LjNNLTIzLjYsNjcuNUw0Ny4xLDI5LjNNNDcuMSw1NC44TC0yMy42LDE2LjZNLTQ3LjEsNTQu"
+  .. "OEwyMy42LDE2LjZNNzAuNyw0Mi4xTDAuMCwzLjlNLTcwLjcsNDIuMUwwLjAsMy45TTcwLjcsNDIuMUw3MC43LC00Mi4xTTcw"
+  .. "LjcsNDIuMUwwLjAsMy45TTQ3LjEsMjkuM0w0Ny4xLC01NC44TTcwLjcsMTQuMEwwLjAsLTI0LjJNMjMuNiwxNi42TDIzLjYs"
+  .. "LTY3LjVNNzAuNywtMTQuMEwwLjAsLTUyLjJNMC4wLDMuOUwwLjAsLTgwLjNNNzAuNywtNDIuMUwwLjAsLTgwLjNNLTcwLjcs"
+  .. "NDIuMUwtNzAuNywtNDIuMU0tNzAuNyw0Mi4xTDAuMCwzLjlNLTQ3LjEsMjkuM0wtNDcuMSwtNTQuOE0tNzAuNywxNC4wTDAu"
+  .. "MCwtMjQuMk0tMjMuNiwxNi42TC0yMy42LC02Ny41TS03MC43LC0xNC4wTDAuMCwtNTIuMk0wLjAsMy45TDAuMCwtODAuM00t"
+  .. "NzAuNywtNDIuMUwwLjAsLTgwLjMiLz48cGF0aCBzdHJva2Utb3BhY2l0eT0iMC44IiBkPSJNLTAuMCwtMy45TC03MC43LC00"
+  .. "Mi4xTS0wLjAsLTMuOUw3MC43LC00Mi4xTTIzLjYsLTE2LjZMLTQ3LjEsLTU0LjhNLTIzLjYsLTE2LjZMNDcuMSwtNTQuOE00"
+  .. "Ny4xLC0yOS4zTC0yMy42LC02Ny41TS00Ny4xLC0yOS4zTDIzLjYsLTY3LjVNNzAuNywtNDIuMUwwLjAsLTgwLjNNLTcwLjcs"
+  .. "LTQyLjFMMC4wLC04MC4zTS0wLjAsODAuM0wtMC4wLC0zLjlNLTAuMCw4MC4zTC03MC43LDQyLjFNLTIzLjYsNjcuNUwtMjMu"
+  .. "NiwtMTYuNk0tMC4wLDUyLjJMLTcwLjcsMTQuME0tNDcuMSw1NC44TC00Ny4xLC0yOS4zTS0wLjAsMjQuMkwtNzAuNywtMTQu"
+  .. "ME0tNzAuNyw0Mi4xTC03MC43LC00Mi4xTS0wLjAsLTMuOUwtNzAuNywtNDIuMU0tMC4wLDgwLjNMLTAuMCwtMy45TS0wLjAs"
+  .. "ODAuM0w3MC43LDQyLjFNMjMuNiw2Ny41TDIzLjYsLTE2LjZNLTAuMCw1Mi4yTDcwLjcsMTQuME00Ny4xLDU0LjhMNDcuMSwt"
+  .. "MjkuM00tMC4wLDI0LjJMNzAuNywtMTQuME03MC43LDQyLjFMNzAuNywtNDIuMU0tMC4wLC0zLjlMNzAuNywtNDIuMSIvPjwv"
+  .. "Zz48L3N2Zz4="
 
 local function merge(t, extra)
   for k, v in pairs(extra or {}) do t[k] = v end
   return t
 end
 
-function Theme.kit(layout, graphics, accent)
-  local N, S, B = Theme.N, Theme.S, Theme.brand(accent)
+function Theme.kit(layout, graphics)
+  local N, S, B = Theme.N, Theme.S, Theme.brand()
   local ui = { N = N, S = S, B = B }
 
   local function g(t) table.insert(graphics, t) end
+  local function box(x, y, w, h, fill, stroke, radius)
+    g({ Type = "GroupBox", Fill = fill, StrokeColor = stroke or fill, StrokeWidth = stroke and 1 or 0,
+        CornerRadius = radius or 0, Position = { x, y }, Size = { w, h } })
+  end
 
-  -- Static text. size: 10 hint, 11 label, 12 body, 13 emphasis
+  -- Static text. size: 10 hint/title, 11 label, 12 body, 13 emphasis
   function ui.label(text, x, y, w, h, align, size, color, style)
     g({ Type = "Label", Text = text, Font = FONT, FontStyle = style or "Regular", FontSize = size or 11,
         HTextAlign = align or "Right", Color = color or N.sub, Position = { x, y }, Size = { w, h or 20 } })
   end
 
-  -- Page background. Call first so it sits behind everything.
+  -- Page background: one flat field, no glows. Call first so it sits behind everything.
   function ui.page(h)
-    g({ Type = "GroupBox", Fill = N.bg, StrokeWidth = 0, CornerRadius = 0, Position = { 0, 0 }, Size = { Theme.W, h } })
+    box(0, 0, Theme.W, h, N.bg)
   end
 
-  -- Transport-bar header: wordmark, page tab, device name readout, Status, Online LED.
-  function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl)
-    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = B.accent, StrokeWidth = 1, CornerRadius = 6,
-        Position = { 8, 8 }, Size = { 624, 48 } })
-    g({ Type = "Label", Text = wordmark, Font = DISPLAY, FontStyle = "Bold", FontSize = 20, HTextAlign = "Left",
-        Color = N.text, Position = { 20, 16 }, Size = { 116, 32 } })
-    g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Bold", FontSize = 10,
-        HTextAlign = "Center", Color = B.ink, Fill = B.pad, CornerRadius = 10, StrokeWidth = 0,
-        Position = { 140, 22 }, Size = { 96, 20 } })
-    if nameCtl then ui.readout(nameCtl, nil, 248, 20, 196, 24) end
+  -- The wireframe cube from home-dash's backdrop, frozen at its starting pose
+  -- (the frame home-dash shows when motion is reduced). s = size in px.
+  function ui.cube(x, y, s)
+    g({ Type = "Svg", Image = CUBE_SVG, Position = { x, y }, Size = { s, s } })
+  end
+  ui.sun = ui.cube  -- v1 name
+
+  -- The front window's top edge: transparent > cyan > red > transparent, in 24 px steps.
+  function ui.edge(x, y, w, base)
+    local n = math.floor(w / 24)
+    for i = 0, n - 1 do
+      local t = (i + 0.5) / n
+      local c
+      if t < 0.25 then c = Theme.mix(base, S.ok, t / 0.25)
+      elseif t < 0.75 then c = Theme.mix(S.ok, S.fault, (t - 0.25) / 0.5)
+      else c = Theme.mix(S.fault, base, (t - 0.75) / 0.25) end
+      box(x + i * 24, y, (i == n - 1) and (w - i * 24) or 24, 1, c)
+    end
+  end
+
+  -- Top bar: cube, wordmark (Michroma stand-in; text after "|" is red, like "home|dash"),
+  -- page number (red, mono) and page name like the numbered menu, device name, Status, Online LED.
+  function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl, pageNo)
+    box(8, 8, 624, 48, N.panel, N.stroke, 8)
+    ui.edge(16, 8, 608, N.stroke)
+    ui.cube(18, 16, 32)
+    local a, b = wordmark:match("^(.-)|(.*)$")
+    a, b = string.upper(a or wordmark), string.upper(b or "")
+    -- Q-SYS can't measure text, so the white part is right-aligned and the red part
+    -- left-aligned on one seam; only the seam position is estimated (caps ~8.5 px at 13 px).
+    local seam = 58 + math.floor(#a * 8.5 + 0.5)
+    g({ Type = "Label", Text = a, Font = DISPLAY, FontStyle = "Medium", FontSize = 13, HTextAlign = "Right",
+        Color = N.white, Position = { seam - 104, 20 }, Size = { 104, 24 }, Padding = 0 })
+    if b ~= "" then
+      g({ Type = "Label", Text = b, Font = DISPLAY, FontStyle = "Medium", FontSize = 13, HTextAlign = "Left",
+          Color = S.fault, Position = { seam, 20 }, Size = { 104, 24 }, Padding = 0 })
+    end
+    if pageNo then
+      g({ Type = "Label", Text = string.format("%02d", pageNo), Font = MONO, FontSize = 10, HTextAlign = "Left",
+          Color = S.fault, Position = { 160, 22 }, Size = { 20, 20 } })
+    end
+    g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Medium", FontSize = 10,
+        HTextAlign = "Left", Color = N.white, Position = { 180, 22 }, Size = { 96, 20 } })
+    if nameCtl then ui.value(nameCtl, nil, 280, 20, 164, 24, { Color = N.panel, TextColor = N.sub, FontSize = 12 }) end
     if statusCtl then
       layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 452, 20 }, Size = { 140, 24 },
-        Font = FONT, FontSize = 11, CornerRadius = 3 }
+        Font = FONT, FontSize = 11, CornerRadius = 12 }
     end
-    if ledCtl then ui.led(ledCtl, "Online", 602, 22, 20, "ok") end
+    if ledCtl then ui.led(ledCtl, "Online", 602, 24, 16, "ok") end
   end
 
-  -- Rack panel with a color-tab title (uppercase, like a console channel label).
-  -- Content starts 32 px below y.
+  -- Panel: glass card with a hairline edge, a small red signal, an uppercase dim title
+  -- and a hairline under the title. Content starts 32 px below y.
   function ui.section(title, x, y, w, h)
-    g({ Type = "GroupBox", Fill = N.panel, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 6,
-        Position = { x, y }, Size = { w, h } })
+    box(x, y, w, h, N.panel, N.stroke, 8)
     if title and title ~= "" then
-      g({ Type = "GroupBox", Fill = B.accent, StrokeWidth = 0, CornerRadius = 1, Position = { x + 12, y + 10 }, Size = { 4, 12 } })
-      ui.label(string.upper(title), x + 22, y + 6, w - 34, 20, "Left", 11, N.sub, "Medium")
+      g({ Type = "GroupBox", StrokeColor = S.fault, StrokeWidth = 1, CornerRadius = 4,
+          Position = { x + 12, y + 10 }, Size = { 8, 8 } })
+      ui.label(string.upper(title), x + 26, y + 4, w - 38, 20, "Left", 10, N.dim, "SemiBold")
+      box(x + 1, y + 27, w - 2, 1, N.hair)
     end
   end
 
-  -- Channel strip / tile inside a section.
+  -- Tile inside a panel.
   function ui.strip(x, y, w, h)
-    g({ Type = "GroupBox", Fill = N.strip, StrokeColor = N.stroke, StrokeWidth = 1, CornerRadius = 4,
-        Position = { x, y }, Size = { w, h } })
+    box(x, y, w, h, N.strip, N.hair, 8)
   end
 
-  -- Alternating list row background (i = row number).
+  -- List row: every other row gets the faint lift.
   function ui.row(x, y, w, h, i)
-    g({ Type = "GroupBox", Fill = (i % 2 == 0) and N.rowAlt or N.strip, StrokeWidth = 0, CornerRadius = 2,
-        Position = { x, y }, Size = { w, h } })
+    box(x, y, w, h, (i % 2 == 0) and N.rowAlt or N.strip, nil, 4)
   end
 
-  -- Hint bar: one recessed line of help per page, bottom of the page.
+  -- Hint bar: one line of help per page, at the bottom.
   function ui.hint(text, y)
-    g({ Type = "Label", Text = text, Font = FONT, FontSize = 10, HTextAlign = "Left", Color = N.sub, Fill = N.well,
-        CornerRadius = 4, StrokeWidth = 0, Margin = 0, Padding = 8, Position = { 8, y }, Size = { 624, 24 } })
+    g({ Type = "Label", Text = text, Font = FONT, FontSize = 10, HTextAlign = "Left", Color = N.dim, Fill = N.well,
+        StrokeColor = N.hair, StrokeWidth = 1, CornerRadius = 8, Margin = 0, Padding = 8,
+        Position = { 8, y }, Size = { 624, 24 } })
   end
 
-  -- Buttons. kind:
-  --   "primary" accent when on       "utility" neutral, lighter when on
-  --   "secondary" accent, dim off     "pad"     step-pad: tinted off, full accent on
-  --   "power" big primary, 16 bold   "warn" / "danger" / "ok" semantic
+  -- Buttons. kind (home-dash class in brackets):
+  --   "primary"   toggle; dark pill, cyan when on            (.btn / .seg-btn.on)
+  --   "secondary" cyan-tinted pill, cyan legend              (.btn-accent)
+  --   "utility"   plain pill, soft legend                    (.btn)
+  --   "pad"       preset tile, 8 px corners, cyan when on    (.tile-layouts button)
+  --   "power"     the page's main action, bold               (.btn-accent, larger)
+  --   "warn" / "danger" / "ok"  semantic tint and legend     (.banner-warn / .btn-danger)
   -- Pass ButtonStyle ("Toggle", "Momentary", "Trigger"...) in extra to match the control's ButtonType.
+  local function tint(c, a) return Theme.mix(N.panel, c, a) end
   local KINDS = {
-    primary   = function() return B.accent, N.btn, 12, "Medium" end,
-    secondary = function() return B.accent, B.dim, 12, "Regular" end,
-    utility   = function() return N.btnOn, N.btn, 12, "Regular" end,
-    pad       = function() return B.accent, B.pad, 12, "Medium" end,
-    power     = function() return B.accent, N.btn, 16, "Bold" end,
-    warn      = function() return S.warn, Theme.mix(S.warn, N.panel, 0.7), 12, "Medium" end,
-    danger    = function() return S.fault, Theme.mix(S.fault, N.panel, 0.7), 12, "Medium" end,
-    ok        = function() return S.ok, Theme.mix(S.ok, N.panel, 0.7), 12, "Medium" end,
+    primary   = { on = B.on, off = N.btn, text = N.text, stroke = N.lineStrong, pill = true, style = "SemiBold" },
+    secondary = { on = B.on, off = B.soft, text = S.ok, stroke = B.edge, pill = true, style = "SemiBold" },
+    utility   = { on = N.btnOn, off = N.btn, text = N.sub, stroke = N.lineStrong, pill = true, style = "SemiBold" },
+    pad       = { on = B.on, off = N.strip, text = N.text, stroke = N.line, pill = false, style = "Medium" },
+    power     = { on = B.on, off = N.btn, text = N.white, stroke = B.edge, pill = true, style = "Bold", size = 16 },
+    warn      = { on = tint(S.warn, 0.25), off = tint(S.warn, 0.06), text = S.warn, stroke = tint(S.warn, 0.3), pill = true, style = "SemiBold" },
+    danger    = { on = tint(S.fault, 0.25), off = tint(S.fault, 0.1), text = S.fault, stroke = tint(S.fault, 0.45), pill = true, style = "SemiBold" },
+    ok        = { on = tint(S.ok, 0.25), off = B.soft, text = S.ok, stroke = B.edge, pill = true, style = "SemiBold" },
   }
   function ui.button(name, legend, x, y, w, h, kind, extra)
-    local on, off, size, style = (KINDS[kind or "primary"] or KINDS.primary)()
-    layout[name] = merge({ PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 28 },
-      Color = on, OffColor = off, UnlinkOffColor = true, TextColor = N.text, Font = FONT, FontStyle = style,
-      FontSize = size, CornerRadius = 4, StrokeWidth = 0, ButtonVisualStyle = "Flat", Margin = 0, WordWrap = true }, extra)
+    local k = KINDS[kind or "primary"] or KINDS.primary
+    h = h or 28
+    layout[name] = merge({ PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h },
+      Color = k.on, OffColor = k.off, UnlinkOffColor = true, TextColor = k.text, StrokeColor = k.stroke, StrokeWidth = 1,
+      Font = FONT, FontStyle = k.style, FontSize = k.size or 12,
+      CornerRadius = k.pill and math.floor(math.min(w, h) / 2) or 8, ButtonVisualStyle = "Flat", Margin = 0, WordWrap = true }, extra)
   end
 
-  -- Read-only readout: recessed well, mono digits, no outline.
+  -- Read-only readout: dark well, mono digits, no outline.
   function ui.readout(name, pretty, x, y, w, h, extra)
     layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 24 },
-      Color = N.well, TextColor = N.text, Font = MONO, FontStyle = "Medium", FontSize = 12, HTextAlign = "Left",
-      CornerRadius = 3, StrokeWidth = 0, Padding = 4 }, extra)
+      Color = N.well, TextColor = N.text, Font = MONO, FontStyle = "Regular", FontSize = 12, HTextAlign = "Left",
+      CornerRadius = 8, StrokeColor = N.well, StrokeWidth = 0, Padding = 4 }, extra)
   end
 
-  -- Editable field: same well, plus a 1 px outline so it reads as typeable.
+  -- Editable field: same well, plus the cyan-tinted outline so it reads as typeable.
   function ui.field(name, pretty, x, y, w, h, extra)
-    ui.readout(name, pretty, x, y, w, h, merge({ StrokeColor = N.stroke, StrokeWidth = 1 }, extra))
+    ui.readout(name, pretty, x, y, w, h, merge({ StrokeColor = N.lineStrong, StrokeWidth = 1 }, extra))
   end
 
   -- Plain value text on the panel (names, secondary info). No well.
@@ -298,10 +395,11 @@ function Theme.kit(layout, graphics, accent)
 
   function ui.combo(name, pretty, x, y, w, h, extra)
     layout[name] = merge({ PrettyName = pretty or name, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 },
-      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 12, StrokeColor = N.stroke, StrokeWidth = 1 }, extra)
+      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 12, StrokeColor = N.stroke, StrokeWidth = 1,
+      CornerRadius = 8 }, extra)
   end
 
-  -- Fader: horizontal when w > h, vertical (channel strip) when h > w.
+  -- Fader: horizontal when w > h, vertical when h > w. Cyan unless the color is the content.
   function ui.fader(name, pretty, x, y, w, h, color, extra)
     layout[name] = merge({ PrettyName = pretty or name, Style = "Fader", Position = { x, y }, Size = { w, h },
       Color = color or B.accent }, extra)
@@ -313,18 +411,19 @@ function Theme.kit(layout, graphics, accent)
       Color = color or B.accent }, extra)
   end
 
-  -- LED. kind: "ok" | "warn" | "fault" | "accent" | an RGB table (e.g. a color swatch)
+  -- Status dot. kind: "ok" | "warn" | "fault" | "accent" | an RGB table (e.g. a color swatch).
+  -- Off is hollow: only the dim ring shows (.led-off).
   function ui.led(name, pretty, x, y, s, kind, extra)
     local c = type(kind) == "table" and kind or (kind == "accent" and B.accent) or S[kind or "ok"] or S.ok
     layout[name] = merge({ PrettyName = pretty or name, Style = "Led", Position = { x, y }, Size = { s or 16, s or 16 },
-      Color = c, OffColor = N.ledOff, UnlinkOffColor = true, StrokeColor = N.stroke, StrokeWidth = 1, Margin = 2 }, extra)
+      Color = c, OffColor = N.ledOff, UnlinkOffColor = true, StrokeColor = N.dim, StrokeWidth = 1, Margin = 3 }, extra)
   end
 
-  -- Meter: bar on a recessed well, no built-in text box (put a readout next to it).
+  -- Meter: thin cyan bar on a faint track, no built-in text box (put a readout next to it).
   function ui.meter(name, pretty, x, y, w, h, color, extra)
     layout[name] = merge({ PrettyName = pretty or name, Style = "Meter", MeterStyle = "Standard", Position = { x, y },
-      Size = { w, h }, Color = color or B.accent, BackgroundColor = N.well, CornerRadius = 2, ShowTextbox = false,
-      StrokeWidth = 0 }, extra)
+      Size = { w, h }, Color = color or B.accent, BackgroundColor = Theme.mix(N.panel, N.white, 0.06), CornerRadius = 2,
+      ShowTextbox = false, StrokeWidth = 0 }, extra)
   end
 
   -- Hide a control but keep its pins.
@@ -337,17 +436,17 @@ end
 
 function GetControlLayout(props)
   local layout, graphics = {}, {}
-  local ui = Theme.kit(layout, graphics, ACCENT)
+  local ui = Theme.kit(layout, graphics)
   local N, S, B = ui.N, ui.S, ui.B
   local page = PageNames[props["page_index"].Value]
   local txEnabled = props["Transmit"].Value == "Enabled"
-  local WORD = "Flex"
+  local WORD = "FLEX|RADIO"
 
   local function cap(text, x, y, w, align) ui.label(text, x, y, w, 20, align or "Left", 10, N.dim, "Medium") end
 
   if page == "Receive" then
     ui.page(652)
-    ui.header(WORD, "Receive", "RadioName", "Status", "Online")
+    ui.header(WORD, "Receive", "RadioName", "Status", "Online", props["page_index"].Value)
 
     -- slices
     ui.section("Slices", 8, 64, 624, 92)
@@ -401,7 +500,7 @@ function GetControlLayout(props)
       local r, c = math.floor((i - 1) / 5), (i - 1) % 5
       ui.button("Mode " .. i, m, 22 + c * 56, 432 + r * 34, 52, 28, "pad", { PrettyName = "Mode~" .. m, FontSize = 11 })
     end
-    cap("Modes the radio does not offer for this slice are dimmed.", 22, 500, 280)
+    cap("Modes this slice can't use are dimmed.", 22, 500, 280)
 
     ui.section("Filter", 320, 400, 312, 132)
     for i = 1, FILTERS do
@@ -423,7 +522,7 @@ function GetControlLayout(props)
 
   elseif page == "DSP" then
     ui.page(524)
-    ui.header(WORD, "DSP", "RadioName", "Status", "Online")
+    ui.header(WORD, "DSP", "RadioName", "Status", "Online", props["page_index"].Value)
 
     ui.section("AGC", 8, 64, 304, 120)
     for i, a in ipairs(AGC_MODES) do
@@ -467,16 +566,16 @@ function GetControlLayout(props)
 
   elseif page == "Transmit" then
     ui.page(604)
-    ui.header(WORD, "Transmit", "RadioName", "Status", "Online")
+    ui.header(WORD, "Transmit", "RadioName", "Status", "Online", props["page_index"].Value)
 
     ui.section("Safety", 8, 64, 624, 108)
     ui.button("TxArm", "ARM", 22, 96, 120, 56, "warn", { PrettyName = "Safety~Arm", FontSize = 16, FontStyle = "Bold" })
     ui.readout("ArmText", "Safety~Arm Text", 152, 96, 200, 24, { HTextAlign = "Center" })
     ui.led("TxEnabled", "Safety~Transmit Enabled", 364, 100, 16, "warn")
     ui.label("TRANSMIT ENABLED", 386, 98, 120, 20, "Left", 10, N.sub, "Medium")
-    ui.readout("TxGuard", "Safety~Message", 152, 128, 344, 24, { TextColor = S.warn, Font = "Roboto", FontSize = 11 })
+    ui.readout("TxGuard", "Safety~Message", 152, 128, 344, 24, { TextColor = S.warn, Font = "Poppins", FontSize = 11 })
     ui.button("TxStop", "STOP", 508, 96, 112, 56, "danger",
-      { PrettyName = "Safety~Stop (unkey)", FontSize = 18, FontStyle = "Bold", OffColor = S.fault })
+      { PrettyName = "Safety~Stop (unkey)", FontSize = 18, FontStyle = "Bold", OffColor = S.fault, TextColor = N.white })
 
     ui.section("Keying", 8, 180, 304, 196)
     ui.button("Mox", "MOX", 22, 212, 132, 48, "danger", { PrettyName = "Keying~MOX", FontSize = 16, FontStyle = "Bold" })
@@ -537,7 +636,7 @@ function GetControlLayout(props)
 
   else -- Setup
     ui.page(500)
-    ui.header(WORD, "Setup", "RadioName", "Status", "Online")
+    ui.header(WORD, "Setup", "RadioName", "Status", "Online", props["page_index"].Value)
 
     ui.section("Connection", 8, 64, 624, 136)
     cap("RADIO IP", 22, 98, 72)
