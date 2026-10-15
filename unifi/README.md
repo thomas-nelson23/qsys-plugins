@@ -35,6 +35,8 @@ It can also restart a device, power cycle a PoE port, authorize a guest and star
 | **Setup** | Console IP, API key, site, optional local user, Last Error, Network application version, site ID, which APIs are in use, counts and last update time. |
 
 The header on every page shows the site name, the Q-SYS status (OK / Fault / Not Present / Initializing) and an Online LED.
+The pages use the shared Deep Ocean theme ([design/README.md](../design/README.md)). State LEDs are cyan for online / up / ok,
+amber for a warning or transitional state, red for offline / down / error, and grey for unknown.
 **Restart** and **PoE Power Cycle** need a second press within 5 s.
 
 **Properties:** Poll Interval (default 5 s), Extended Stats (On / Off, default On), WAN Meter Scale (default 1000 Mbps),
@@ -135,3 +137,7 @@ details were taken from the console's own OpenAPI spec (via go-unifi) rather tha
 documented by Ubiquiti. Its field names come from `unpoller` and may change between Network versions. The Q-SYS layout
 properties (`GroupBox`/`Label` graphics, `Style`, `Meter`, `OffColor`, `CornerRadius`) follow the conventions of this
 project's Hue and Nanoleaf plugins, so check them in Designer.
+
+## Changelog
+- 1.1: restyled to the home-dash Deep Ocean design ([design/README.md](../design/README.md)); no control or pin changes.
+- 1.0: first release.

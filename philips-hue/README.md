@@ -27,7 +27,7 @@ color temperature and the built-in light effects, which is most of what the Hue 
 | **Scenes** | Pick a room or zone, then a 12-button scene grid with paging that lights the active scene. It has a transition time, a **Dynamic** toggle (plays the scene's palette) and Room Off. **Light Effects** sends candle, fire, sparkle, prism and the rest to the Control target. |
 | **Setup** | Bridge IP, app key, Pair / Forget Key, last error, and the bridge ID, model, software version and counts. |
 
-The header on every page shows the bridge name, the Q-SYS status (OK / Fault / Not Present / Initializing) and an Online LED.
+The header on every page shows the bridge name, the Q-SYS status (OK / Fault / Not Present / Initializing) and a cyan Online LED. Each page ends with a one-line hint bar.
 
 **Properties:** Poll Interval (default 2 s), Group Command Interval (default 1000 ms) and Debug Print (None / Errors / All).
 
@@ -60,7 +60,7 @@ The layout previews (`preview_*.png`) are a close rendering, not a Designer scre
 
 Check these on site:
 - **HTTPS certificate:** API v2 is HTTPS only. The Hue Bridge uses a certificate signed by Signify's own root CA, not a public CA. Q-SYS's HttpClient documentation covers `https://` URLs and TLS 1.0-1.3 but says nothing about certificate checks. If the Core rejects the bridge certificate, Last Error shows the HttpClient error on every poll. This is the first thing to confirm.
-- **Layout styling:** check that Designer renders the layout the same way. The plugin uses flat buttons, rounded corners, and runtime `.Color` on the swatch LEDs.
+- **Layout styling:** check that Designer renders the layout the same way. The layout uses the shared Deep Ocean theme (deep-blue field, dark glass panels, cyan accent, Poppins and Roboto Mono, an SVG cube mark), flat pill buttons, rounded corners, `TextColor`, transparent LED off colors, and runtime `.Color` on the swatch LEDs.
 - **Group speed:** a room fader updates at most once per Group Command Interval. Lowering it below 1000 ms is faster but goes past Hue's guidance.
 - **Effects:** only lamps that list the effect in `effects.status_values` get it. Older bulbs have no effects.
 
@@ -69,6 +69,10 @@ Not included:
 - The event stream (`/eventstream/clip/v2`, server-sent events), because HttpClient can't hold a streaming connection. Polling is used instead.
 - Entertainment areas and sync, gradient per-segment color, timed effects (sunrise), smart scenes, sensors, switches and automations.
 - Creating or editing rooms, zones and scenes. Do that in the Hue app; the plugin picks them up on the next full read or Refresh.
+
+## Changelog
+- 1.1: restyled to the home-dash Deep Ocean design ([design/README.md](../design/README.md)); no control or pin changes.
+- 1.0: first release.
 
 ## Sources
 - Philips Hue developer portal: Hue API v2 announcement. It confirms that v2 is HTTPS only, explains how v2 relates to v1, and recommends not using REST for fast continuous updates. https://developers.meethue.com/?p=3403
