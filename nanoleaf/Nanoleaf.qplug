@@ -9,8 +9,8 @@
 
 PluginInfo = {
   Name = "Lighting~Nanoleaf Open API",
-  Version = "1.1",
-  BuildVersion = "1.1.0.0",
+  Version = "1.2",
+  BuildVersion = "1.2.0.0",
   Id = "8ad083e0-b14d-4387-8671-9b4053ac46a4",
   Author = "AV Programming",
   Description = "Control Nanoleaf lights (power, brightness, color, color temperature, effects, rhythm, per-panel color) over the local Nanoleaf Open API.",
@@ -323,6 +323,425 @@ local QuickColors = {
 local WhitePresets = { {"Candle", 1900}, {"Warm", 2700}, {"Neutral", 4000}, {"Daylight", 5000}, {"Cool", 6500} }
 local EFFECT_BUTTONS = 12
 
+--[[ "Rad" theme for TSC-101-G3 UCI pages, v1.0 (2026-10-19)
+     A loud 80s/90s look styled after the Pit Viper website (pitviper.com): neon hot pink,
+     electric yellow, cyan and orange on a purple-black field, heavy italic type, hard offset
+     shadows, sunset stripes, a sliced retro sun, a grid and a checkerboard.
+     Pages are 1280 x 800, the 16:10 shape of the Q-SYS TSC-101-G3 (1920 x 1200 native).
+     The static artwork is one SVG per page (documented "Svg" graphic, Base-64 Image),
+     built here so the active nav tab and the cards line up with the controls.
+     Q-SYS layouts have no gradients, glows or blur, so: sunset gradient = flat bands,
+     neon glow = a hard offset shadow, chrome = flat light grey.
+     Properties used are the documented GetControlLayout ones:
+     https://help.qsys.com/DeveloperHelp/Content/Standards_Definitions/Reserved_Functions.htm
+]]
+local Rad = {}
+
+Rad.W, Rad.H = 1280, 800
+
+Rad.C = {
+  night  = { 20, 10, 40 },    -- page field, purple-black
+  ink    = { 10, 5, 20 },     -- cards, wells, and text on a neon fill
+  grid   = { 40, 24, 78 },    -- background grid lines
+  pink   = { 255, 46, 147 },  -- hot pink
+  yellow = { 255, 230, 0 },   -- electric yellow
+  cyan   = { 0, 229, 255 },   -- cyan
+  orange = { 255, 122, 0 },   -- orange
+  purple = { 150, 70, 255 },  -- violet
+  lime   = { 170, 255, 0 },   -- LED "on"
+  white  = { 255, 255, 255 },
+  chrome = { 214, 220, 235 }, -- flat stand-in for chrome lettering
+  off    = { 64, 48, 100 },   -- unlit LED, disabled
+}
+
+Rad.TABS = { "HOME", "COLOR", "FX", "PANELS" }
+
+local function hexc(c) return string.format("#%02x%02x%02x", c[1], c[2], c[3]) end
+
+local B64C = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function b64(s)
+  local out, n = {}, #s
+  for i = 1, n, 3 do
+    local a, b, c = s:byte(i, i + 2)
+    local v = a * 65536 + (b or 0) * 256 + (c or 0)
+    local c1, c2 = v // 262144 % 64, v // 4096 % 64
+    local c3, c4 = v // 64 % 64, v % 64
+    out[#out + 1] = B64C:sub(c1 + 1, c1 + 1) .. B64C:sub(c2 + 1, c2 + 1)
+      .. (b and B64C:sub(c3 + 1, c3 + 1) or "=") .. (c and B64C:sub(c4 + 1, c4 + 1) or "=")
+  end
+  return table.concat(out)
+end
+
+local function merge2(t, extra)
+  for k, v in pairs(extra or {}) do t[k] = v end
+  return t
+end
+
+-- tab = 1..4: which nav tab is lit on this page
+function Rad.kit(layout, graphics, tab)
+  local C = Rad.C
+  local r = { C = C }
+  local svg = {}
+  local labels = {}
+
+  local function s(fmt, ...) svg[#svg + 1] = string.format(fmt, ...) end
+  local function rect(x, y, w, h, fill, stroke, sw)
+    if stroke then
+      s('<rect x="%g" y="%g" width="%g" height="%g" fill="%s" stroke="%s" stroke-width="%g"/>',
+        x, y, w, h, fill and hexc(fill) or "none", hexc(stroke), sw or 4)
+    else
+      s('<rect x="%g" y="%g" width="%g" height="%g" fill="%s"/>', x, y, w, h, hexc(fill))
+    end
+  end
+  local function poly(pts, fill, stroke, sw)
+    local p = {}
+    for i = 1, #pts, 2 do p[#p + 1] = string.format("%g,%g", pts[i], pts[i + 1]) end
+    s('<polygon points="%s" fill="%s"%s/>', table.concat(p, " "), fill and hexc(fill) or "none",
+      stroke and string.format(' stroke="%s" stroke-width="%g" stroke-linejoin="round"', hexc(stroke), sw or 3) or "")
+  end
+  r.rect, r.poly = rect, poly
+
+  -- Static text. Montserrat is the heaviest face on the Q-SYS font list; Black Italic is the
+  -- stand-in for the site's chunky slanted display type.
+  function r.text(text, x, y, w, h, size, color, align, style, font)
+    labels[#labels + 1] = { Type = "Label", Text = text, Font = font or "Montserrat",
+      FontStyle = style or "Black Italic", FontSize = size or 16, HTextAlign = align or "Left",
+      Color = color or C.white, Position = { x, y }, Size = { w, h }, Padding = 0, Margin = 0 }
+  end
+  -- Shouty text with a hard offset shadow (stand-in for a neon glow).
+  function r.shout(text, x, y, w, h, size, color, shadow, dx)
+    r.text(text, x + (dx or 4), y + (dx or 4), w, h, size, shadow or C.pink)
+    r.text(text, x, y, w, h, size, color or C.yellow)
+  end
+
+  -- Approximate text width for Montserrat Black Italic caps (Q-SYS can't measure text).
+  local function capsW(text, size) return math.floor(#text * size * 0.74 + 0.5) end
+
+  -- Sliced retro sun: flat bands with dark gaps that grow toward the horizon.
+  local function sun(cx, cy, rad, bands)
+    local top = cy - rad
+    local n = #bands
+    local bandH = rad / n
+    for i, col in ipairs(bands) do
+      local y1 = top + (i - 1) * bandH
+      local gap = (i - 1) * 2
+      local y2 = top + i * bandH - gap
+      if y2 > y1 then
+        local left, right = {}, {}
+        for k = 0, 4 do
+          local y = y1 + (y2 - y1) * k / 4
+          local dx = math.sqrt(math.max(0, rad * rad - (y - cy) * (y - cy)))
+          left[#left + 1] = { cx - dx, y }
+          right[#right + 1] = { cx + dx, y }
+        end
+        local pts = {}
+        for k = 1, #right do pts[#pts + 1] = right[k][1]; pts[#pts + 1] = right[k][2] end
+        for k = #left, 1, -1 do pts[#pts + 1] = left[k][1]; pts[#pts + 1] = left[k][2] end
+        poly(pts, col)
+      end
+    end
+  end
+
+  -- Page chrome: field, grid, header with wordmark and sun, sunset stripes, nav tabs, checkerboard.
+  function r.page(slogan)
+    rect(0, 0, Rad.W, Rad.H, C.night)
+    for x = 0, Rad.W, 40 do rect(x, 140, 1, 560, C.grid) end
+    for y = 140, 700, 40 do rect(0, y, Rad.W, 1, C.grid) end
+    -- header
+    rect(0, 0, Rad.W, 120, C.ink)
+    sun(704, 120, 92, { C.yellow, C.yellow, C.orange, C.orange, C.pink, C.pink, C.purple })
+    -- Memphis confetti
+    poly({ 470, 30, 494, 70, 446, 70 }, nil, C.cyan, 3)
+    s('<path d="M 530 92 l 12 -12 l 12 12 l 12 -12 l 12 12 l 12 -12" fill="none" stroke="%s" stroke-width="4" stroke-linejoin="round"/>', hexc(C.pink))
+    s('<circle cx="860" cy="30" r="6" fill="%s"/><circle cx="884" cy="82" r="4" fill="%s"/><circle cx="420" cy="96" r="5" fill="%s"/>',
+      hexc(C.yellow), hexc(C.cyan), hexc(C.orange))
+    poly({ 820, 64, 836, 56, 844, 72, 828, 80 }, C.lime)
+    -- sunset stripes (flat bands standing in for a gradient)
+    local stripes = { C.yellow, C.orange, C.pink, C.purple, C.cyan }
+    for i, c in ipairs(stripes) do rect(0, 120 + (i - 1) * 4, Rad.W, 4, c) end
+    -- nav tabs: slanted stickers; drop UCI Navigation Buttons on them (see README)
+    for i, t in ipairs(Rad.TABS) do
+      local x, y, w, h, k = 32 + (i - 1) * 236, 712, 220, 52, 16
+      local on = (i == tab)
+      if on then poly({ x + k + 6, y + 6, x + w + 6, y + 6, x + w - k + 6, y + h + 6, x + 6, y + h + 6 }, C.pink) end
+      poly({ x + k, y, x + w, y, x + w - k, y + h, x, y + h }, on and C.yellow or C.ink, on and C.ink or C.cyan, on and 0 or 3)
+      r.text(t, x, y + 12, w, 28, 22, on and C.ink or C.cyan, "Center")
+    end
+    if slogan then r.text(slogan, 980, 722, 268, 32, 18, C.pink, "Right") end
+    -- checkerboard
+    rect(0, 772, Rad.W, 28, C.white)
+    for row = 0, 1 do
+      for col = 0, Rad.W // 14 do
+        if (col + row) % 2 == 0 then rect(col * 14, 772 + row * 14, 14, 14, C.ink) end
+      end
+    end
+    -- wordmark and tagline
+    r.shout("NANOLEAF", 32, 16, 420, 64, 52, C.yellow, C.pink, 5)
+    r.text("LIGHT CONTROL", 36, 82, 200, 24, 16, C.cyan, "Left", "ExtraBold Italic")
+    r.text("MAXIMUM RAD", 210, 82, 200, 24, 16, C.white, "Left", "ExtraBold Italic")
+  end
+
+  -- Header status: device name, Q-SYS status, Online LED.
+  function r.status(nameCtl, statusCtl, ledCtl)
+    r.text("DEVICE", 868, 18, 160, 18, 12, C.pink, "Left", "ExtraBold Italic")
+    r.text("STATUS", 1040, 18, 160, 18, 12, C.pink, "Left", "ExtraBold Italic")
+    layout[nameCtl] = { PrettyName = "Device Name", Style = "Text", Position = { 868, 40 }, Size = { 160, 40 },
+      Color = C.ink, TextColor = C.white, Font = "Montserrat", FontStyle = "Bold", FontSize = 16, HTextAlign = "Left",
+      StrokeWidth = 0, TextBoxStyle = "NoBackground", IsReadOnly = true }
+    layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 1040, 40 }, Size = { 160, 40 },
+      Font = "Montserrat", FontStyle = "Bold", FontSize = 14, CornerRadius = 0, StrokeWidth = 0 }
+    layout[ledCtl] = { PrettyName = "Online", Style = "Led", Position = { 1212, 44 }, Size = { 32, 32 },
+      Color = C.lime, OffColor = C.off, UnlinkOffColor = true, StrokeColor = C.white, StrokeWidth = 2, Margin = 2 }
+  end
+
+  -- Card: ink fill, thick neon edge, hard offset shadow, and a slanted title sticker that
+  -- overhangs the top edge (keep 20 px above the card free).
+  function r.card(title, x, y, w, h, color, shadow)
+    rect(x + 10, y + 10, w, h, shadow or C.pink)
+    rect(x, y, w, h, C.ink, color, 4)
+    if title then
+      local tw = capsW(title, 22) + 40
+      local sx, sy, sh, k = x + 20, y - 20, 40, 10
+      poly({ sx + k, sy, sx + tw, sy, sx + tw - k, sy + sh, sx, sy + sh }, color)
+      r.text(title, sx, sy + 6, tw, 30, 22, C.ink, "Center")
+    end
+  end
+
+  -- Small caption above a control.
+  function r.cap(text, x, y, w, color, align)
+    r.text(text, x, y, w, 22, 16, color or C.white, align or "Left", "ExtraBold Italic")
+  end
+
+  -- Diagonal hazard stripes (yellow / ink).
+  function r.hazard(x, y, w, h)
+    rect(x, y, w, h, C.yellow)
+    for i = -h, w, 24 do
+      local pts = { x + i, y + h, x + i + 12, y + h, x + i + 12 + h, y, x + i + h, y }
+      -- clip by hand to the strip
+      for p = 1, #pts, 2 do pts[p] = math.min(math.max(pts[p], x), x + w) end
+      poly(pts, C.ink)
+    end
+  end
+
+  -- Buttons. kind:
+  --   "power"  big toggle: pink edge and legend, solid pink when on
+  --   "hit"    trigger: solid yellow, ink legend, flashes white
+  --   "zap"    trigger: solid cyan, ink legend
+  --   "ghost"  trigger: ink with cyan edge and legend, fills cyan when pressed
+  --   "pad"    toggle tile: ink with a neon edge, fills with that neon when on (pass color)
+  --   "alert"  trigger: solid orange, ink legend (Identify)
+  --   "swatch" trigger: the button's own color (quick colors, white presets)
+  local KIND = {
+    power = { on = C.pink, off = C.ink, text = C.white, stroke = C.pink, sw = 5, size = 48, style = "Black Italic" },
+    hit   = { on = C.white, off = C.yellow, text = C.ink, stroke = C.ink, sw = 0, size = 24, style = "Black Italic" },
+    zap   = { on = C.white, off = C.cyan, text = C.ink, stroke = C.ink, sw = 0, size = 22, style = "Black Italic" },
+    ghost = { on = C.cyan, off = C.ink, text = C.cyan, stroke = C.cyan, sw = 3, size = 18, style = "ExtraBold Italic" },
+    pad   = { on = C.yellow, off = C.ink, text = C.white, stroke = C.yellow, sw = 3, size = 18, style = "ExtraBold Italic" },
+    alert = { on = C.white, off = C.orange, text = C.ink, stroke = C.ink, sw = 0, size = 30, style = "Black Italic" },
+    swatch = { on = C.white, off = C.white, text = C.ink, stroke = C.ink, sw = 0, size = 16, style = "Black Italic" },
+  }
+  -- PrettyName is the control name, as on the plugin's own pages.
+  function r.button(name, legend, x, y, w, h, kind, extra)
+    local k = KIND[kind or "hit"]
+    layout[name] = merge2({ PrettyName = name, Style = "Button", Legend = legend,
+      Position = { x, y }, Size = { w, h }, Color = k.on, OffColor = k.off, UnlinkOffColor = true,
+      TextColor = k.text, StrokeColor = k.stroke, StrokeWidth = k.sw, Font = "Montserrat", FontStyle = k.style,
+      FontSize = k.size, CornerRadius = 4, ButtonVisualStyle = "Flat", ButtonStyle = "Trigger", Margin = 0,
+      WordWrap = true }, extra)
+  end
+
+  function r.fader(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge2({ PrettyName = pretty or name, Style = "Fader", Position = { x, y }, Size = { w, h },
+      Color = color or C.yellow, ShowTextbox = false }, extra)
+  end
+
+  -- Read-only readout: ink well, mono digits in yellow.
+  function r.readout(name, pretty, x, y, w, h, extra)
+    layout[name] = merge2({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h },
+      Color = C.ink, TextColor = C.yellow, Font = "Roboto Mono", FontStyle = "Bold", FontSize = 18,
+      HTextAlign = "Center", CornerRadius = 0, StrokeColor = C.purple, StrokeWidth = 2, Padding = 4,
+      IsReadOnly = true }, extra)
+  end
+
+  -- Editable field (opens the TSC keyboard): cyan edge.
+  function r.field(name, pretty, x, y, w, h, extra)
+    r.readout(name, pretty, x, y, w, h, merge2({ StrokeColor = C.cyan, StrokeWidth = 3, IsReadOnly = false }, extra))
+  end
+
+  -- Plain value text on a card.
+  function r.value(name, pretty, x, y, w, h, extra)
+    layout[name] = merge2({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h },
+      Color = C.ink, TextColor = C.chrome, Font = "Montserrat", FontStyle = "Bold", FontSize = 16,
+      HTextAlign = "Center", StrokeWidth = 0, TextBoxStyle = "NoBackground", IsReadOnly = true }, extra)
+  end
+
+  function r.combo(name, pretty, x, y, w, h, extra)
+    layout[name] = merge2({ PrettyName = pretty or name, Style = "ComboBox", Position = { x, y }, Size = { w, h },
+      Color = C.ink, TextColor = C.white, Font = "Montserrat", FontStyle = "Bold", FontSize = 18,
+      StrokeColor = C.pink, StrokeWidth = 3, CornerRadius = 0 }, extra)
+  end
+
+  function r.led(name, pretty, x, y, sz, color, extra)
+    layout[name] = merge2({ PrettyName = pretty or name, Style = "Led", Position = { x, y }, Size = { sz, sz },
+      Color = color or C.lime, OffColor = C.off, UnlinkOffColor = true, StrokeColor = C.white, StrokeWidth = 2,
+      Margin = 2 }, extra)
+  end
+
+  -- Call last: puts the page artwork behind everything as one Svg, then the text on top.
+  function r.finish()
+    local doc = string.format('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">%s</svg>',
+      Rad.W, Rad.H, Rad.W, Rad.H, table.concat(svg))
+    table.insert(graphics, { Type = "Svg", Image = b64(doc), Position = { 0, 0 }, Size = { Rad.W, Rad.H }, ZOrder = -100 })
+    for _, l in ipairs(labels) do table.insert(graphics, l) end
+    r.svgText = doc
+  end
+
+  return r
+end
+
+-- TSC-101-G3 UCI pages (1280 x 800). Shown when the "TSC-101 UCI Pages" property is On.
+-- Open one of these pages, press Ctrl+A (selects controls and graphics) and paste onto a
+-- UCI page set to Panel Type TSC-101-G3, landscape. The pasted controls stay linked to this plugin.
+local UciPages = { "TSC Home", "TSC Color", "TSC Effects", "TSC Panels" }
+
+local function RadLayout(page, layout, graphics)
+  local tab = ({ ["TSC Home"] = 1, ["TSC Color"] = 2, ["TSC Effects"] = 3, ["TSC Panels"] = 4 })[page]
+  local r = Rad.kit(layout, graphics, tab)
+  local C = r.C
+  local slogans = { "SHADES ON. LIGHTS UP.", "TASTE THE RAINBOW.", "PARTY MODE: ARMED.", "EVERY PANEL. NO MERCY." }
+  r.page(slogans[tab])
+  r.status("DeviceName", "Status", "Online")
+
+  if tab == 1 then
+    -- Power
+    r.card("POWER", 32, 180, 340, 500, C.pink, C.cyan)
+    r.button("Power", "POWER", 56, 216, 292, 220, "power", { ButtonStyle = "Toggle" })
+    r.button("PowerOn", "ON", 56, 456, 140, 72, "hit")
+    r.button("PowerOff", "OFF", 208, 456, 140, 72, "ghost", { FontSize = 24, FontStyle = "Black Italic" })
+    r.cap("NOW PLAYING", 56, 548, 292, C.cyan)
+    r.readout("EffectCurrent", "Effects~Current", 56, 574, 292, 56, { FontSize = 16, WordWrap = true })
+    -- Brightness
+    r.card("BRIGHTNESS", 404, 180, 340, 500, C.yellow, C.pink)
+    r.fader("Brightness", "Brightness~Level", 436, 220, 136, 436, C.yellow, { ShowTextbox = true })
+    r.button("BrightnessUp", "+", 596, 220, 124, 120, "hit", { FontSize = 64 })
+    r.button("BrightnessDown", "-", 596, 356, 124, 120, "zap", { FontSize = 64 })
+    r.cap("FADE (S)", 596, 504, 124, C.yellow, "Center")
+    r.field("FadeTime", "Brightness~Fade Time", 596, 532, 124, 56, { FontSize = 22 })
+    r.text("0 = SNAP", 596, 600, 124, 20, 13, C.chrome, "Center", "Bold Italic")
+    -- Quick hits
+    r.card("QUICK HITS", 776, 180, 472, 500, C.cyan, C.yellow)
+    for i, qc in ipairs(QuickColors) do
+      local c = qc[2]
+      local col, row = (i - 1) % 4, (i - 1) // 4
+      r.button("QuickColor " .. i, string.upper(qc[1]), 800 + col * 109, 220 + row * 92, 97, 80,
+        "swatch", { OffColor = c, Color = C.white,
+          TextColor = (c[1] * 0.3 + c[2] * 0.59 + c[3] * 0.11 < 110) and C.white or C.ink })
+    end
+    r.cap("WHITES", 800, 410, 200, C.cyan)
+    for i, wp in ipairs(WhitePresets) do
+      local k = math.floor((wp[2] - 1900) / (6500 - 1900) * 100 + 0.5) / 100
+      local warm, cool = { 255, 170, 80 }, { 215, 235, 255 }
+      local c = { math.floor(warm[1] + (cool[1] - warm[1]) * k), math.floor(warm[2] + (cool[2] - warm[2]) * k),
+                  math.floor(warm[3] + (cool[3] - warm[3]) * k) }
+      r.button("WhitePreset " .. i, string.upper(wp[1]), 800 + (i - 1) * 87, 436, 76, 64, "swatch",
+        { OffColor = c, Color = C.white, FontSize = 12 })
+    end
+    r.cap("SCENES", 800, 520, 200, C.cyan)
+    r.button("EffectPrev", "< PREV", 800, 546, 206, 72, "ghost", { FontSize = 22 })
+    r.button("EffectNext", "NEXT >", 1018, 546, 206, 72, "hit")
+
+  elseif tab == 2 then
+    -- Color faders (fader colors are the content)
+    r.card("COLOR LAB", 32, 180, 800, 340, C.pink, C.yellow)
+    local rows = { { "Hue", "HUE", C.pink }, { "Saturation", "SAT", C.cyan }, { "Red", "RED", { 255, 40, 60 } },
+                   { "Green", "GREEN", { 60, 255, 90 } }, { "Blue", "BLUE", { 60, 110, 255 } } }
+    for i, row in ipairs(rows) do
+      local y = 224 + (i - 1) * 56
+      r.text(row[2], 56, y + 8, 112, 30, 24, row[3], "Left")
+      r.fader(row[1], "Color~" .. row[1], 176, y, 632, 44, row[3])
+    end
+    r.card("SWATCH", 864, 180, 384, 340, C.cyan, C.pink)
+    r.led("ColorSwatch", "Color~Swatch", 888, 228, 168, C.white, { Margin = 0, StrokeWidth = 4 })
+    r.cap("HEX", 1072, 228, 152, C.cyan)
+    r.field("HexColor", "Color~Hex", 1072, 254, 152, 56, { FontSize = 20 })
+    r.cap("MODE", 1072, 330, 152, C.cyan)
+    r.readout("ColorMode", "Color~Mode", 1072, 356, 152, 48, { FontSize = 16 })
+    r.text("WHAT YOU SEE IS WHAT YOU GLOW", 888, 440, 336, 24, 15, C.pink, "Left", "ExtraBold Italic")
+    -- White
+    r.card("WHITE HEAT", 32, 560, 1216, 120, C.orange, C.purple)
+    r.text("KELVIN", 56, 604, 112, 30, 24, C.orange, "Left")
+    r.fader("ColorTemp", "White~Color Temp", 168, 596, 520, 48, C.orange)
+    for i, wp in ipairs(WhitePresets) do
+      r.button("WhitePreset " .. i, string.upper(wp[1]), 716 + (i - 1) * 100, 592, 92, 56,
+        i % 2 == 1 and "hit" or "zap", { FontSize = 15 })
+    end
+
+  elseif tab == 3 then
+    r.card("PICK A VIBE", 32, 180, 1216, 112, C.purple, C.cyan)
+    r.combo("EffectSelect", "Effects~Select", 56, 212, 600, 56)
+    r.button("EffectPrev", "< PREV", 680, 212, 140, 56, "ghost", { FontSize = 20 })
+    r.button("EffectNext", "NEXT >", 832, 212, 140, 56, "hit", { FontSize = 20 })
+    r.button("EffectRefresh", "RELOAD", 984, 212, 120, 56, "ghost", { FontSize = 16 })
+    r.value("EffectCount", "Effects~Count", 1112, 212, 120, 56, { FontSize = 13, WordWrap = true })
+    -- Effect pads: each pad has its own neon; it fills with it when that effect is playing
+    r.card("PARTY PADS", 32, 332, 856, 348, C.yellow, C.pink)
+    local neon = { C.pink, C.purple, C.orange, { 0, 120, 255 } }  -- dark enough for a white legend when lit
+    for i = 1, EFFECT_BUTTONS do
+      local col, row = (i - 1) % 4, (i - 1) // 4
+      local c = neon[(col + row) % 4 + 1]
+      r.button("EffectButton " .. i, "", 56 + col * 205, 372 + row * 84, 193, 72, "pad",
+        { ButtonStyle = "Toggle", Color = c, StrokeColor = c, TextColor = C.white })
+    end
+    r.button("EffectPageDown", "< PAGE", 56, 624, 140, 48, "ghost", { FontSize = 18 })
+    r.value("EffectPageLabel", "Effects~Page", 208, 624, 504, 48, { FontSize = 16 })
+    r.button("EffectPageUp", "PAGE >", 724, 624, 140, 48, "ghost", { FontSize = 18 })
+    -- Now playing and Rhythm
+    r.card("NOW PLAYING", 920, 332, 328, 348, C.cyan, C.orange)
+    r.readout("EffectCurrent", "Effects~Current", 944, 372, 280, 64, { FontSize = 18, WordWrap = true })
+    r.cap("RHYTHM", 944, 456, 280, C.yellow)
+    r.led("RhythmConnected", "Rhythm~Connected", 944, 488, 28, C.lime)
+    r.text("MIC CONNECTED", 984, 492, 240, 22, 15, C.white, "Left", "ExtraBold Italic")
+    r.led("RhythmActive", "Rhythm~Active", 944, 524, 28, C.pink)
+    r.text("SOUND REACTIVE", 984, 528, 240, 22, 15, C.white, "Left", "ExtraBold Italic")
+    r.cap("INPUT", 944, 566, 280, C.yellow)
+    r.combo("RhythmMode", "Rhythm~Input", 944, 592, 280, 52, { FontSize = 16 })
+
+  elseif tab == 4 then
+    r.card("PANEL PICKER", 32, 180, 800, 500, C.cyan, C.pink)
+    r.text("PANEL", 56, 230, 104, 30, 24, C.cyan, "Left")
+    r.combo("PanelSelect", "Panels~Select", 160, 216, 360, 56)
+    r.value("PanelInfo", "Panels~Info", 536, 216, 272, 56, { FontSize = 14, HTextAlign = "Left", WordWrap = true })
+    local prow = { { "PanelRed", "RED", { 255, 40, 60 } }, { "PanelGreen", "GREEN", { 60, 255, 90 } },
+                   { "PanelBlue", "BLUE", { 60, 110, 255 } } }
+    for i, row in ipairs(prow) do
+      local y = 300 + (i - 1) * 64
+      r.text(row[2], 56, y + 10, 104, 30, 24, row[3], "Left")
+      r.fader(row[1], "Panels~" .. row[1]:sub(6), 160, y, 648, 48, row[3])
+    end
+    r.cap("FADE (S)", 56, 512, 140, C.cyan)
+    r.field("PanelTransition", "Panels~Transition", 168, 500, 120, 48, { FontSize = 20 })
+    r.cap("PREVIEW", 600, 512, 120, C.cyan, "Right")
+    r.led("PanelSwatch", "Panels~Swatch", 736, 488, 72, C.white, { Margin = 0, StrokeWidth = 3 })
+    r.button("PanelApply", "PAINT PANEL", 56, 584, 360, 72, "hit", { FontSize = 26 })
+    r.button("PanelApplyAll", "PAINT 'EM ALL", 432, 584, 376, 72, "zap", { FontSize = 26 })
+
+    r.card("THE LAYOUT", 864, 180, 384, 500, C.orange, C.yellow)
+    r.cap("PANELS", 888, 216, 336, C.orange)
+    r.readout("PanelCount", "Panels~Count", 888, 242, 336, 72, { FontSize = 40 })
+    r.cap("ROTATE", 888, 334, 200, C.orange)
+    r.field("Orientation", "Panels~Orientation", 888, 360, 160, 56, { FontSize = 22 })
+    r.text("DEGREES", 1064, 376, 160, 24, 16, C.chrome, "Left", "ExtraBold Italic")
+    r.hazard(888, 440, 336, 16)
+    r.button("Identify", "FIND 'EM!", 888, 472, 336, 112, "alert")
+    r.hazard(888, 600, 336, 16)
+    r.text("EVERY PANEL FLASHES", 888, 628, 336, 22, 15, C.chrome, "Center", "ExtraBold Italic")
+  end
+
+  r.finish()
+  return r
+end
+
+
 function GetColor(props)
   return ACCENT
 end
@@ -333,9 +752,20 @@ end
 
 local PageNames = { "Control", "Effects", "Panels", "Setup" }
 
+-- Page list for these properties: the four plugin pages, plus the UCI pages when switched on.
+local function PagesFor(props)
+  local list = {}
+  for _, n in ipairs(PageNames) do list[#list + 1] = n end
+  local p = props and props["TSC-101 UCI Pages"]
+  if p and p.Value == "On" then
+    for _, n in ipairs(UciPages) do list[#list + 1] = n end
+  end
+  return list
+end
+
 function GetPages(props)
   local pages = {}
-  for _, name in ipairs(PageNames) do table.insert(pages, { name = name }) end
+  for _, name in ipairs(PagesFor(props)) do table.insert(pages, { name = name }) end
   return pages
 end
 
@@ -344,6 +774,7 @@ function GetProperties()
     { Name = "Port", Type = "integer", Min = 1, Max = 65535, Value = 16021 },
     { Name = "Poll Interval (s)", Type = "integer", Min = 1, Max = 60, Value = 3 },
     { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
+    { Name = "TSC-101 UCI Pages", Type = "enum", Choices = { "Off", "On" }, Value = "Off" },
   }
 end
 
@@ -425,7 +856,11 @@ end
 
 function GetControlLayout(props)
   local layout, graphics = {}, {}
-  local page = PageNames[props["page_index"].Value]
+  local page = PagesFor(props)[props["page_index"].Value]
+  if page and page:sub(1, 4) == "TSC " then
+    RadLayout(page, layout, graphics)
+    return layout, graphics
+  end
   local ui = Theme.kit(layout, graphics)
   local N, S = ui.N, ui.S
 

@@ -29,7 +29,7 @@ The header on every page shows the device name, the Q-SYS status (OK / Fault / N
 
 **Look:** the layout follows the shared Deep Ocean theme ([design/README.md](../design/README.md)): a deep-blue field, dark glass panels, cyan for active pads, buttons and faders, amber/red for Identify and Unpair, and one hint line at the bottom of each page. Color swatches, the RGB/hue/kelvin faders and the quick-color buttons show their own colors.
 
-**Properties:** Port (default 16021), Poll Interval (default 3 s), and Debug Print (None / Errors / All).
+**Properties:** Port (default 16021), Poll Interval (default 3 s), Debug Print (None / Errors / All), and TSC-101 UCI Pages (Off / On, default Off). Set it to On to add four 1280 x 800 touchscreen pages (TSC Home, TSC Color, TSC Effects, TSC Panels) in a neon 80s look, ready to copy onto a TSC-101-G3 UCI. See [nanoleaf-tsc101-uci](../nanoleaf-tsc101-uci/).
 
 Every control has a pin, so UCI buttons, control scripts and snapshots can drive it.
 
@@ -66,3 +66,4 @@ The official Nanoleaf and Q-SYS developer pages could not be fully loaded from t
 ## Changelog
 - 1.0: first release.
 - 1.1: restyled to the home-dash Deep Ocean design ([design/README.md](../design/README.md)); no control or pin changes.
+- 1.2: new TSC-101 UCI Pages property (default Off) that adds four 1280 x 800 UCI pages in the "Rad" neon theme. With it Off, pages, controls and pins are the same as 1.1.
