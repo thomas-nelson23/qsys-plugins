@@ -1,19 +1,20 @@
 --[[ Cambridge Audio CXA81 plugin for Q-SYS
-  Controls a Cambridge Audio CXA81 (also CXA81 Mk II and CXA61) integrated amplifier over its rear-panel
-  RS-232C port, using Cambridge Audio's published serial control protocol: power, mute and source,
-  with feedback, plus the protocol and firmware versions.
+  Controls a Cambridge Audio CXA81 (also CXA81 Mk II and CXA61) integrated amplifier over any mix of the
+  control paths Cambridge Audio documents for it. Each path is optional (Properties), and the plugin uses
+  the best one available for each command, falling back to the next when one is down:
 
-  The protocol has no volume, balance or tone commands, and the amplifier has no network control.
-  Volume up / down is therefore sent as IR (Property "IR Volume"), through a Global Cache iTach IP2IR
-  style gateway whose output drives an IR emitter on the amp's front IR window or its rear "IR in"
-  socket. IR is one-way: the plugin can ramp the volume but can't read the level.
+    RS-232   power, mute, source, versions, with live feedback      serial pin, or a serial-to-IP gateway
+    IR       power, mute, source, volume, speakers A/B, display    Global Cache iTach gateway -> amp IR in / window
+    Trigger  power (12 V trigger in), power feedback (trigger out)  plugin pins wired to Q-SYS GPIO / relays
 
-  Transport (Property "Connection"):
-    Serial   a serial pin on the plugin, wired in the design to a Q-SYS serial port (Core or peripheral)
-    TCP      a serial-to-IP gateway in front of the amplifier's RS-232 port (raw TCP pass-through)
-  Either way: 9600 baud, 8 data bits, no parity, 1 stop bit.
+  Command routing:
+    power        RS-232 -> IR (discrete on/off) ; the trigger output also follows it when enabled
+    mute, source RS-232 -> IR (discrete codes) ; a setter RS-232 doesn't answer is resent over IR
+    volume, speakers A/B, display brightness      IR only (the serial protocol has none of them)
+  Feedback: RS-232 when it answers, else power from the trigger sense input, else the last command sent
+  (shown as "assumed"). The CX Control Bus has no published protocol, so it is not used.
 
-  Protocol (CXA61 and CXA81 Serial Control Protocol v1.0), ASCII, "#" + group,number[,data] + CR:
+  RS-232 protocol (CXA61 and CXA81 Serial Control Protocol v1.0), 9600 8N1, ASCII "#" group,number[,data] CR:
     #01,01 get power      #01,02,d set power (0 standby, 1 on)    reply #02,01,d
     #01,03 get mute       #01,04,d set mute  (0 off, 1 muted)     reply #02,03,d
     #03,01 get source     #03,02 next   #03,03 previous   #03,04,xx set     reply #04,01,xx
@@ -22,26 +23,42 @@
   The amplifier also sends the reply unprompted when power, mute or source change from the front
   panel or the IR remote, so the plugin listens all the time and polls only to know it is online.
 
-  IR volume (Cambridge Audio CXA IR Remote Control Codes, RC-5, system 16): Volume Up 16, Volume Down 17.
-    Cambridge Audio's IR sheet names the CXA60/80; the CXA61/81 use the same CX remote. Check on site.
+  IR codes (RC-5). Cambridge Audio publishes two sheets that disagree on power and display:
+    CXA IR Remote Control Codes (CXA60/80): everything on system 16.
+    CX Series Remote Control IR Codes: power and display on system 25, the rest on system 16.
+  Property "IR Code Set" picks one, or "Both" sends power and display codes on both systems.
+    system 16: power on 14, off 15 | mute on 50, off 51 | volume up 16, down 17 | source up 99, down 126
+               A1 100, A2 101, A3 102, A4 103, A1 balanced 104, D1 105, D2 106, D3 107, MP3 108, USB 114, Bluetooth 115
+               speakers A+B 30, A 35, B 39 | display bright 18, dim 19, off 71
+    system 25: power on 14, off 15 | display bright 18, dim 19, off 71
+    Neither sheet names the CXA81; it ships with the same CX remote. Check on site.
   RC-5 frame: 36 kHz carrier, 889 us half-bits (32 carrier cycles), Manchester coded (1 = space then mark),
-    2 start bits, toggle bit, 5 address bits, 6 command bits, MSB first, repeated every 64 bit times.
-    The toggle bit flips on each new press; frames with the same toggle bit read as a held key.
-  Gateway (Global Cache Unified TCP API, TCP 4998, CR terminated):
-    sendir,1:<port>,<id>,36000,<repeat>,1,<on>,<off>,...   reply completeir,1:<port>,<id> / busyIR / ERR_...
-    stopir,1:<port>                                          stops a running transmission
+    start bit, field bit (inverted command bit 6, so codes 64-127 work), toggle bit, 5 address bits,
+    6 command bits, MSB first, repeated every 64 bit times. The toggle bit flips on each new key press;
+    frames with the same toggle bit read as one held key.
+  IR gateway (Global Cache Unified TCP API, TCP 4998, CR terminated):
+    sendir,<m>:<p>,<id>,36000,<repeat>,1,<on>,<off>,...   reply completeir,<m>:<p>,<id> / busyir / ERR_...
+    stopir,<m>:<p>                                          stops a running transmission
+    getdevices                                              keepalive; reply ends with endlistdevices
     Held buttons resend the identical sendir before it runs out (the gateway's continuous-repeat method).
+
+  12 V trigger (manual): "Trigger in" takes 12 V from home automation to control the power state;
+    "Trigger out" gives a continuous 12 V while the CXA is on. Q-SYS can't make or read 12 V by itself:
+    wire the TriggerOut pin to a GPIO output or relay that switches 12 V into Trigger in, and the amp's
+    Trigger out to a GPIO input (within its voltage rating) wired to the TriggerSense pin.
 
   References:
     Cambridge Audio, CXA61 and CXA81 Serial Control Protocol v1.0 (AP366462) -
       https://www.cambridgeaudio.com/sites/default/files/compliance/doc/AP366462%20CXA61%20CXA81%20Serial%20Control%20Protocol%20(1).pdf
-    Cambridge Audio, CXA61/81/81 Mk II manual (inputs, RS232C, Control Bus, auto power down) -
-      https://www.cambridgeaudio.com/row/en/manuals/cxa618181-mk-ii
-    Cambridge Audio, CXA IR Remote Control Codes (RC-5 system 16, CXA60/80) -
+    Cambridge Audio, CXA IR Remote Control Codes -
       https://www.cambridgeaudio.com/sites/default/files/compliance/doc/CXA%20IR%20Remote%20Control%20Codes.pdf
+    Cambridge Audio, CX Series Remote Control IR Codes -
+      https://supportarchive.cambridgeaudio.com/hc/en-us/article_attachments/18773756055581
+    Cambridge Audio, CXA61/81/81 Mk II manual (inputs, RS232C, IR in, trigger in/out, Control Bus, speakers, display) -
+      https://www.cambridgeaudio.com/row/en/manuals/cxa618181-mk-ii
     STMicroelectronics application note cd00229682, implementing an RC5 infrared transmitter (frame and timing) -
       https://www.st.com/resource/en/application_note/cd00229682-implementing-an-rc5-infrared-transmitter-using-the-ir-timer-modulator-of-the-stm8l10x-microcontroller-stmicroelectronics.pdf
-    Global Cache, Unified TCP API (sendir, stopir, continuous repeat) - https://www.globalcache.com/files/docs/api-gc-unifiedtcp.pdf
+    Global Cache, Unified TCP API (sendir, stopir, getdevices, continuous repeat) - https://www.globalcache.com/files/docs/api-gc-unifiedtcp.pdf
     Q-SYS SerialPorts - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/SerialPorts.htm
     Q-SYS TcpSocket - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/TcpSocket.htm
     Q-SYS plugin functions (GetPins Domain "serial") -
@@ -49,42 +66,43 @@
 ]]
 
 PluginInfo = {
-  Name = "Audio~Cambridge Audio CXA81 (RS-232)",
-  Version = "1.1",
-  BuildVersion = "1.1.0.0",
+  Name = "Audio~Cambridge Audio CXA81",
+  Version = "2.0",
+  BuildVersion = "2.0.0.0",
   Id = "7b3e9c21-0a81-4c6d-b2f4-ca8100000081",
   Author = "AV Programming",
-  Description = "Control a Cambridge Audio CXA81 or CXA61 integrated amplifier over RS-232 (directly or through a serial-to-IP gateway): power, mute, source, with live feedback, plus volume up / down over IR through an IR gateway.",
+  Description = "Control a Cambridge Audio CXA81 or CXA61 over any mix of RS-232 (live feedback), IR through a Global Cache gateway (volume, speakers, display, and backup for everything else) and the 12 V trigger: power, mute, source, volume, speakers A/B, display.",
   ShowDebug = true,
 }
 
 local ACCENT = { 52, 52, 56 }  -- neutral charcoal for the schematic block (pages use the shared theme)
 
--- Source codes from the protocol document, in front-panel order (manual: A1 balanced is CXA81 only, MP3 is CXA61 only).
+-- Source codes: RS-232 code from the serial protocol, IR command (RC-5 system 16) from the CXA IR sheet,
+-- in front-panel order (manual: A1 balanced is CXA81 only, MP3 is CXA61 only).
 local SOURCES = {
   CXA81 = {
-    { code = 20, label = "A1 BAL", name = "A1 Balanced" },
-    { code = 0,  label = "A1",     name = "A1" },
-    { code = 1,  label = "A2",     name = "A2" },
-    { code = 2,  label = "A3",     name = "A3" },
-    { code = 3,  label = "A4",     name = "A4" },
-    { code = 4,  label = "D1",     name = "D1" },
-    { code = 5,  label = "D2",     name = "D2" },
-    { code = 6,  label = "D3",     name = "D3" },
-    { code = 16, label = "USB",    name = "USB Audio" },
-    { code = 14, label = "BT",     name = "Bluetooth" },
+    { code = 20, ir = 104, label = "A1 BAL", name = "A1 Balanced" },
+    { code = 0,  ir = 100, label = "A1",     name = "A1" },
+    { code = 1,  ir = 101, label = "A2",     name = "A2" },
+    { code = 2,  ir = 102, label = "A3",     name = "A3" },
+    { code = 3,  ir = 103, label = "A4",     name = "A4" },
+    { code = 4,  ir = 105, label = "D1",     name = "D1" },
+    { code = 5,  ir = 106, label = "D2",     name = "D2" },
+    { code = 6,  ir = 107, label = "D3",     name = "D3" },
+    { code = 16, ir = 114, label = "USB",    name = "USB Audio" },
+    { code = 14, ir = 115, label = "BT",     name = "Bluetooth" },
   },
   CXA61 = {
-    { code = 0,  label = "A1",     name = "A1" },
-    { code = 1,  label = "A2",     name = "A2" },
-    { code = 2,  label = "A3",     name = "A3" },
-    { code = 3,  label = "A4",     name = "A4" },
-    { code = 4,  label = "D1",     name = "D1" },
-    { code = 5,  label = "D2",     name = "D2" },
-    { code = 6,  label = "D3",     name = "D3" },
-    { code = 10, label = "MP3",    name = "MP3" },
-    { code = 16, label = "USB",    name = "USB Audio" },
-    { code = 14, label = "BT",     name = "Bluetooth" },
+    { code = 0,  ir = 100, label = "A1",     name = "A1" },
+    { code = 1,  ir = 101, label = "A2",     name = "A2" },
+    { code = 2,  ir = 102, label = "A3",     name = "A3" },
+    { code = 3,  ir = 103, label = "A4",     name = "A4" },
+    { code = 4,  ir = 105, label = "D1",     name = "D1" },
+    { code = 5,  ir = 106, label = "D2",     name = "D2" },
+    { code = 6,  ir = 107, label = "D3",     name = "D3" },
+    { code = 10, ir = 108, label = "MP3",    name = "MP3" },
+    { code = 16, ir = 114, label = "USB",    name = "USB Audio" },
+    { code = 14, ir = 115, label = "BT",     name = "Bluetooth" },
   },
 }
 local MAX_SOURCES = 10
@@ -93,12 +111,21 @@ local function modelOf(props)
   return (props["Model"] and props["Model"].Value or "CXA81"):match("^(CXA%d+)") or "CXA81"
 end
 
-local function isTcp(props)
-  return props["Connection"].Value:find("^TCP") ~= nil
+-- "off" | "serial" | "tcp"
+local function rsMode(props)
+  local v = props["RS-232"] and props["RS-232"].Value or "Off"
+  if v:find("^Serial") then return "serial" elseif v:find("^TCP") then return "tcp" end
+  return "off"
 end
 
 local function hasIr(props)
-  return props["IR Volume"] ~= nil and props["IR Volume"].Value ~= "Off"
+  return props["IR"] ~= nil and props["IR"].Value ~= "Off"
+end
+
+-- { out = bool, sense = bool }
+local function trigMode(props)
+  local v = props["12V Trigger"] and props["12V Trigger"].Value or "Off"
+  return { out = v:find("Out") ~= nil, sense = v:find("Sense") ~= nil }
 end
 
 function GetColor(props)
@@ -120,16 +147,28 @@ end
 function GetProperties()
   return {
     { Name = "Model", Type = "enum", Choices = { "CXA81 / CXA81 Mk II", "CXA61" }, Value = "CXA81 / CXA81 Mk II" },
-    { Name = "Connection", Type = "enum", Choices = { "Serial (RS-232 pin)", "TCP (serial-to-IP gateway)" }, Value = "Serial (RS-232 pin)" },
+    { Name = "RS-232", Type = "enum", Choices = { "Off", "Serial (RS-232 pin)", "TCP (serial-to-IP gateway)" }, Value = "Serial (RS-232 pin)" },
+    { Name = "IR", Type = "enum", Choices = { "Off", "Global Cache iTach (TCP 4998)" }, Value = "Off" },
+    { Name = "IR Code Set", Type = "enum", Choices = { "Both (most compatible)", "CXA sheet (system 16)", "CX Series sheet (system 25)" }, Value = "Both (most compatible)" },
+    { Name = "IR Power-On Wait (s)", Type = "integer", Min = 1, Max = 15, Value = 3 },
+    { Name = "12V Trigger", Type = "enum", Choices = { "Off", "Out (power control)", "Sense (power feedback)", "Out and Sense" }, Value = "Off" },
+    { Name = "Power On With Source", Type = "enum", Choices = { "Yes", "No" }, Value = "Yes" },
     { Name = "Poll Interval (s)", Type = "integer", Min = 2, Max = 60, Value = 10 },
-    { Name = "IR Volume", Type = "enum", Choices = { "Off", "Global Cache iTach (TCP 4998)" }, Value = "Off" },
     { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
   }
 end
 
+function RectifyProperties(props)
+  local ir = hasIr(props)
+  props["IR Code Set"].IsHidden = not ir
+  props["IR Power-On Wait (s)"].IsHidden = not ir
+  props["Poll Interval (s)"].IsHidden = rsMode(props) == "off"
+  return props
+end
+
 function GetPins(props)
   local pins = {}
-  if not isTcp(props) then
+  if rsMode(props) == "serial" then
     table.insert(pins, { Name = "RS-232", Direction = "input", Domain = "serial" })
   end
   return pins
@@ -140,6 +179,7 @@ function GetControls(props)
   local function led(name) return { Name = name, ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true } end
   local function trig(name) return { Name = name, ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true } end
   local function tog(name, count) return { Name = name, ControlType = "Button", ButtonType = "Toggle", Count = count, PinStyle = "Both", UserPin = true } end
+  local function mom(name) return { Name = name, ControlType = "Button", ButtonType = "Momentary", PinStyle = "Input", UserPin = true } end
   local function text(name) return { Name = name, ControlType = "Text", PinStyle = "Both", UserPin = true } end
 
   return {
@@ -148,18 +188,25 @@ function GetControls(props)
     led("Online"), ind("DeviceName"),
     -- amplifier
     tog("Power"), trig("PowerOn"), trig("PowerOff"), ind("PowerText"), led("PowerLed"),
-    tog("Mute"),
-    -- volume (IR)
-    { Name = "VolumeUp", ControlType = "Button", ButtonType = "Momentary", PinStyle = "Input", UserPin = true },
-    { Name = "VolumeDown", ControlType = "Button", ButtonType = "Momentary", PinStyle = "Input", UserPin = true },
-    ind("IrText"), led("IrOnline"),
+    tog("Mute"), trig("MuteOn"), trig("MuteOff"),
     -- source
     tog("Source", MAX_SOURCES), text("SourceSelect"), trig("SourceNext"), trig("SourcePrev"),
     { Name = "SourceCode", ControlType = "Knob", ControlUnit = "Integer", Min = -1, Max = 99, DefaultValue = -1, PinStyle = "Output", UserPin = true },
-    -- setup
+    -- IR only: volume, speakers, display
+    mom("VolumeUp"), mom("VolumeDown"),
+    trig("SpeakerA"), trig("SpeakerB"), trig("SpeakerAB"),
+    trig("DisplayBright"), trig("DisplayDim"), trig("DisplayOff"),
+    -- 12 V trigger
+    led("TriggerOut"),
+    { Name = "TriggerSense", ControlType = "Button", ButtonType = "Toggle", PinStyle = "Input", UserPin = true },
+    ind("TriggerText"),
+    -- feedback and paths
+    ind("FeedbackText"), ind("PathText"),
+    -- setup: RS-232
     text("IPAddress"), text("Port"), trig("Connect"), trig("Refresh"),
-    text("IrAddress"), text("IrPort"),
     ind("LinkText"), ind("ModelText"), ind("ProtocolText"), ind("FirmwareText"), ind("LastError"), ind("LastMessage"),
+    -- setup: IR gateway
+    text("IrAddress"), text("IrPort"), trig("IrConnect"), ind("IrText"), led("IrOnline"),
   }
 end
 
@@ -463,15 +510,17 @@ function GetControlLayout(props)
   local N, S, B = ui.N, ui.S, ui.B
   local page = PageNames[props["page_index"].Value]
   local model = modelOf(props)
-  local tcp = isTcp(props)
+  local rs = rsMode(props)
+  local ir = hasIr(props)
+  local tm = trigMode(props)
   local WORD = "CXA|" .. model:sub(4)
 
   local function cap(t, x, y, w) ui.label(t, x, y, w, 20, "Left", 10, N.dim, "Medium") end
-
-  local ir = hasIr(props)
+  local function hideAll(list) for _, n in ipairs(list) do ui.hide(n[1], n[2]) end end
 
   if page == "Control" then
-    ui.page(ir and 400 or 312)
+    local h = 280 + (ir and 128 or 0) + 64 + 32
+    ui.page(h)
     ui.header(WORD, "Control", "DeviceName", "Status", "Online", props["page_index"].Value)
 
     -- power and mute
@@ -480,8 +529,8 @@ function GetControlLayout(props)
     ui.led("PowerLed", "Amplifier~Power LED", 32, 164, 16, "ok")
     ui.readout("PowerText", "Amplifier~Power State", 56, 160, 136, 24, { HTextAlign = "Center" })
     ui.button("Mute", "MUTE", 24, 196, 168, 56, "danger", { PrettyName = "Amplifier~Mute", FontSize = 14 })
-    ui.hide("PowerOn", "Amplifier~Power On")
-    ui.hide("PowerOff", "Amplifier~Power Off")
+    hideAll({ { "PowerOn", "Amplifier~Power On" }, { "PowerOff", "Amplifier~Power Off" },
+              { "MuteOn", "Amplifier~Mute On" }, { "MuteOff", "Amplifier~Mute Off" } })
 
     -- sources
     local list = SOURCES[model]
@@ -497,70 +546,120 @@ function GetControlLayout(props)
     ui.button("SourceNext", ">", 544, 200, 72, 40, "utility", { PrettyName = "Source~Next", FontSize = 16 })
     ui.hide("SourceCode", "Source~Source Code")
 
+    local y = 280
+    local irCtl = { { "VolumeDown", "Volume~Down" }, { "VolumeUp", "Volume~Up" },
+                    { "SpeakerA", "Speakers~A" }, { "SpeakerB", "Speakers~B" }, { "SpeakerAB", "Speakers~A and B" },
+                    { "DisplayBright", "Display~Bright" }, { "DisplayDim", "Display~Dim" }, { "DisplayOff", "Display~Off" } }
     if ir then
-      ui.section("Volume (IR)", 8, 280, 624, 80)
-      ui.button("VolumeDown", "VOL -", 24, 312, 140, 40, "primary", { PrettyName = "Volume~Down", ButtonStyle = "Momentary", FontSize = 14 })
-      ui.button("VolumeUp", "VOL +", 172, 312, 140, 40, "primary", { PrettyName = "Volume~Up", ButtonStyle = "Momentary", FontSize = 14 })
-      ui.led("IrOnline", "Volume~IR Gateway Online", 328, 324, 16, "ok")
-      ui.readout("IrText", "Volume~IR Status", 352, 320, 264, 24, { FontSize = 11 })
-      ui.hint("Hold VOL to ramp. Volume goes over IR, so the amp can't report the level back.", 368)
+      ui.section("Volume, Speakers, Display (IR)", 8, y, 624, 120)
+      ui.button("VolumeDown", "VOL -", 24, y + 32, 140, 40, "primary", { PrettyName = "Volume~Down", ButtonStyle = "Momentary", FontSize = 14 })
+      ui.button("VolumeUp", "VOL +", 172, y + 32, 140, 40, "primary", { PrettyName = "Volume~Up", ButtonStyle = "Momentary", FontSize = 14 })
+      ui.led("IrOnline", "Volume~IR Gateway Online", 328, y + 44, 16, "ok")
+      ui.readout("IrText", "Volume~IR Status", 352, y + 40, 264, 24, { FontSize = 11 })
+      cap("SPEAKERS", 24, y + 82, 64)
+      ui.button("SpeakerA", "A", 92, y + 78, 52, 30, "pad", { PrettyName = "Speakers~A", ButtonStyle = "Trigger" })
+      ui.button("SpeakerB", "B", 148, y + 78, 52, 30, "pad", { PrettyName = "Speakers~B", ButtonStyle = "Trigger" })
+      ui.button("SpeakerAB", "A+B", 204, y + 78, 52, 30, "pad", { PrettyName = "Speakers~A and B", ButtonStyle = "Trigger" })
+      cap("DISPLAY", 280, y + 82, 56)
+      ui.button("DisplayBright", "BRIGHT", 340, y + 78, 88, 30, "pad", { PrettyName = "Display~Bright", ButtonStyle = "Trigger", FontSize = 11 })
+      ui.button("DisplayDim", "DIM", 434, y + 78, 88, 30, "pad", { PrettyName = "Display~Dim", ButtonStyle = "Trigger", FontSize = 11 })
+      ui.button("DisplayOff", "OFF", 528, y + 78, 88, 30, "pad", { PrettyName = "Display~Off", ButtonStyle = "Trigger", FontSize = 11 })
+      y = y + 128
     else
-      ui.hide("VolumeDown", "Volume~Down")
-      ui.hide("VolumeUp", "Volume~Up")
-      ui.hide("IrOnline", "Volume~IR Gateway Online")
-      ui.hide("IrText", "Volume~IR Status")
-      ui.hint("Volume isn't in the CXA serial protocol. Turn on IR Volume in Properties to add it.", 280)
+      hideAll(irCtl)
     end
+
+    ui.section("Feedback", 8, y, 624, 56)
+    ui.readout("FeedbackText", "Feedback~Source of Truth", 24, y + 28, 592, 20, { FontSize = 11, TextColor = N.sub })
+    y = y + 64
+
+    ui.hint(ir and "Hold VOL to ramp. IR is one-way: volume, speakers and display have no feedback."
+      or "Volume, speakers and display need IR: turn on IR in Properties.", y)
 
   else -- Setup
-    ui.page(ir and 504 or 400)
+    local h = 64
+    if rs ~= "off" then h = h + 144 + 152 end
+    if ir then h = h + 112 end
+    if tm.out or tm.sense then h = h + 80 end
+    h = h + 72 + 32
+    ui.page(h)
     ui.header(WORD, "Setup", "DeviceName", "Status", "Online", props["page_index"].Value)
+    local y = 64
 
-    ui.section("Connection", 8, 64, 624, 136)
-    cap("LINK", 22, 98, 72)
-    ui.readout("LinkText", "Setup~Link", 96, 96, 400, 24, { FontSize = 11 })
-    ui.button("Connect", tcp and "CONNECT" or "REOPEN", 504, 94, 112, 28, "primary", { PrettyName = "Setup~Connect" })
-    if tcp then
-      cap("GATEWAY IP", 22, 132, 72)
-      ui.field("IPAddress", "Setup~Gateway IP", 96, 130, 200, 24)
-      cap("PORT", 312, 132, 40)
-      ui.field("Port", "Setup~Gateway Port", 352, 130, 96, 24)
+    local rsCtl = { { "LinkText", "RS-232~Link" }, { "Connect", "RS-232~Connect" }, { "IPAddress", "RS-232~Gateway IP" },
+                    { "Port", "RS-232~Gateway Port" }, { "LastError", "RS-232~Last Error" }, { "ModelText", "Amplifier~Model" },
+                    { "ProtocolText", "Amplifier~Protocol Version" }, { "FirmwareText", "Amplifier~Firmware" },
+                    { "Refresh", "Amplifier~Refresh" }, { "LastMessage", "Amplifier~Last Message" } }
+    if rs ~= "off" then
+      ui.section("RS-232", 8, y, 624, 136)
+      cap("LINK", 22, y + 34, 72)
+      ui.readout("LinkText", "RS-232~Link", 96, y + 32, 400, 24, { FontSize = 11 })
+      ui.button("Connect", rs == "tcp" and "CONNECT" or "REOPEN", 504, y + 30, 112, 28, "primary", { PrettyName = "RS-232~Connect" })
+      if rs == "tcp" then
+        cap("GATEWAY IP", 22, y + 68, 72)
+        ui.field("IPAddress", "RS-232~Gateway IP", 96, y + 66, 200, 24)
+        cap("PORT", 312, y + 68, 40)
+        ui.field("Port", "RS-232~Gateway Port", 352, y + 66, 96, 24)
+      else
+        cap("WIRING", 22, y + 68, 72)
+        ui.label("Wire the RS-232 pin to a Q-SYS serial port. 9600 8N1.", 96, y + 68, 520, 20, "Left", 11, N.sub)
+        ui.hide("IPAddress", "RS-232~Gateway IP")
+        ui.hide("Port", "RS-232~Gateway Port")
+      end
+      cap("ERROR", 22, y + 102, 72)
+      ui.readout("LastError", "RS-232~Last Error", 96, y + 100, 520, 24, { TextColor = S.fault, FontSize = 11 })
+      y = y + 144
+
+      ui.section("Amplifier", 8, y, 624, 144)
+      cap("MODEL", 22, y + 34, 72)
+      ui.readout("ModelText", "Amplifier~Model", 96, y + 32, 208, 24, { FontSize = 11 })
+      cap("PROTOCOL", 330, y + 34, 72)
+      ui.readout("ProtocolText", "Amplifier~Protocol Version", 404, y + 32, 212, 24, { FontSize = 11 })
+      cap("FIRMWARE", 22, y + 66, 72)
+      ui.readout("FirmwareText", "Amplifier~Firmware", 96, y + 64, 400, 24, { FontSize = 11 })
+      ui.button("Refresh", "REFRESH", 504, y + 62, 112, 28, "secondary", { PrettyName = "Amplifier~Refresh" })
+      cap("LAST RX", 22, y + 98, 72)
+      ui.readout("LastMessage", "Amplifier~Last Message", 96, y + 96, 520, 24, { FontSize = 11 })
+      y = y + 152
     else
-      cap("WIRING", 22, 132, 72)
-      ui.label("Wire the RS-232 pin to a Q-SYS serial port. 9600 8N1.", 96, 132, 520, 20, "Left", 11, N.sub)
-      ui.hide("IPAddress", "Setup~Gateway IP")
-      ui.hide("Port", "Setup~Gateway Port")
+      hideAll(rsCtl)
     end
-    cap("ERROR", 22, 166, 72)
-    ui.readout("LastError", "Setup~Last Error", 96, 164, 520, 24, { TextColor = S.fault, FontSize = 11 })
 
-    ui.section("Amplifier", 8, 208, 624, 144)
-    cap("MODEL", 22, 242, 72)
-    ui.readout("ModelText", "Amplifier~Model", 96, 240, 208, 24, { FontSize = 11 })
-    cap("PROTOCOL", 330, 242, 72)
-    ui.readout("ProtocolText", "Amplifier~Protocol Version", 404, 240, 212, 24, { FontSize = 11 })
-    cap("FIRMWARE", 22, 274, 72)
-    ui.readout("FirmwareText", "Amplifier~Firmware", 96, 272, 400, 24, { FontSize = 11 })
-    ui.button("Refresh", "REFRESH", 504, 270, 112, 28, "secondary", { PrettyName = "Amplifier~Refresh" })
-    cap("LAST RX", 22, 306, 72)
-    ui.readout("LastMessage", "Amplifier~Last Message", 96, 304, 520, 24, { FontSize = 11 })
-
-    local hy = 360
     if ir then
-      ui.section("IR Gateway", 8, 360, 624, 104)
-      cap("GATEWAY IP", 22, 394, 72)
-      ui.field("IrAddress", "IR Gateway~IP Address", 96, 392, 200, 24)
-      cap("IR PORT", 312, 394, 56)
-      ui.combo("IrPort", "IR Gateway~IR Port", 372, 392, 96, 24)
-      cap("STATUS", 22, 428, 72)
-      ui.readout("IrText", "IR Gateway~Status", 96, 426, 520, 24, { FontSize = 11 })
-      hy = 472
+      ui.section("IR Gateway", 8, y, 624, 104)
+      cap("GATEWAY IP", 22, y + 34, 72)
+      ui.field("IrAddress", "IR Gateway~IP Address", 96, y + 32, 200, 24)
+      cap("IR PORT", 312, y + 34, 56)
+      ui.combo("IrPort", "IR Gateway~IR Port", 372, y + 32, 96, 24)
+      ui.button("IrConnect", "CONNECT", 504, y + 30, 112, 28, "primary", { PrettyName = "IR Gateway~Connect" })
+      cap("STATUS", 22, y + 68, 72)
+      ui.led("IrOnline", "IR Gateway~Online", 96, y + 70, 16, "ok")
+      ui.readout("IrText", "IR Gateway~Status", 120, y + 66, 496, 24, { FontSize = 11 })
+      y = y + 112
     else
-      ui.hide("IrAddress", "IR Gateway~IP Address")
-      ui.hide("IrPort", "IR Gateway~IR Port")
+      hideAll({ { "IrAddress", "IR Gateway~IP Address" }, { "IrPort", "IR Gateway~IR Port" }, { "IrConnect", "IR Gateway~Connect" },
+                { "IrText", "IR Gateway~Status" }, { "IrOnline", "IR Gateway~Online" } })
     end
-    ui.hint(tcp and "Set the gateway's serial side to 9600 8N1 and its TCP side to raw pass-through."
-      or "Changes made on the amp or its remote show up here too: the amp reports them itself.", hy)
+
+    if tm.out or tm.sense then
+      ui.section("12 V Trigger", 8, y, 624, 72)
+      cap("OUT", 22, y + 38, 32)
+      ui.led("TriggerOut", "Trigger~Out (to GPIO)", 56, y + 40, 16, "ok")
+      cap("SENSE", 88, y + 38, 44)
+      ui.led("TriggerSense", "Trigger~Sense (from GPIO)", 136, y + 40, 16, "ok")
+      ui.readout("TriggerText", "Trigger~Status", 168, y + 36, 448, 24, { FontSize = 11 })
+      y = y + 80
+    else
+      hideAll({ { "TriggerOut", "Trigger~Out (to GPIO)" }, { "TriggerSense", "Trigger~Sense (from GPIO)" }, { "TriggerText", "Trigger~Status" } })
+    end
+
+    ui.section("Control Paths", 8, y, 624, 64)
+    ui.readout("PathText", "Paths~Routing", 24, y + 32, 592, 24, { FontSize = 10 })
+    y = y + 72
+
+    ui.hint(rs == "tcp" and "Set the serial gateway to 9600 8N1, raw TCP pass-through."
+      or (rs == "off" and "Without RS-232, mute and source show the last command sent, not the amp's state."
+      or "Changes made on the amp or its remote show up here too: the amp reports them itself."), y)
   end
 
   return layout, graphics
@@ -572,21 +671,34 @@ end
 if Controls then
   local MODEL = modelOf(Properties)
   local LIST = SOURCES[MODEL]
-  local TCP = isTcp(Properties)
+  local RS = rsMode(Properties)            -- "off" | "serial" | "tcp"
+  local TCP = RS == "tcp"
+  local IR = hasIr(Properties)
+  local TRIG = trigMode(Properties)
+  local CODESET = Properties["IR Code Set"].Value
+  local IR_WAKE = Properties["IR Power-On Wait (s)"].Value
+  local SOURCE_POWERS_ON = Properties["Power On With Source"].Value == "Yes"
   local POLL = Properties["Poll Interval (s)"].Value
   local DEBUG = Properties["Debug Print"].Value
   local TICK = 0.1             -- main timer period (s)
   local REPLY_TIMEOUT = 1.5    -- the protocol says every command gets a reply or an error
   local MISSES_OFFLINE = 2     -- unanswered commands in a row before we call the amp offline
-  local RECONNECT_EVERY = 5    -- TCP gateway reconnect interval (s)
+  local RECONNECT_EVERY = 5    -- TCP reconnect interval (s), both gateways
   local HOLD = 2.0             -- keep the user's choice on screen this long while the amp catches up
-  local IR = hasIr(Properties)
+  local BUSY_RETRIES = 6       -- "#00,04" retries (1 s apart) for a setter sent while the amp is starting up
   local IR_TCP_PORT = 4998     -- Global Cache Unified TCP API
-  local IR_SYSTEM = 16         -- CXA IR codes: RC-5 system 16
-  local IR_VOL_UP, IR_VOL_DOWN = 16, 17
-  local IR_FIRST_REPEAT = 0.4  -- a tap sends one frame (one step); holding longer than this starts the ramp
+  local IR_FIRST_REPEAT = 0.4  -- a volume tap sends one frame (one step); holding longer starts the ramp
   local IR_RESEND = 0.3        -- resend the held code this often...
   local IR_REPEAT = 4          -- ...with this many frames (4 x 114 ms outlasts the resend gap)
+  local IR_FRAMES = 2          -- frames per discrete command (same toggle bit, so one key press)
+  local IR_DONE_TIMEOUT = 1.0  -- wait this long for completeir before sending the next code
+  local IR_KEEPALIVE = 30      -- getdevices this often; no answer in 5 s means the gateway is gone
+
+  -- IR codes (see the header). sys16 = everything; sys25 = power and display on the CX Series sheet.
+  local IRC = { powerOn = 14, powerOff = 15, muteOn = 50, muteOff = 51, volUp = 16, volDown = 17,
+                srcUp = 99, srcDown = 126, spkAB = 30, spkA = 35, spkB = 39, bright = 18, dim = 19, lcdOff = 71 }
+  local SYS_MAIN = { 16 }
+  local SYS_POWER = CODESET:find("^CXA") and { 16 } or (CODESET:find("^CX Series") and { 25 } or { 16, 25 })
 
   local ERRORS = {
     ["01"] = "Command group unknown (#00,01)",
@@ -605,17 +717,21 @@ if Controls then
   -- state ------------------------------------------------------------
   mainTimer = Timer.New()      -- global on purpose, like sockets, so it is not collected
   if TCP then sock = TcpSocket.New() end
+  if IR then irSock = TcpSocket.New() end
 
   local tick = 0
   local link = { open = false, lastTry = -100, rxBuf = "" }
-  local amp = { power = nil, mute = nil, source = nil, protocol = nil, firmware = nil }
-  local queue = {}             -- { key, cmd, expect } waiting to go out; setters with the same key replace each other
-  local inflight = nil         -- { key, cmd, expect, sentAt }
+  -- amp state; *Src says where it came from: "rs232", "trigger" or "assumed" (last command sent)
+  local amp = { power = nil, mute = nil, source = nil, protocol = nil, firmware = nil, powerSrc = nil, muteSrc = nil, sourceSrc = nil }
+  local queue = {}             -- RS-232 { key, cmd, expect, busyRetries, fallback } waiting to go out
+  local inflight = nil
+  local later = {}             -- { at, fn } delayed actions (busy retries, IR power-on wait)
   local misses = 0
-  local online = false
+  local online = false         -- RS-232 answering
   local lastPoll = -100
   local hold = {}              -- "power" / "mute" / "source" -> tick until which the user's value stays shown
   local userError = ""
+  local render, setStatus      -- defined below
 
   local function byCode(code)
     for i, s in ipairs(LIST) do if s.code == code then return i, s end end
@@ -627,29 +743,204 @@ if Controls then
     if msg and msg ~= "" then dbg("err", "CXA: " .. msg) end
   end
 
-  local function setStatus()
-    local code, text
-    if not link.open then
-      code, text = 4, TCP and "Not connected to gateway" or "Serial port not open"
-    elseif not online then
-      code, text = 2, "No reply from amplifier"
-    else
-      code, text = 0, ""
+  local function after(seconds, fn) table.insert(later, { at = tick + seconds, fn = fn }) end
+
+  local function rsReady() return RS ~= "off" and link.open and online end
+
+  --===================================================================
+  -- IR (Global Cache gateway)
+  --===================================================================
+  -- RC-5 frame as Global Cache on/off counts of 36 kHz carrier cycles. One half-bit is 889 us = 32 cycles.
+  local function rc5Counts(system, command, toggle)
+    local bits = { 1, command < 64 and 1 or 0, toggle }   -- start bit, field bit (inverted command bit 6), toggle
+    for i = 4, 0, -1 do table.insert(bits, math.floor(system / 2 ^ i) % 2) end
+    for i = 5, 0, -1 do table.insert(bits, math.floor(command / 2 ^ i) % 2) end
+    local halves = {}                  -- true = carrier on (mark)
+    for _, b in ipairs(bits) do
+      table.insert(halves, b == 0)     -- Manchester: 1 = space then mark, 0 = mark then space
+      table.insert(halves, b == 1)
     end
-    Controls.Status.Value = code
-    Controls.Status.String = text
-    setBool(Controls.Online, code == 0)
+    while halves[1] == false do table.remove(halves, 1) end   -- the frame starts at the first mark
+    local counts, run, total = {}, 0, 0
+    for i, h in ipairs(halves) do
+      run = run + 32
+      if halves[i + 1] ~= h then
+        table.insert(counts, run) ; total = total + run ; run = 0
+      end
+    end
+    if #counts % 2 == 1 then table.insert(counts, 0) end     -- ends on a mark: add the gap as the last off
+    counts[#counts] = counts[#counts] + (64 * 64 - 32 - total)   -- pad to 64 bit times per frame
+    return table.concat(counts, ",")
   end
 
-  -- rendering --------------------------------------------------------
+  local ir = { open = false, lastTry = -100, held = nil, heldSince = 0, lastSend = 0, toggle = 0, buf = "",
+               queue = {}, inflight = nil, nextId = 1, lastKeep = 0, keepSent = nil }
+
+  local function irPort()
+    local m, p = (Controls.IrPort.String or ""):match("^(%d+):(%d+)$")
+    return m and (m .. ":" .. p) or "1:1"
+  end
+
+  local function irStatus(text, isError)
+    setText(Controls.IrText, text)
+    setBool(Controls.IrOnline, ir.open)
+    if isError then dbg("err", "CXA IR: " .. text) end
+  end
+
+  local function irReady() return IR and ir.open end
+
+  local function irConnect()
+    ir.lastTry = tick
+    local ip = (Controls.IrAddress.String or ""):match("^%s*(.-)%s*$")
+    pcall(function() irSock:Disconnect() end)
+    ir.open, ir.inflight, ir.keepSent = false, nil, nil
+    if ip == "" then irStatus("Type the IR gateway's IP address on the Setup page") ; if setStatus then setStatus() end ; return end
+    irStatus("Connecting to " .. ip .. ":" .. IR_TCP_PORT)
+    irSock:Connect(ip, IR_TCP_PORT)
+  end
+
+  local function irWrite(line)
+    if not ir.open then return false end
+    dbg("all", "IR -> " .. line:sub(1, 48))
+    local ok = pcall(function() irSock:Write(line .. "\r") end)
+    return ok
+  end
+
+  local function irSendir(system, command, repeats, id)
+    return irWrite(string.format("sendir,%s,%d,36000,%d,1,%s", irPort(), id, repeats, rc5Counts(system, command, ir.toggle)))
+  end
+
+  local function irPump()
+    if ir.inflight or ir.held or not ir.open then return end
+    local item = table.remove(ir.queue, 1)
+    if not item then return end
+    if item.wait then                       -- a pause (e.g. power-on wait before a source code)
+      ir.inflight = { id = -1, sentAt = tick, untilT = tick + item.wait }
+      return
+    end
+    ir.toggle = 1 - ir.toggle               -- each queued code is a new key press
+    local id = ir.nextId
+    ir.nextId = ir.nextId % 65000 + 1
+    ir.inflight = { id = id, sentAt = tick, untilT = tick + IR_DONE_TIMEOUT }
+    irSendir(item.system, item.command, IR_FRAMES, id)
+    irStatus("Sent " .. item.label)
+  end
+
+  -- queue one IR code on each system in systems; returns false when IR can't be used
+  local function irCode(systems, command, label)
+    if not irReady() then return false end
+    for _, s in ipairs(systems) do table.insert(ir.queue, { system = s, command = command, label = label }) end
+    irPump()
+    return true
+  end
+
+  local function irWait(seconds)
+    table.insert(ir.queue, { wait = seconds })
+  end
+
+  local function irVolume(command, down)
+    if not irReady() then
+      if down then irStatus(IR and "IR gateway not connected: no volume" or "IR is off in Properties", true) end
+      return
+    end
+    if down then
+      if ir.inflight and ir.inflight.id > 0 then irWrite("stopir," .. irPort()) end
+      ir.inflight = nil
+      ir.toggle = 1 - ir.toggle
+      ir.held, ir.heldSince, ir.lastSend = command, tick, tick
+      irSendir(16, command, 1, 60000 + command)
+      irStatus(command == IRC.volUp and "Volume up" or "Volume down")
+    elseif ir.held == command then
+      ir.held = nil
+      irWrite("stopir," .. irPort())
+      irStatus("Ready, port " .. irPort())
+      irPump()
+    end
+  end
+
+  local function irTick()
+    if not IR then return end
+    if ir.held and tick - ir.heldSince >= IR_FIRST_REPEAT and tick - ir.lastSend >= IR_RESEND then
+      irSendir(16, ir.held, IR_REPEAT, 60000 + ir.held)
+      ir.lastSend = tick
+    end
+    if ir.inflight and tick >= ir.inflight.untilT then ir.inflight = nil ; irPump() end
+    if ir.open then
+      if ir.keepSent and tick - ir.keepSent > 5 then
+        ir.open = false
+        irStatus("IR gateway stopped answering", true)
+        setStatus()
+        irConnect()
+      elseif not ir.keepSent and tick - ir.lastKeep >= IR_KEEPALIVE and not ir.held then
+        ir.lastKeep, ir.keepSent = tick, tick
+        irWrite("getdevices")
+      end
+    elseif tick - ir.lastTry >= RECONNECT_EVERY then
+      irConnect()
+    end
+  end
+
+  if IR then
+    irSock.ReconnectTimeout = 0
+    irSock.EventHandler = function(s, evt, err)
+      if evt == TcpSocket.Events.Connected then
+        ir.open, ir.lastKeep, ir.keepSent = true, tick, nil
+        irStatus("Ready, port " .. irPort())
+        setStatus()
+        irPump()
+      elseif evt == TcpSocket.Events.Data then
+        ir.buf = ir.buf .. (s:Read(s.BufferLength) or "")
+        while true do
+          local cr = ir.buf:find("[\r\n]")
+          if not cr then break end
+          local line = ir.buf:sub(1, cr - 1)
+          ir.buf = ir.buf:sub(cr + 1)
+          if line ~= "" then
+            dbg("all", "IR <- " .. line)
+            ir.keepSent = nil
+            local doneId = line:match("^completeir,[%d:]+,(%d+)")
+            if doneId then
+              if ir.inflight and ir.inflight.id == tonumber(doneId) then ir.inflight = nil ; irPump() end
+            elseif line:find("^ERR") then
+              irStatus("Gateway error " .. line, true)
+              ir.inflight = nil ; irPump()
+            elseif line:lower():find("^busyir") then
+              irStatus("Gateway busy sending another code")
+            end
+          end
+        end
+        if #ir.buf > 1024 then ir.buf = "" end
+      elseif evt == TcpSocket.Events.Closed or evt == TcpSocket.Events.Error or evt == TcpSocket.Events.Timeout then
+        ir.open, ir.inflight, ir.held = false, nil, nil
+        ir.lastTry = tick
+        irStatus(evt == TcpSocket.Events.Closed and "IR gateway closed the connection"
+          or ("IR gateway " .. tostring(evt) .. " " .. tostring(err or "")), true)
+        setStatus()
+      end
+    end
+  end
+
+  --===================================================================
+  -- rendering
+  --===================================================================
   local function held(key) return hold[key] and tick < hold[key] end
 
-  local function render()
+  local function feedbackText()
+    if rsReady() then return "Live from RS-232: power, mute and source are the amp's real state" end
+    local parts = {}
+    if TRIG.sense then table.insert(parts, "power from the 12 V trigger") end
+    if RS ~= "off" then table.insert(parts, 1, "RS-232 not answering") end
+    table.insert(parts, (TRIG.sense and "mute and source" or "power, mute and source") .. " assumed from the last command")
+    return (table.concat(parts, "; "):gsub("^%l", string.upper))
+  end
+
+  function render()
     local power = amp.power
     if held("power") then power = hold.powerValue end
     setBool(Controls.Power, power == true)
     setBool(Controls.PowerLed, power == true)
-    setText(Controls.PowerText, power == nil and "Unknown" or (power and "On" or "Standby"))
+    local assumed = amp.powerSrc == "assumed" and not held("power")
+    setText(Controls.PowerText, power == nil and "Unknown" or ((power and "On" or "Standby") .. (assumed and "?" or "")))
 
     local mute = amp.mute
     if held("mute") then mute = hold.muteValue end
@@ -667,15 +958,43 @@ if Controls then
     if Controls.SourceCode.Value ~= (code or -1) then Controls.SourceCode.Value = code or -1 end
 
     local name = MODEL
-    if online and power ~= nil then
+    if power ~= nil then
       name = name .. "  " .. (power and ((s and s.name or "") .. (mute and "  MUTED" or "")) or "Standby")
     end
     setText(Controls.DeviceName, name)
     setText(Controls.ProtocolText, amp.protocol or "")
     setText(Controls.FirmwareText, amp.firmware or "")
+    setText(Controls.FeedbackText, feedbackText())
   end
 
-  -- transport --------------------------------------------------------
+  function setStatus()
+    local code, text
+    local rsOk, irOk = rsReady(), irReady()
+    local trigOnly = RS == "off" and not IR and (TRIG.out or TRIG.sense)
+    if RS == "off" and not IR and not TRIG.out and not TRIG.sense then
+      code, text = 2, "No control path: set RS-232, IR or 12V Trigger in Properties"
+    elseif RS ~= "off" then
+      if rsOk then
+        code, text = (IR and not irOk) and 1 or 0, (IR and not irOk) and "IR gateway offline: no volume" or ""
+      elseif irOk then
+        code, text = 1, "RS-232 not answering: using IR, no feedback"
+      else
+        code, text = 2, link.open and "No reply from amplifier" or (TCP and "Not connected to serial gateway" or "Serial port not open")
+      end
+    elseif IR then
+      code, text = irOk and 0 or 2, irOk and "IR control, no feedback" or "IR gateway offline"
+    elseif trigOnly then
+      code, text = 0, "12 V trigger only"
+    end
+    Controls.Status.Value = code
+    Controls.Status.String = text
+    setBool(Controls.Online, code <= 1)
+    render()
+  end
+
+  --===================================================================
+  -- RS-232
+  --===================================================================
   local function write(cmd)
     local data = "#" .. cmd .. "\r"
     dbg("all", "-> " .. cmd)
@@ -699,12 +1018,12 @@ if Controls then
   end
 
   -- key: commands with the same key replace one another (a later source press wins).
-  -- expect: the reply group that answers it ("02", "04" or "14").
-  local function enqueue(key, cmd, expect)
+  -- expect: the reply group that answers it. fallback: what to do over IR if RS-232 never answers.
+  local function enqueue(key, cmd, expect, fallback)
     for _, q in ipairs(queue) do
-      if q.key == key then q.cmd = cmd ; q.expect = expect ; return end
+      if q.key == key then q.cmd, q.expect, q.fallback, q.busyRetries = cmd, expect, fallback, BUSY_RETRIES ; return end
     end
-    table.insert(queue, { key = key, cmd = cmd, expect = expect })
+    table.insert(queue, { key = key, cmd = cmd, expect = expect, fallback = fallback, busyRetries = BUSY_RETRIES })
     pump()
   end
 
@@ -721,8 +1040,8 @@ if Controls then
     misses = 0
     if not online then
       online = true
-      setStatus()
       if userError:find("^No reply") then setError("") end
+      setStatus()
       poll(true)
     end
   end
@@ -737,35 +1056,34 @@ if Controls then
     local gi, ni = tonumber(g), tonumber(n)
     heard()
 
-    local answered = false
     if gi == 0 then
       local e = string.format("%02d", ni)
-      if inflight then
-        local isQuery = inflight.key:sub(1, 1) == "q"
-        local what = inflight.cmd
-        inflight = nil
-        if not isQuery then
-          if e == "04" then
-            setError(ERRORS[e] .. ((amp.power == false) and ": the amp is in standby" or "") .. " [#" .. what .. "]")
-          else
-            setError((ERRORS[e] or ("Error " .. e)) .. " [#" .. what .. "]")
-          end
-          hold = {}            -- show the amp's real state again
+      local cmd = inflight
+      inflight = nil
+      if cmd and cmd.key:sub(1, 1) ~= "q" then
+        if e == "04" and cmd.busyRetries > 0 and amp.power ~= false then
+          -- the amp is on (or powering on) but not ready yet: try again shortly
+          cmd.busyRetries = cmd.busyRetries - 1
+          after(1, function() table.insert(queue, 1, cmd) ; pump() end)
         else
-          dbg("all", "query #" .. what .. " refused: " .. (ERRORS[e] or e))
+          setError((ERRORS[e] or ("Error " .. e)) .. ((e == "04" and amp.power == false) and ": the amp is in standby" or "")
+            .. " [#" .. cmd.cmd .. "]")
+          hold = {}            -- show the amp's real state again
         end
-        render()
+      elseif cmd then
+        dbg("all", "query #" .. cmd.cmd .. " refused: " .. (ERRORS[e] or e))
       end
+      render()
       pump()
       return
     elseif gi == 2 and ni == 1 then
-      amp.power = (d == "1")
+      amp.power, amp.powerSrc = (d == "1"), "rs232"
       if hold.powerValue == amp.power then hold.power = nil end
     elseif gi == 2 and ni == 3 then
-      amp.mute = (d == "1")
+      amp.mute, amp.muteSrc = (d == "1"), "rs232"
       if hold.muteValue == amp.mute then hold.mute = nil end
     elseif gi == 4 and ni == 1 then
-      amp.source = tonumber(d)
+      amp.source, amp.sourceSrc = tonumber(d), "rs232"
       if hold.sourceValue == amp.source then hold.source = nil end
     elseif gi == 14 and ni == 1 then
       amp.protocol = d
@@ -773,6 +1091,7 @@ if Controls then
       amp.firmware = d
     end
 
+    local answered = false
     if inflight and tonumber(inflight.expect) == gi then
       inflight = nil
       answered = true
@@ -798,11 +1117,14 @@ if Controls then
     link.open = false
     link.lastTry = tick
     link.rxBuf = ""
+    -- setters still waiting go out over IR instead
+    local pending = queue
+    if inflight then table.insert(pending, 1, inflight) end
     inflight, queue = nil, {}
+    for _, q in ipairs(pending) do if q.fallback then q.fallback() end end
     online = false
     if reason then setError(reason) end
     setStatus()
-    render()
   end
 
   local function linkUp()
@@ -814,13 +1136,14 @@ if Controls then
   end
 
   local function connect()
+    if RS == "off" then return end
     link.lastTry = tick
     if TCP then
       local ip = (Controls.IPAddress.String or ""):match("^%s*(.-)%s*$")
       local port = tonumber(Controls.Port.String)
       if ip == "" or not port then
         linkDown(nil)
-        setText(Controls.LinkText, "Type the gateway's IP address and port")
+        setText(Controls.LinkText, "Type the serial gateway's IP address and port")
         return
       end
       setText(Controls.LinkText, string.format("TCP %s:%d (serial-to-IP gateway)", ip, port))
@@ -841,23 +1164,21 @@ if Controls then
 
   if TCP then
     sock.ReconnectTimeout = 0  -- reconnects are handled by mainTimer
-    sock.ReadTimeout = 0
-    sock.WriteTimeout = 0
     sock.EventHandler = function(s, evt, err)
       if evt == TcpSocket.Events.Connected then
         setError("")
         linkUp()
       elseif evt == TcpSocket.Events.Data then
-        onData(s:Read(s.BufferLength))
+        onData(s:Read(s.BufferLength) or "")
       elseif evt == TcpSocket.Events.Closed then
-        linkDown("Gateway closed the connection")
+        linkDown("Serial gateway closed the connection")
       elseif evt == TcpSocket.Events.Error then
-        linkDown("Gateway socket error: " .. tostring(err))
+        linkDown("Serial gateway socket error: " .. tostring(err))
       elseif evt == TcpSocket.Events.Timeout then
-        linkDown("Gateway socket timeout")
+        linkDown("Serial gateway socket timeout")
       end
     end
-  elseif SerialPorts and SerialPorts[1] then
+  elseif RS == "serial" and SerialPorts and SerialPorts[1] then
     SerialPorts[1].EventHandler = function(port, evt, err)
       if evt == SerialPorts.Events.Connected then
         setError("")
@@ -873,134 +1194,168 @@ if Controls then
     end
   end
 
-  -- IR volume ---------------------------------------------------------
-  -- RC-5 frame as Global Cache on/off counts of 36 kHz carrier cycles. One half-bit is 889 us = 32 cycles.
-  local function rc5Counts(system, command, toggle)
-    local bits = { 1, 1, toggle }
-    for i = 4, 0, -1 do table.insert(bits, math.floor(system / 2 ^ i) % 2) end
-    for i = 5, 0, -1 do table.insert(bits, math.floor(command / 2 ^ i) % 2) end
-    local halves = {}                  -- true = carrier on (mark)
-    for _, b in ipairs(bits) do
-      table.insert(halves, b == 0)     -- Manchester: 1 = space then mark, 0 = mark then space
-      table.insert(halves, b == 1)
-    end
-    while halves[1] == false do table.remove(halves, 1) end   -- the frame starts at the first mark
-    local counts, run, total = {}, 0, 0
-    for i, h in ipairs(halves) do
-      run = run + 32
-      if halves[i + 1] ~= h then
-        table.insert(counts, run) ; total = total + run ; run = 0
-      end
-    end
-    if #counts % 2 == 1 then table.insert(counts, 0) end     -- ends on a mark: add the gap as the last off
-    counts[#counts] = counts[#counts] + (64 * 64 - 32 - total)   -- pad to 64 bit times per frame
-    return table.concat(counts, ",")
+  --===================================================================
+  -- 12 V trigger
+  --===================================================================
+  local function triggerText()
+    local t = {}
+    if TRIG.out then table.insert(t, "out " .. (Controls.TriggerOut.Boolean and "12 V (on)" or "0 V (standby)")) end
+    if TRIG.sense then table.insert(t, "sense " .. (Controls.TriggerSense.Boolean and "amp on" or "amp off")) end
+    setText(Controls.TriggerText, table.concat(t, ", "))
   end
 
-  local ir = { open = false, lastTry = -100, held = nil, heldSince = 0, lastSend = 0, toggle = 0, buf = "" }
-  if IR then irSock = TcpSocket.New() end   -- global on purpose, like sock
-
-  local function irPort()
-    local p = (Controls.IrPort.String or ""):match("^1:([123])$")
-    return "1:" .. (p or "1")
-  end
-
-  local function irStatus(text, isError)
-    setText(Controls.IrText, text)
-    setBool(Controls.IrOnline, ir.open)
-    if isError then dbg("err", "CXA IR: " .. text) end
-  end
-
-  local function irConnect()
-    ir.lastTry = tick
-    local ip = (Controls.IrAddress.String or ""):match("^%s*(.-)%s*$")
-    if ip == "" then ir.open = false ; irStatus("Type the IR gateway's IP address on the Setup page") ; return end
-    pcall(function() irSock:Disconnect() end)
-    ir.open = false
-    irStatus("Connecting to " .. ip .. ":" .. IR_TCP_PORT)
-    irSock:Connect(ip, IR_TCP_PORT)
-  end
-
-  local function irWrite(line)
-    if not ir.open then irStatus("IR gateway not connected", true) ; return end
-    dbg("all", "IR -> " .. line:sub(1, 40))
-    pcall(function() irSock:Write(line .. "\r") end)
-  end
-
-  local function irSend(command, repeats)
-    local id = command * 2 + ir.toggle
-    irWrite(string.format("sendir,%s,%d,36000,%d,1,%s", irPort(), id, repeats, rc5Counts(IR_SYSTEM, command, ir.toggle)))
-    ir.lastSend = tick
-  end
-
-  local function irPress(dir, down)
-    if down then
-      ir.toggle = 1 - ir.toggle        -- a new key press
-      ir.held, ir.heldSince = dir, tick
-      irSend(dir, 1)
-      irStatus(dir == IR_VOL_UP and "Volume up" or "Volume down")
-    elseif ir.held == dir then
-      ir.held = nil
-      irWrite("stopir," .. irPort())
-      irStatus("Ready, " .. irPort())
+  local function onTriggerSense()
+    if not TRIG.sense then return end
+    triggerText()
+    if not rsReady() then
+      amp.power, amp.powerSrc = Controls.TriggerSense.Boolean, "trigger"
+      render()
     end
   end
 
-  local function irTick()
-    if ir.held and tick - ir.heldSince >= IR_FIRST_REPEAT and tick - ir.lastSend >= IR_RESEND then
-      irSend(ir.held, IR_REPEAT)
-    end
-    if not ir.open and tick - ir.lastTry >= RECONNECT_EVERY then irConnect() end
+  --===================================================================
+  -- commands: RS-232 first, IR as backup, trigger alongside
+  --===================================================================
+  local function noPath(what)
+    setError("Can't " .. what .. ": " .. (RS ~= "off" and "RS-232 isn't answering" or "no RS-232") ..
+      (IR and " and the IR gateway is offline" or " and IR is off"))
   end
 
-  if IR then
-    irSock.ReconnectTimeout = 0
-    irSock.EventHandler = function(s, evt, err)
-      if evt == TcpSocket.Events.Connected then
-        ir.open = true
-        irStatus("Ready, " .. irPort())
-      elseif evt == TcpSocket.Events.Data then
-        ir.buf = ir.buf .. (s:Read(s.BufferLength) or "")
-        while true do
-          local cr = ir.buf:find("[\r\n]")
-          if not cr then break end
-          local line = ir.buf:sub(1, cr - 1)
-          ir.buf = ir.buf:sub(cr + 1)
-          if line ~= "" then
-            dbg("all", "IR <- " .. line)
-            if line:find("^ERR") then irStatus("Gateway error " .. line, true)
-            elseif line:lower():find("^busyir") then irStatus("Gateway busy sending another code") end
-          end
-        end
-      else
-        ir.open = false
-        ir.lastTry = tick
-        irStatus((evt == TcpSocket.Events.Closed and "Gateway closed the connection" or ("Gateway " .. tostring(evt) .. " " .. tostring(err or ""))), true)
+  local function assume(field, value)
+    if not rsReady() then
+      if field ~= "power" or not TRIG.sense then
+        amp[field], amp[field .. "Src"] = value, "assumed"
       end
     end
   end
 
+  local function setPower(on)
+    hold.power, hold.powerValue = tick + HOLD, on
+    setError("")
+    if TRIG.out then setBool(Controls.TriggerOut, on) ; triggerText() end
+    local function viaIr()
+      return irCode(SYS_POWER, on and IRC.powerOn or IRC.powerOff, on and "power on" or "standby")
+    end
+    if rsReady() then
+      enqueue("power", "01,02," .. (on and "1" or "0"), "02", viaIr)
+    elseif not viaIr() and not TRIG.out then
+      noPath(on and "power on" or "go to standby")
+    end
+    assume("power", on)
+    render()
+  end
+
+  local function setMute(on)
+    hold.mute, hold.muteValue = tick + HOLD, on
+    setError("")
+    local function viaIr() return irCode(SYS_MAIN, on and IRC.muteOn or IRC.muteOff, on and "mute on" or "mute off") end
+    if rsReady() then
+      enqueue("mute", "01,04," .. (on and "1" or "0"), "02", viaIr)
+    elseif not viaIr() then
+      noPath(on and "mute" or "unmute")
+    end
+    assume("mute", on)
+    render()
+  end
+
+  local function setSource(entry)
+    hold.source, hold.sourceValue = tick + HOLD, entry.code
+    setError("")
+    -- without RS-232 an unknown power state counts as off: a discrete power-on is harmless if it was on
+    local wasOff = (amp.power == false) or (amp.power == nil and not rsReady())
+    local function viaIr()
+      if not irReady() then return false end
+      if SOURCE_POWERS_ON and wasOff then
+        irCode(SYS_POWER, IRC.powerOn, "power on")
+        irWait(IR_WAKE)
+      end
+      return irCode(SYS_MAIN, entry.ir, entry.name)
+    end
+    if SOURCE_POWERS_ON and wasOff then
+      if TRIG.out then setBool(Controls.TriggerOut, true) ; triggerText() end
+      hold.power, hold.powerValue = tick + HOLD, true
+    end
+    if rsReady() then
+      -- power on first; the source command retries on "#00,04" while the amp starts up
+      if SOURCE_POWERS_ON and wasOff then enqueue("power", "01,02,1", "02") end
+      enqueue("source", string.format("03,04,%02d", entry.code), "04", viaIr)
+    elseif not viaIr() then
+      noPath("select " .. entry.name)
+    end
+    if SOURCE_POWERS_ON and wasOff then assume("power", true) end
+    assume("source", entry.code)
+    render()
+  end
+
+  local function stepSource(dir)
+    setError("")
+    hold.source = nil
+    local function viaIr() return irCode(SYS_MAIN, dir > 0 and IRC.srcUp or IRC.srcDown, dir > 0 and "next source" or "previous source") end
+    if rsReady() then
+      -- next / previous are separate commands; let each press go out
+      table.insert(queue, { key = "step", cmd = dir > 0 and "03,02" or "03,03", expect = "04", busyRetries = BUSY_RETRIES, fallback = viaIr })
+      pump()
+    elseif viaIr() then
+      if amp.source then           -- move the assumed source along the front-panel order
+        local i = byCode(amp.source) or 1
+        amp.source, amp.sourceSrc = LIST[(i - 1 + dir) % #LIST + 1].code, "assumed"
+      end
+      render()
+    else
+      noPath("change source")
+    end
+  end
+
+  local function irOnly(command, label, systems)
+    return function()
+      if not irCode(systems or SYS_MAIN, command, label) then
+        irStatus(IR and ("IR gateway not connected: can't " .. label) or "IR is off in Properties", true)
+      end
+    end
+  end
+
+  --===================================================================
+  -- timer
+  --===================================================================
   mainTimer.EventHandler = function()
     tick = tick + TICK
+    -- delayed actions
+    if #later > 0 then
+      local due = {}
+      for i = #later, 1, -1 do
+        if tick >= later[i].at then table.insert(due, table.remove(later, i)) end
+      end
+      for i = #due, 1, -1 do due[i].fn() end
+    end
+    -- RS-232
     if inflight and tick - inflight.sentAt > REPLY_TIMEOUT then
-      dbg("all", "no reply to #" .. inflight.cmd)
+      local cmd = inflight
+      dbg("all", "no reply to #" .. cmd.cmd)
       inflight = nil
       misses = misses + 1
+      if cmd.fallback and irReady() then
+        dbg("all", "resending over IR: #" .. cmd.cmd)
+        cmd.fallback()
+      end
       if misses >= MISSES_OFFLINE and online then
         online = false
         setError("No reply from the amplifier: check power, cable and 9600 8N1")
+        -- anything else waiting goes over IR now
+        for _, q in ipairs(queue) do if q.fallback and irReady() then q.fallback() end end
+        queue = {}
         setStatus()
-        render()
       elseif misses >= MISSES_OFFLINE then
         queue = {}             -- offline: keep only the next poll going, so retries stay slow
       end
       pump()
     end
-    if link.open and not inflight and #queue == 0 and tick - lastPoll >= (online and POLL or 2) then
+    if RS ~= "off" and link.open and not inflight and #queue == 0 and tick - lastPoll >= (online and POLL or 2) then
       poll(false)
     end
     if TCP and not link.open and tick - link.lastTry >= RECONNECT_EVERY then connect() end
-    if IR then irTick() end
+    -- IR
+    irTick()
+    -- holds
     if (hold.power and not held("power")) or (hold.mute and not held("mute")) or (hold.source and not held("source")) then
       if not held("power") then hold.power = nil end
       if not held("mute") then hold.mute = nil end
@@ -1009,76 +1364,75 @@ if Controls then
     end
   end
 
-  -- commands ---------------------------------------------------------
-  local function setPower(on)
-    hold.power, hold.powerValue = tick + HOLD, on
-    setError("")
-    enqueue("power", "01,02," .. (on and "1" or "0"), "02")
-    render()
-  end
-
-  local function setMute(on)
-    hold.mute, hold.muteValue = tick + HOLD, on
-    setError("")
-    enqueue("mute", "01,04," .. (on and "1" or "0"), "02")
-    render()
-  end
-
-  local function setSource(code)
-    hold.source, hold.sourceValue = tick + HOLD, code
-    setError("")
-    enqueue("source", string.format("03,04,%02d", code), "04")
-    render()
-  end
-
-  local function stepSource(dir)
-    setError("")
-    hold.source = nil
-    -- next / previous are separate commands; let each press go out
-    table.insert(queue, { key = "step", cmd = dir > 0 and "03,02" or "03,03", expect = "04" })
-    pump()
-  end
-
-  -- controls ---------------------------------------------------------
+  --===================================================================
+  -- controls
+  --===================================================================
   Controls.Power.EventHandler = function(c) setPower(c.Boolean) end
   Controls.PowerOn.EventHandler = function() setPower(true) end
   Controls.PowerOff.EventHandler = function() setPower(false) end
   Controls.Mute.EventHandler = function(c) setMute(c.Boolean) end
+  Controls.MuteOn.EventHandler = function() setMute(true) end
+  Controls.MuteOff.EventHandler = function() setMute(false) end
   for i = 1, MAX_SOURCES do
     Controls.Source[i].EventHandler = function()
-      if LIST[i] then setSource(LIST[i].code) else render() end
+      if LIST[i] then setSource(LIST[i]) else render() end
     end
   end
   Controls.SourceSelect.EventHandler = function(c)
     for _, s in ipairs(LIST) do
-      if s.name == c.String then setSource(s.code) ; return end
+      if s.name == c.String then setSource(s) ; return end
     end
     render()
   end
   Controls.SourceNext.EventHandler = function() stepSource(1) end
   Controls.SourcePrev.EventHandler = function() stepSource(-1) end
-  Controls.Refresh.EventHandler = function() amp.protocol, amp.firmware = nil, nil ; poll(true) end
+  Controls.VolumeUp.EventHandler = function(c) irVolume(IRC.volUp, c.Boolean) end
+  Controls.VolumeDown.EventHandler = function(c) irVolume(IRC.volDown, c.Boolean) end
+  Controls.SpeakerA.EventHandler = irOnly(IRC.spkA, "speakers A")
+  Controls.SpeakerB.EventHandler = irOnly(IRC.spkB, "speakers B")
+  Controls.SpeakerAB.EventHandler = irOnly(IRC.spkAB, "speakers A+B")
+  Controls.DisplayBright.EventHandler = irOnly(IRC.bright, "display bright", SYS_POWER)
+  Controls.DisplayDim.EventHandler = irOnly(IRC.dim, "display dim", SYS_POWER)
+  Controls.DisplayOff.EventHandler = irOnly(IRC.lcdOff, "display off", SYS_POWER)
+  Controls.TriggerSense.EventHandler = onTriggerSense
+  Controls.Refresh.EventHandler = function() amp.protocol, amp.firmware = nil, nil ; if link.open then poll(true) end end
   Controls.Connect.EventHandler = function() setError("") ; connect() end
   Controls.IPAddress.EventHandler = function() setError("") ; connect() end
   Controls.Port.EventHandler = function() setError("") ; connect() end
-  Controls.VolumeUp.EventHandler = function(c) if IR then irPress(IR_VOL_UP, c.Boolean) end end
-  Controls.VolumeDown.EventHandler = function(c) if IR then irPress(IR_VOL_DOWN, c.Boolean) end end
   Controls.IrAddress.EventHandler = function() if IR then irConnect() end end
-  Controls.IrPort.EventHandler = function() if IR then irStatus(ir.open and ("Ready, " .. irPort()) or "") end end
+  Controls.IrConnect.EventHandler = function() if IR then irConnect() end end
+  Controls.IrPort.EventHandler = function() if IR then irStatus(ir.open and ("Ready, port " .. irPort()) or Controls.IrText.String) end end
 
-  -- startup ----------------------------------------------------------
+  --===================================================================
+  -- startup
+  --===================================================================
   local names = {}
   for _, s in ipairs(LIST) do table.insert(names, s.name) end
   Controls.SourceSelect.Choices = names
   for i = 1, MAX_SOURCES do Controls.Source[i].Legend = LIST[i] and LIST[i].label or "" end
+  Controls.IrPort.Choices = { "1:1", "1:2", "1:3" }
+  if not (Controls.IrPort.String or ""):match("^%d+:%d+$") then Controls.IrPort.String = "1:1" end
   setText(Controls.ModelText, MODEL == "CXA81" and "CXA81 / CXA81 Mk II" or MODEL)
   setText(Controls.LastMessage, "")
+
+  local paths = {}
+  local function route(what, list) if #list > 0 then table.insert(paths, what .. ": " .. table.concat(list, " > ")) end end
+  local pw, ms = {}, {}
+  if RS ~= "off" then table.insert(pw, "RS-232") ; table.insert(ms, "RS-232") end
+  if IR then table.insert(pw, "IR") ; table.insert(ms, "IR") end
+  if TRIG.out then table.insert(pw, "trigger") end
+  route("Power", pw) ; route("Mute, source", ms)
+  if TRIG.out then paths[1] = paths[1]:gsub(" > trigger$", " + trigger") end
+  if IR then table.insert(paths, "Volume, speakers, display: IR") end
+  setText(Controls.PathText, #paths > 0 and table.concat(paths, " | ") or "No control path set in Properties")
+
+  if not IR then setText(Controls.IrText, "IR is off in Properties") end
+  triggerText()
+  if TRIG.sense then onTriggerSense() end
   setError("")
-  linkDown(nil)
   link.lastTry = -100
-  Controls.IrPort.Choices = { "1:1", "1:2", "1:3" }
-  if not (Controls.IrPort.String or ""):match("^1:[123]$") then Controls.IrPort.String = "1:1" end
-  if IR then irConnect() else setText(Controls.IrText, "IR Volume is off in Properties") end
+  setStatus()
   mainTimer:Start(TICK)
+  if IR then irConnect() end
   connect()
 end
