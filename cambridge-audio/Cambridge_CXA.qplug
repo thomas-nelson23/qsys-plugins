@@ -1,0 +1,906 @@
+--[[ Cambridge Audio CXA81 plugin for Q-SYS
+  Controls a Cambridge Audio CXA81 (also CXA81 Mk II and CXA61) integrated amplifier over its rear-panel
+  RS-232C port, using Cambridge Audio's published serial control protocol: power, mute and source,
+  with feedback, plus the protocol and firmware versions.
+
+  The protocol has no volume, balance or tone commands, and the amplifier has no network control,
+  so volume stays on the amplifier's knob or its IR remote.
+
+  Transport (Property "Connection"):
+    Serial   a serial pin on the plugin, wired in the design to a Q-SYS serial port (Core or peripheral)
+    TCP      a serial-to-IP gateway in front of the amplifier's RS-232 port (raw TCP pass-through)
+  Either way: 9600 baud, 8 data bits, no parity, 1 stop bit.
+
+  Protocol (CXA61 and CXA81 Serial Control Protocol v1.0), ASCII, "#" + group,number[,data] + CR:
+    #01,01 get power      #01,02,d set power (0 standby, 1 on)    reply #02,01,d
+    #01,03 get mute       #01,04,d set mute  (0 off, 1 muted)     reply #02,03,d
+    #03,01 get source     #03,02 next   #03,03 previous   #03,04,xx set     reply #04,01,xx
+    #13,01 protocol ver.  #13,02 firmware ver.                    reply #14,01,x.x / #14,02,<text>
+    #00,01..04 errors: unknown group, unknown number, data out of range, can't be actioned now
+  The amplifier also sends the reply unprompted when power, mute or source change from the front
+  panel or the IR remote, so the plugin listens all the time and polls only to know it is online.
+
+  References:
+    Cambridge Audio, CXA61 and CXA81 Serial Control Protocol v1.0 (AP366462) -
+      https://www.cambridgeaudio.com/sites/default/files/compliance/doc/AP366462%20CXA61%20CXA81%20Serial%20Control%20Protocol%20(1).pdf
+    Cambridge Audio, CXA61/81/81 Mk II manual (inputs, RS232C, Control Bus, auto power down) -
+      https://www.cambridgeaudio.com/row/en/manuals/cxa618181-mk-ii
+    Q-SYS SerialPorts - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/SerialPorts.htm
+    Q-SYS TcpSocket - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/TcpSocket.htm
+    Q-SYS plugin functions (GetPins Domain "serial") -
+      https://help.qsys.com/DeveloperHelp/Content/Standards_Definitions/Reserved_Functions.htm
+]]
+
+PluginInfo = {
+  Name = "Audio~Cambridge Audio CXA81 (RS-232)",
+  Version = "1.0",
+  BuildVersion = "1.0.0.0",
+  Id = "7b3e9c21-0a81-4c6d-b2f4-ca8100000081",
+  Author = "AV Programming",
+  Description = "Control a Cambridge Audio CXA81 or CXA61 integrated amplifier over RS-232 (directly or through a serial-to-IP gateway): power, mute, source, with live feedback.",
+  ShowDebug = true,
+}
+
+local ACCENT = { 52, 52, 56 }  -- neutral charcoal for the schematic block (pages use the shared theme)
+
+-- Source codes from the protocol document, in front-panel order (manual: A1 balanced is CXA81 only, MP3 is CXA61 only).
+local SOURCES = {
+  CXA81 = {
+    { code = 20, label = "A1 BAL", name = "A1 Balanced" },
+    { code = 0,  label = "A1",     name = "A1" },
+    { code = 1,  label = "A2",     name = "A2" },
+    { code = 2,  label = "A3",     name = "A3" },
+    { code = 3,  label = "A4",     name = "A4" },
+    { code = 4,  label = "D1",     name = "D1" },
+    { code = 5,  label = "D2",     name = "D2" },
+    { code = 6,  label = "D3",     name = "D3" },
+    { code = 16, label = "USB",    name = "USB Audio" },
+    { code = 14, label = "BT",     name = "Bluetooth" },
+  },
+  CXA61 = {
+    { code = 0,  label = "A1",     name = "A1" },
+    { code = 1,  label = "A2",     name = "A2" },
+    { code = 2,  label = "A3",     name = "A3" },
+    { code = 3,  label = "A4",     name = "A4" },
+    { code = 4,  label = "D1",     name = "D1" },
+    { code = 5,  label = "D2",     name = "D2" },
+    { code = 6,  label = "D3",     name = "D3" },
+    { code = 10, label = "MP3",    name = "MP3" },
+    { code = 16, label = "USB",    name = "USB Audio" },
+    { code = 14, label = "BT",     name = "Bluetooth" },
+  },
+}
+local MAX_SOURCES = 10
+
+local function modelOf(props)
+  return (props["Model"] and props["Model"].Value or "CXA81"):match("^(CXA%d+)") or "CXA81"
+end
+
+local function isTcp(props)
+  return props["Connection"].Value:find("^TCP") ~= nil
+end
+
+function GetColor(props)
+  return ACCENT
+end
+
+function GetPrettyName(props)
+  return "Cambridge Audio " .. modelOf(props) .. " v" .. PluginInfo.Version
+end
+
+local PageNames = { "Control", "Setup" }
+
+function GetPages(props)
+  local pages = {}
+  for _, name in ipairs(PageNames) do table.insert(pages, { name = name }) end
+  return pages
+end
+
+function GetProperties()
+  return {
+    { Name = "Model", Type = "enum", Choices = { "CXA81 / CXA81 Mk II", "CXA61" }, Value = "CXA81 / CXA81 Mk II" },
+    { Name = "Connection", Type = "enum", Choices = { "Serial (RS-232 pin)", "TCP (serial-to-IP gateway)" }, Value = "Serial (RS-232 pin)" },
+    { Name = "Poll Interval (s)", Type = "integer", Min = 2, Max = 60, Value = 10 },
+    { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
+  }
+end
+
+function GetPins(props)
+  local pins = {}
+  if not isTcp(props) then
+    table.insert(pins, { Name = "RS-232", Direction = "input", Domain = "serial" })
+  end
+  return pins
+end
+
+function GetControls(props)
+  local function ind(name, count) return { Name = name, ControlType = "Indicator", IndicatorType = "Text", Count = count, PinStyle = "Output", UserPin = true } end
+  local function led(name) return { Name = name, ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true } end
+  local function trig(name) return { Name = name, ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true } end
+  local function tog(name, count) return { Name = name, ControlType = "Button", ButtonType = "Toggle", Count = count, PinStyle = "Both", UserPin = true } end
+  local function text(name) return { Name = name, ControlType = "Text", PinStyle = "Both", UserPin = true } end
+
+  return {
+    -- header
+    { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true },
+    led("Online"), ind("DeviceName"),
+    -- amplifier
+    tog("Power"), trig("PowerOn"), trig("PowerOff"), ind("PowerText"), led("PowerLed"),
+    tog("Mute"),
+    -- source
+    tog("Source", MAX_SOURCES), text("SourceSelect"), trig("SourceNext"), trig("SourcePrev"),
+    { Name = "SourceCode", ControlType = "Knob", ControlUnit = "Integer", Min = -1, Max = 99, DefaultValue = -1, PinStyle = "Output", UserPin = true },
+    -- setup
+    text("IPAddress"), text("Port"), trig("Connect"), trig("Refresh"),
+    ind("LinkText"), ind("ModelText"), ind("ProtocolText"), ind("FirmwareText"), ind("LastError"), ind("LastMessage"),
+  }
+end
+
+--[[ Deep Ocean theme for Q-SYS plugins, v2.0 (2026-10-15)
+     The home-dash design system (thomas-nelson23/home-dashboard, web/src/styles.css + theme.css)
+     translated into what GetControlLayout can draw. Paste this block into a .qplug above
+     GetControlLayout, then:
+
+       function GetControlLayout(props)
+         local layout, graphics = {}, {}
+         local ui = Theme.kit(layout, graphics)
+         ui.page(600)
+         ui.header("PHILIPS|HUE", "Control", "BridgeName", "Status", "Online", 1)
+         ui.section("Power", 8, 64, 200, 160)
+         ui.button("Power", "POWER", 24, 96, 168, 48, "power")
+         ...
+         ui.hint("Pick a room, then use the pads.", 568)
+         return layout, graphics
+       end
+
+     Every property used here is a documented GetControlLayout property:
+     https://help.qsys.com/DeveloperHelp/Content/Standards_Definitions/Reserved_Functions.htm
+     Guide: design/README.md in thomas-nelson23/qsys-plugins.
+]]
+local Theme = {}
+
+Theme.W = 640   -- page width; every page is 640 wide
+Theme.GRID = 8  -- positions and sizes snap to 8 (4 for fine alignment inside a row)
+
+-- home-dash tokens. Glass and hairline colors are pre-blended over the panel or the
+-- field, because Q-SYS draws solid fills (comments give the CSS each one comes from).
+Theme.N = {
+  bg      = { 2, 29, 46 },     -- --field #021d2e: the one flat deep-blue field
+  panel   = { 6, 18, 27 },     -- .panel/.tile: rgba(--ink 4,12,18, .62-.93) glass over the field
+  strip   = { 8, 27, 37 },     -- --surface-hi rgba(cyan, .045): a tile or row inside a panel
+  rowAlt  = { 12, 24, 33 },    -- rgba(255,255,255,.025): alternate list row
+  well    = { 4, 13, 19 },     -- .field input rgba(0,0,0,.3): readouts, fields, meters, hint bar
+  stroke  = { 25, 41, 50 },    -- --glass-edge rgba(200,245,255,.1): panel and input edges
+  hair    = { 20, 31, 40 },    -- --hair rgba(255,255,255,.055): dividers
+  line    = { 10, 37, 50 },    -- --line rgba(cyan,.1)
+  lineStrong = { 16, 72, 91 }, -- --line-strong rgba(cyan,.28): button and field outlines
+  btn     = { 12, 24, 33 },    -- .btn background rgba(255,255,255,.025)
+  btnOn   = { 25, 41, 50 },    -- .btn:hover, lifted
+  ledOff  = { 0, 0, 0, 0 },    -- .led-off: hollow, only the ring shows
+  white   = { 255, 255, 255 }, -- headings and big values (#fff)
+  text    = { 217, 238, 242 }, -- --text #d9eef2
+  sub     = { 156, 199, 207 }, -- --text-soft #9cc7cf: labels, secondary values
+  dim     = { 95, 114, 122 },  -- --text-dim #5f727a: section titles, notes, units
+  off     = { 58, 70, 80 },    -- --off #3a4650
+  ink     = { 11, 15, 28 },    -- #0b0f1c: text on a solid cyan or white fill
+}
+
+-- Semantic colors: same meaning in every plugin. Cyan is also the only accent.
+Theme.S = {
+  ok    = { 42, 212, 255 },  -- --cyan #2ad4ff (Deep Ocean): good, online, on, the accent
+  warn  = { 255, 176, 32 },  -- --warn #ffb020: attention only, always with a label
+  fault = { 255, 42, 79 },   -- --red #ff2a4f: bad/offline, destructive actions, small signals
+}
+
+function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
+  return { math.floor(a[1] + (b[1] - a[1]) * t + 0.5),
+           math.floor(a[2] + (b[2] - a[2]) * t + 0.5),
+           math.floor(a[3] + (b[3] - a[3]) * t + 0.5) }
+end
+
+-- home-dash has one accent, cyan. Theme.brand keeps the v1 field names so plugin code that
+-- reads ui.B still works; the accent argument is accepted and ignored.
+function Theme.brand()
+  local cyan, panel = Theme.S.ok, Theme.N.panel
+  return {
+    accent = cyan,                        -- fader/knob/meter fill, on state of solid controls
+    on     = Theme.mix(panel, cyan, 0.45), -- lit button fill (cyan at 45% over the panel)
+    soft   = Theme.mix(panel, cyan, 0.08), -- --cyan-soft: .btn-accent and pad off state
+    edge   = Theme.mix(panel, cyan, 0.45), -- rgba(cyan,.45): .btn-accent border
+    dim    = Theme.mix(panel, cyan, 0.08), -- v1 name for soft
+    pad    = Theme.mix(panel, cyan, 0.08), -- v1 name for soft
+    ink    = cyan,                        -- cyan text (.lcd-inline, .bar-rest)
+  }
+end
+
+-- Fonts. Q-SYS ships a fixed font list; these are the closest stand-ins for home-dash's
+-- Sora (text), JetBrains Mono (numbers, ids) and Michroma (wordmark, display).
+local FONT, MONO, DISPLAY = "Poppins", "Roboto Mono", "Montserrat"
+
+local CUBE_SVG = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0xMDAgLTEwMCAyMDAgMjAwIj48ZyBm"
+  .. "aWxsPSJub25lIiBzdHJva2U9IiMyYWQ0ZmYiIHN0cm9rZS13aWR0aD0iNy4wIiBzdHJva2UtbGluZWNhcD0icm91bmQiPjxw"
+  .. "YXRoIHN0cm9rZS1vcGFjaXR5PSIwLjE3NiIgZD0iTS0wLjAsODAuM0wtNzAuNyw0Mi4xTS0wLjAsODAuM0w3MC43LDQyLjFN"
+  .. "MjMuNiw2Ny41TC00Ny4xLDI5LjNNLTIzLjYsNjcuNUw0Ny4xLDI5LjNNNDcuMSw1NC44TC0yMy42LDE2LjZNLTQ3LjEsNTQu"
+  .. "OEwyMy42LDE2LjZNNzAuNyw0Mi4xTDAuMCwzLjlNLTcwLjcsNDIuMUwwLjAsMy45TTcwLjcsNDIuMUw3MC43LC00Mi4xTTcw"
+  .. "LjcsNDIuMUwwLjAsMy45TTQ3LjEsMjkuM0w0Ny4xLC01NC44TTcwLjcsMTQuMEwwLjAsLTI0LjJNMjMuNiwxNi42TDIzLjYs"
+  .. "LTY3LjVNNzAuNywtMTQuMEwwLjAsLTUyLjJNMC4wLDMuOUwwLjAsLTgwLjNNNzAuNywtNDIuMUwwLjAsLTgwLjNNLTcwLjcs"
+  .. "NDIuMUwtNzAuNywtNDIuMU0tNzAuNyw0Mi4xTDAuMCwzLjlNLTQ3LjEsMjkuM0wtNDcuMSwtNTQuOE0tNzAuNywxNC4wTDAu"
+  .. "MCwtMjQuMk0tMjMuNiwxNi42TC0yMy42LC02Ny41TS03MC43LC0xNC4wTDAuMCwtNTIuMk0wLjAsMy45TDAuMCwtODAuM00t"
+  .. "NzAuNywtNDIuMUwwLjAsLTgwLjMiLz48cGF0aCBzdHJva2Utb3BhY2l0eT0iMC44IiBkPSJNLTAuMCwtMy45TC03MC43LC00"
+  .. "Mi4xTS0wLjAsLTMuOUw3MC43LC00Mi4xTTIzLjYsLTE2LjZMLTQ3LjEsLTU0LjhNLTIzLjYsLTE2LjZMNDcuMSwtNTQuOE00"
+  .. "Ny4xLC0yOS4zTC0yMy42LC02Ny41TS00Ny4xLC0yOS4zTDIzLjYsLTY3LjVNNzAuNywtNDIuMUwwLjAsLTgwLjNNLTcwLjcs"
+  .. "LTQyLjFMMC4wLC04MC4zTS0wLjAsODAuM0wtMC4wLC0zLjlNLTAuMCw4MC4zTC03MC43LDQyLjFNLTIzLjYsNjcuNUwtMjMu"
+  .. "NiwtMTYuNk0tMC4wLDUyLjJMLTcwLjcsMTQuME0tNDcuMSw1NC44TC00Ny4xLC0yOS4zTS0wLjAsMjQuMkwtNzAuNywtMTQu"
+  .. "ME0tNzAuNyw0Mi4xTC03MC43LC00Mi4xTS0wLjAsLTMuOUwtNzAuNywtNDIuMU0tMC4wLDgwLjNMLTAuMCwtMy45TS0wLjAs"
+  .. "ODAuM0w3MC43LDQyLjFNMjMuNiw2Ny41TDIzLjYsLTE2LjZNLTAuMCw1Mi4yTDcwLjcsMTQuME00Ny4xLDU0LjhMNDcuMSwt"
+  .. "MjkuM00tMC4wLDI0LjJMNzAuNywtMTQuME03MC43LDQyLjFMNzAuNywtNDIuMU0tMC4wLC0zLjlMNzAuNywtNDIuMSIvPjwv"
+  .. "Zz48L3N2Zz4="
+
+local function merge(t, extra)
+  for k, v in pairs(extra or {}) do t[k] = v end
+  return t
+end
+
+function Theme.kit(layout, graphics)
+  local N, S, B = Theme.N, Theme.S, Theme.brand()
+  local ui = { N = N, S = S, B = B }
+
+  local function g(t) table.insert(graphics, t) end
+  local function box(x, y, w, h, fill, stroke, radius)
+    g({ Type = "GroupBox", Fill = fill, StrokeColor = stroke or fill, StrokeWidth = stroke and 1 or 0,
+        CornerRadius = radius or 0, Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Static text. size: 10 hint/title, 11 label, 12 body, 13 emphasis
+  function ui.label(text, x, y, w, h, align, size, color, style)
+    g({ Type = "Label", Text = text, Font = FONT, FontStyle = style or "Regular", FontSize = size or 11,
+        HTextAlign = align or "Right", Color = color or N.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+
+  -- Page background: one flat field, no glows. Call first so it sits behind everything.
+  function ui.page(h)
+    box(0, 0, Theme.W, h, N.bg)
+  end
+
+  -- The wireframe cube from home-dash's backdrop, frozen at its starting pose
+  -- (the frame home-dash shows when motion is reduced). s = size in px.
+  function ui.cube(x, y, s)
+    g({ Type = "Svg", Image = CUBE_SVG, Position = { x, y }, Size = { s, s } })
+  end
+  ui.sun = ui.cube  -- v1 name
+
+  -- The front window's top edge: transparent > cyan > red > transparent, in 24 px steps.
+  function ui.edge(x, y, w, base)
+    local n = math.floor(w / 24)
+    for i = 0, n - 1 do
+      local t = (i + 0.5) / n
+      local c
+      if t < 0.25 then c = Theme.mix(base, S.ok, t / 0.25)
+      elseif t < 0.75 then c = Theme.mix(S.ok, S.fault, (t - 0.25) / 0.5)
+      else c = Theme.mix(S.fault, base, (t - 0.75) / 0.25) end
+      box(x + i * 24, y, (i == n - 1) and (w - i * 24) or 24, 1, c)
+    end
+  end
+
+  -- Top bar: cube, wordmark (Michroma stand-in; text after "|" is red, like "home|dash"),
+  -- page number (red, mono) and page name like the numbered menu, device name, Status, Online LED.
+  function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl, pageNo)
+    box(8, 8, 624, 48, N.panel, N.stroke, 8)
+    ui.edge(16, 8, 608, N.stroke)
+    ui.cube(18, 16, 32)
+    local a, b = wordmark:match("^(.-)|(.*)$")
+    a, b = string.upper(a or wordmark), string.upper(b or "")
+    -- Q-SYS can't measure text, so the white part is right-aligned and the red part
+    -- left-aligned on one seam; only the seam position is estimated (caps ~8.5 px at 13 px).
+    local seam = 58 + math.floor(#a * 8.5 + 0.5)
+    g({ Type = "Label", Text = a, Font = DISPLAY, FontStyle = "Medium", FontSize = 13, HTextAlign = "Right",
+        Color = N.white, Position = { seam - 104, 20 }, Size = { 104, 24 }, Padding = 0 })
+    if b ~= "" then
+      g({ Type = "Label", Text = b, Font = DISPLAY, FontStyle = "Medium", FontSize = 13, HTextAlign = "Left",
+          Color = S.fault, Position = { seam, 20 }, Size = { 104, 24 }, Padding = 0 })
+    end
+    if pageNo then
+      g({ Type = "Label", Text = string.format("%02d", pageNo), Font = MONO, FontSize = 10, HTextAlign = "Left",
+          Color = S.fault, Position = { 160, 22 }, Size = { 20, 20 } })
+    end
+    g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Medium", FontSize = 10,
+        HTextAlign = "Left", Color = N.white, Position = { 180, 22 }, Size = { 96, 20 } })
+    if nameCtl then ui.value(nameCtl, nil, 280, 20, 164, 24, { Color = N.panel, TextColor = N.sub, FontSize = 12 }) end
+    if statusCtl then
+      layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 452, 20 }, Size = { 140, 24 },
+        Font = FONT, FontSize = 11, CornerRadius = 12 }
+    end
+    if ledCtl then ui.led(ledCtl, "Online", 602, 24, 16, "ok") end
+  end
+
+  -- Panel: glass card with a hairline edge, a small red signal, an uppercase dim title
+  -- and a hairline under the title. Content starts 32 px below y.
+  function ui.section(title, x, y, w, h)
+    box(x, y, w, h, N.panel, N.stroke, 8)
+    if title and title ~= "" then
+      g({ Type = "GroupBox", StrokeColor = S.fault, StrokeWidth = 1, CornerRadius = 4,
+          Position = { x + 12, y + 10 }, Size = { 8, 8 } })
+      ui.label(string.upper(title), x + 26, y + 4, w - 38, 20, "Left", 10, N.dim, "SemiBold")
+      box(x + 1, y + 27, w - 2, 1, N.hair)
+    end
+  end
+
+  -- Tile inside a panel.
+  function ui.strip(x, y, w, h)
+    box(x, y, w, h, N.strip, N.hair, 8)
+  end
+
+  -- List row: every other row gets the faint lift.
+  function ui.row(x, y, w, h, i)
+    box(x, y, w, h, (i % 2 == 0) and N.rowAlt or N.strip, nil, 4)
+  end
+
+  -- Hint bar: one line of help per page, at the bottom.
+  function ui.hint(text, y)
+    g({ Type = "Label", Text = text, Font = FONT, FontSize = 10, HTextAlign = "Left", Color = N.dim, Fill = N.well,
+        StrokeColor = N.hair, StrokeWidth = 1, CornerRadius = 8, Margin = 0, Padding = 8,
+        Position = { 8, y }, Size = { 624, 24 } })
+  end
+
+  -- Buttons. kind (home-dash class in brackets):
+  --   "primary"   toggle; dark pill, cyan when on            (.btn / .seg-btn.on)
+  --   "secondary" cyan-tinted pill, cyan legend              (.btn-accent)
+  --   "utility"   plain pill, soft legend                    (.btn)
+  --   "pad"       preset tile, 8 px corners, cyan when on    (.tile-layouts button)
+  --   "power"     the page's main action, bold               (.btn-accent, larger)
+  --   "warn" / "danger" / "ok"  semantic tint and legend     (.banner-warn / .btn-danger)
+  -- Pass ButtonStyle ("Toggle", "Momentary", "Trigger"...) in extra to match the control's ButtonType.
+  local function tint(c, a) return Theme.mix(N.panel, c, a) end
+  local KINDS = {
+    primary   = { on = B.on, off = N.btn, text = N.text, stroke = N.lineStrong, pill = true, style = "SemiBold" },
+    secondary = { on = B.on, off = B.soft, text = S.ok, stroke = B.edge, pill = true, style = "SemiBold" },
+    utility   = { on = N.btnOn, off = N.btn, text = N.sub, stroke = N.lineStrong, pill = true, style = "SemiBold" },
+    pad       = { on = B.on, off = N.strip, text = N.text, stroke = N.line, pill = false, style = "Medium" },
+    power     = { on = B.on, off = N.btn, text = N.white, stroke = B.edge, pill = true, style = "Bold", size = 16 },
+    warn      = { on = tint(S.warn, 0.25), off = tint(S.warn, 0.06), text = S.warn, stroke = tint(S.warn, 0.3), pill = true, style = "SemiBold" },
+    danger    = { on = tint(S.fault, 0.25), off = tint(S.fault, 0.1), text = S.fault, stroke = tint(S.fault, 0.45), pill = true, style = "SemiBold" },
+    ok        = { on = tint(S.ok, 0.25), off = B.soft, text = S.ok, stroke = B.edge, pill = true, style = "SemiBold" },
+  }
+  function ui.button(name, legend, x, y, w, h, kind, extra)
+    local k = KINDS[kind or "primary"] or KINDS.primary
+    h = h or 28
+    layout[name] = merge({ PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h },
+      Color = k.on, OffColor = k.off, UnlinkOffColor = true, TextColor = k.text, StrokeColor = k.stroke, StrokeWidth = 1,
+      Font = FONT, FontStyle = k.style, FontSize = k.size or 12,
+      CornerRadius = k.pill and math.floor(math.min(w, h) / 2) or 8, ButtonVisualStyle = "Flat", Margin = 0, WordWrap = true }, extra)
+  end
+
+  -- Read-only readout: dark well, mono digits, no outline.
+  function ui.readout(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = MONO, FontStyle = "Regular", FontSize = 12, HTextAlign = "Left",
+      CornerRadius = 8, StrokeColor = N.well, StrokeWidth = 0, Padding = 4 }, extra)
+  end
+
+  -- Editable field: same well, plus the cyan-tinted outline so it reads as typeable.
+  function ui.field(name, pretty, x, y, w, h, extra)
+    ui.readout(name, pretty, x, y, w, h, merge({ StrokeColor = N.lineStrong, StrokeWidth = 1 }, extra))
+  end
+
+  -- Plain value text on the panel (names, secondary info). No well.
+  function ui.value(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 20 },
+      Color = N.panel, TextColor = N.text, Font = FONT, FontSize = 12, HTextAlign = "Left", StrokeWidth = 0,
+      TextBoxStyle = "NoBackground" }, extra)
+  end
+
+  function ui.combo(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 12, StrokeColor = N.stroke, StrokeWidth = 1,
+      CornerRadius = 8 }, extra)
+  end
+
+  -- Fader: horizontal when w > h, vertical when h > w. Cyan unless the color is the content.
+  function ui.fader(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Fader", Position = { x, y }, Size = { w, h },
+      Color = color or B.accent }, extra)
+  end
+
+  -- Knob: secondary parameters only (trim, fade time, step). 36 or 48 square.
+  function ui.knob(name, pretty, x, y, s, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Knob", Position = { x, y }, Size = { s or 36, s or 36 },
+      Color = color or B.accent }, extra)
+  end
+
+  -- Status dot. kind: "ok" | "warn" | "fault" | "accent" | an RGB table (e.g. a color swatch).
+  -- Off is hollow: only the dim ring shows (.led-off).
+  function ui.led(name, pretty, x, y, s, kind, extra)
+    local c = type(kind) == "table" and kind or (kind == "accent" and B.accent) or S[kind or "ok"] or S.ok
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Led", Position = { x, y }, Size = { s or 16, s or 16 },
+      Color = c, OffColor = N.ledOff, UnlinkOffColor = true, StrokeColor = N.dim, StrokeWidth = 1, Margin = 3 }, extra)
+  end
+
+  -- Meter: thin cyan bar on a faint track, no built-in text box (put a readout next to it).
+  function ui.meter(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Meter", MeterStyle = "Standard", Position = { x, y },
+      Size = { w, h }, Color = color or B.accent, BackgroundColor = Theme.mix(N.panel, N.white, 0.06), CornerRadius = 2,
+      ShowTextbox = false, StrokeWidth = 0 }, extra)
+  end
+
+  -- Hide a control but keep its pins.
+  function ui.hide(name, pretty)
+    layout[name] = { PrettyName = pretty or name, Style = "None", Position = { 0, 0 }, Size = { 0, 0 } }
+  end
+
+  return ui
+end
+
+function GetControlLayout(props)
+  local layout, graphics = {}, {}
+  local ui = Theme.kit(layout, graphics)
+  local N, S, B = ui.N, ui.S, ui.B
+  local page = PageNames[props["page_index"].Value]
+  local model = modelOf(props)
+  local tcp = isTcp(props)
+  local WORD = "CXA|" .. model:sub(4)
+
+  local function cap(t, x, y, w) ui.label(t, x, y, w, 20, "Left", 10, N.dim, "Medium") end
+
+  if page == "Control" then
+    ui.page(312)
+    ui.header(WORD, "Control", "DeviceName", "Status", "Online", props["page_index"].Value)
+
+    -- power and mute
+    ui.section("Amplifier", 8, 64, 200, 208)
+    ui.button("Power", "POWER", 24, 96, 168, 56, "power", { PrettyName = "Amplifier~Power" })
+    ui.led("PowerLed", "Amplifier~Power LED", 32, 164, 16, "ok")
+    ui.readout("PowerText", "Amplifier~Power State", 56, 160, 136, 24, { HTextAlign = "Center" })
+    ui.button("Mute", "MUTE", 24, 196, 168, 56, "danger", { PrettyName = "Amplifier~Mute", FontSize = 14 })
+    ui.hide("PowerOn", "Amplifier~Power On")
+    ui.hide("PowerOff", "Amplifier~Power Off")
+
+    -- sources
+    local list = SOURCES[model]
+    ui.section("Source", 216, 64, 416, 208)
+    for i = 1, MAX_SOURCES do
+      local s = list[i]
+      local r, c = math.floor((i - 1) / 5), (i - 1) % 5
+      ui.button("Source " .. i, s and s.label or "", 232 + c * 78, 96 + r * 48, 72, 40, "pad",
+        { PrettyName = "Source~" .. (s and s.name or ("Source " .. i)), FontSize = 13 })
+    end
+    ui.button("SourcePrev", "<", 232, 200, 72, 40, "utility", { PrettyName = "Source~Previous", FontSize = 16 })
+    ui.combo("SourceSelect", "Source~Select", 312, 208, 224, 24)
+    ui.button("SourceNext", ">", 544, 200, 72, 40, "utility", { PrettyName = "Source~Next", FontSize = 16 })
+    ui.hide("SourceCode", "Source~Source Code")
+
+    ui.hint("Volume isn't in the CXA serial protocol: use the amp's volume knob or its IR remote.", 280)
+
+  else -- Setup
+    ui.page(400)
+    ui.header(WORD, "Setup", "DeviceName", "Status", "Online", props["page_index"].Value)
+
+    ui.section("Connection", 8, 64, 624, 136)
+    cap("LINK", 22, 98, 72)
+    ui.readout("LinkText", "Setup~Link", 96, 96, 400, 24, { FontSize = 11 })
+    ui.button("Connect", tcp and "CONNECT" or "REOPEN", 504, 94, 112, 28, "primary", { PrettyName = "Setup~Connect" })
+    if tcp then
+      cap("GATEWAY IP", 22, 132, 72)
+      ui.field("IPAddress", "Setup~Gateway IP", 96, 130, 200, 24)
+      cap("PORT", 312, 132, 40)
+      ui.field("Port", "Setup~Gateway Port", 352, 130, 96, 24)
+    else
+      cap("WIRING", 22, 132, 72)
+      ui.label("Wire the RS-232 pin to a Q-SYS serial port. 9600 8N1.", 96, 132, 520, 20, "Left", 11, N.sub)
+      ui.hide("IPAddress", "Setup~Gateway IP")
+      ui.hide("Port", "Setup~Gateway Port")
+    end
+    cap("ERROR", 22, 166, 72)
+    ui.readout("LastError", "Setup~Last Error", 96, 164, 520, 24, { TextColor = S.fault, FontSize = 11 })
+
+    ui.section("Amplifier", 8, 208, 624, 144)
+    cap("MODEL", 22, 242, 72)
+    ui.readout("ModelText", "Amplifier~Model", 96, 240, 208, 24, { FontSize = 11 })
+    cap("PROTOCOL", 330, 242, 72)
+    ui.readout("ProtocolText", "Amplifier~Protocol Version", 404, 240, 212, 24, { FontSize = 11 })
+    cap("FIRMWARE", 22, 274, 72)
+    ui.readout("FirmwareText", "Amplifier~Firmware", 96, 272, 400, 24, { FontSize = 11 })
+    ui.button("Refresh", "REFRESH", 504, 270, 112, 28, "secondary", { PrettyName = "Amplifier~Refresh" })
+    cap("LAST RX", 22, 306, 72)
+    ui.readout("LastMessage", "Amplifier~Last Message", 96, 304, 520, 24, { FontSize = 11 })
+
+    ui.hint(tcp and "Set the gateway's serial side to 9600 8N1 and its TCP side to raw pass-through."
+      or "Changes made on the amp or its remote show up here too: the amp reports them itself.", 360)
+  end
+
+  return layout, graphics
+end
+
+--=====================================================================
+-- Runtime
+--=====================================================================
+if Controls then
+  local MODEL = modelOf(Properties)
+  local LIST = SOURCES[MODEL]
+  local TCP = isTcp(Properties)
+  local POLL = Properties["Poll Interval (s)"].Value
+  local DEBUG = Properties["Debug Print"].Value
+  local TICK = 0.1             -- main timer period (s)
+  local REPLY_TIMEOUT = 1.5    -- the protocol says every command gets a reply or an error
+  local MISSES_OFFLINE = 2     -- unanswered commands in a row before we call the amp offline
+  local RECONNECT_EVERY = 5    -- TCP gateway reconnect interval (s)
+  local HOLD = 2.0             -- keep the user's choice on screen this long while the amp catches up
+
+  local ERRORS = {
+    ["01"] = "Command group unknown (#00,01)",
+    ["02"] = "Command number unknown (#00,02)",
+    ["03"] = "Data out of range (#00,03)",
+    ["04"] = "Amp can't do that right now (#00,04)",
+  }
+
+  local function dbg(level, ...)
+    if DEBUG == "All" or (DEBUG == "Errors" and level == "err") then print(...) end
+  end
+
+  local function setText(c, s) if c and c.String ~= s then c.String = s end end
+  local function setBool(c, b) if c and c.Boolean ~= b then c.Boolean = b end end
+
+  -- state ------------------------------------------------------------
+  mainTimer = Timer.New()      -- global on purpose, like sockets, so it is not collected
+  if TCP then sock = TcpSocket.New() end
+
+  local tick = 0
+  local link = { open = false, lastTry = -100, rxBuf = "" }
+  local amp = { power = nil, mute = nil, source = nil, protocol = nil, firmware = nil }
+  local queue = {}             -- { key, cmd, expect } waiting to go out; setters with the same key replace each other
+  local inflight = nil         -- { key, cmd, expect, sentAt }
+  local misses = 0
+  local online = false
+  local lastPoll = -100
+  local hold = {}              -- "power" / "mute" / "source" -> tick until which the user's value stays shown
+  local userError = ""
+
+  local function byCode(code)
+    for i, s in ipairs(LIST) do if s.code == code then return i, s end end
+  end
+
+  local function setError(msg)
+    userError = msg or ""
+    setText(Controls.LastError, userError)
+    if msg and msg ~= "" then dbg("err", "CXA: " .. msg) end
+  end
+
+  local function setStatus()
+    local code, text
+    if not link.open then
+      code, text = 4, TCP and "Not connected to gateway" or "Serial port not open"
+    elseif not online then
+      code, text = 2, "No reply from amplifier"
+    else
+      code, text = 0, ""
+    end
+    Controls.Status.Value = code
+    Controls.Status.String = text
+    setBool(Controls.Online, code == 0)
+  end
+
+  -- rendering --------------------------------------------------------
+  local function held(key) return hold[key] and tick < hold[key] end
+
+  local function render()
+    local power = amp.power
+    if held("power") then power = hold.powerValue end
+    setBool(Controls.Power, power == true)
+    setBool(Controls.PowerLed, power == true)
+    setText(Controls.PowerText, power == nil and "Unknown" or (power and "On" or "Standby"))
+
+    local mute = amp.mute
+    if held("mute") then mute = hold.muteValue end
+    setBool(Controls.Mute, mute == true)
+
+    local code = amp.source
+    if held("source") then code = hold.sourceValue end
+    local idx, s = nil, nil
+    if code then idx, s = byCode(code) end
+    for i = 1, MAX_SOURCES do
+      setBool(Controls.Source[i], i == idx)
+      Controls.Source[i].IsDisabled = LIST[i] == nil
+    end
+    setText(Controls.SourceSelect, s and s.name or (code and ("Code " .. code) or ""))
+    if Controls.SourceCode.Value ~= (code or -1) then Controls.SourceCode.Value = code or -1 end
+
+    local name = MODEL
+    if online and power ~= nil then
+      name = name .. "  " .. (power and ((s and s.name or "") .. (mute and "  MUTED" or "")) or "Standby")
+    end
+    setText(Controls.DeviceName, name)
+    setText(Controls.ProtocolText, amp.protocol or "")
+    setText(Controls.FirmwareText, amp.firmware or "")
+  end
+
+  -- transport --------------------------------------------------------
+  local function write(cmd)
+    local data = "#" .. cmd .. "\r"
+    dbg("all", "-> " .. cmd)
+    local ok, err
+    if TCP then
+      ok, err = pcall(function() sock:Write(data) end)
+    else
+      ok, err = pcall(function() return SerialPorts[1]:Write(data) end)
+    end
+    if not ok then setError("Write failed: " .. tostring(err)) end
+    return ok
+  end
+
+  local function pump()
+    if inflight or not link.open then return end
+    local nextCmd = table.remove(queue, 1)
+    if not nextCmd then return end
+    nextCmd.sentAt = tick
+    inflight = nextCmd
+    write(nextCmd.cmd)
+  end
+
+  -- key: commands with the same key replace one another (a later source press wins).
+  -- expect: the reply group that answers it ("02", "04" or "14").
+  local function enqueue(key, cmd, expect)
+    for _, q in ipairs(queue) do
+      if q.key == key then q.cmd = cmd ; q.expect = expect ; return end
+    end
+    table.insert(queue, { key = key, cmd = cmd, expect = expect })
+    pump()
+  end
+
+  local function poll(full)
+    lastPoll = tick
+    enqueue("qpower", "01,01", "02")
+    enqueue("qmute", "01,03", "02")
+    enqueue("qsource", "03,01", "04")
+    if full or not amp.protocol then enqueue("qproto", "13,01", "14") end
+    if full or not amp.firmware then enqueue("qfw", "13,02", "14") end
+  end
+
+  local function heard()
+    misses = 0
+    if not online then
+      online = true
+      setStatus()
+      if userError:find("^No reply") then setError("") end
+      poll(true)
+    end
+  end
+
+  -- one message from the amplifier, without "#" and CR
+  local function onMessage(msg)
+    setText(Controls.LastMessage, "#" .. msg)
+    dbg("all", "<- " .. msg)
+    local g, n, d = msg:match("^(%d+),(%d+),?(.*)$")
+    if not g then dbg("err", "CXA: unparsed " .. msg) ; return end
+    -- The document's examples drop the leading zero ("#1,01"), so compare numbers, not text.
+    local gi, ni = tonumber(g), tonumber(n)
+    heard()
+
+    local answered = false
+    if gi == 0 then
+      local e = string.format("%02d", ni)
+      if inflight then
+        local isQuery = inflight.key:sub(1, 1) == "q"
+        local what = inflight.cmd
+        inflight = nil
+        if not isQuery then
+          if e == "04" then
+            setError(ERRORS[e] .. ((amp.power == false) and ": the amp is in standby" or "") .. " [#" .. what .. "]")
+          else
+            setError((ERRORS[e] or ("Error " .. e)) .. " [#" .. what .. "]")
+          end
+          hold = {}            -- show the amp's real state again
+        else
+          dbg("all", "query #" .. what .. " refused: " .. (ERRORS[e] or e))
+        end
+        render()
+      end
+      pump()
+      return
+    elseif gi == 2 and ni == 1 then
+      amp.power = (d == "1")
+      if hold.powerValue == amp.power then hold.power = nil end
+    elseif gi == 2 and ni == 3 then
+      amp.mute = (d == "1")
+      if hold.muteValue == amp.mute then hold.mute = nil end
+    elseif gi == 4 and ni == 1 then
+      amp.source = tonumber(d)
+      if hold.sourceValue == amp.source then hold.source = nil end
+    elseif gi == 14 and ni == 1 then
+      amp.protocol = d
+    elseif gi == 14 and ni == 2 then
+      amp.firmware = d
+    end
+
+    if inflight and tonumber(inflight.expect) == gi then
+      inflight = nil
+      answered = true
+    end
+    render()
+    if answered then pump() end
+  end
+
+  local function onData(chunk)
+    link.rxBuf = link.rxBuf .. chunk
+    while true do
+      local cr = link.rxBuf:find("[\r\n]")
+      if not cr then break end
+      local line = link.rxBuf:sub(1, cr - 1)
+      link.rxBuf = link.rxBuf:sub(cr + 1)
+      local msg = line:match("#(.+)$")   -- anything before "#" is line noise
+      if msg then onMessage(msg) end
+    end
+    if #link.rxBuf > 256 then link.rxBuf = "" end
+  end
+
+  local function linkDown(reason)
+    link.open = false
+    link.lastTry = tick
+    link.rxBuf = ""
+    inflight, queue = nil, {}
+    online = false
+    if reason then setError(reason) end
+    setStatus()
+    render()
+  end
+
+  local function linkUp()
+    link.open = true
+    link.rxBuf = ""
+    misses = 0
+    setStatus()
+    poll(true)
+  end
+
+  local function connect()
+    link.lastTry = tick
+    if TCP then
+      local ip = (Controls.IPAddress.String or ""):match("^%s*(.-)%s*$")
+      local port = tonumber(Controls.Port.String)
+      if ip == "" or not port then
+        linkDown(nil)
+        setText(Controls.LinkText, "Type the gateway's IP address and port")
+        return
+      end
+      setText(Controls.LinkText, string.format("TCP %s:%d (serial-to-IP gateway)", ip, port))
+      pcall(function() sock:Disconnect() end)
+      sock:Connect(ip, port)
+    else
+      setText(Controls.LinkText, "RS-232 serial pin, 9600 baud 8N1")
+      local port = SerialPorts and SerialPorts[1]
+      if not port then
+        linkDown("No serial port: wire the RS-232 pin to a serial port (serial only works on a Core, not in emulation)")
+        return
+      end
+      pcall(function() port:Close() end)
+      local ok, err = pcall(function() port:Open(9600, 8, "N") end)
+      if not ok then linkDown("Serial open failed: " .. tostring(err)) end
+    end
+  end
+
+  if TCP then
+    sock.ReconnectTimeout = 0  -- reconnects are handled by mainTimer
+    sock.ReadTimeout = 0
+    sock.WriteTimeout = 0
+    sock.EventHandler = function(s, evt, err)
+      if evt == TcpSocket.Events.Connected then
+        setError("")
+        linkUp()
+      elseif evt == TcpSocket.Events.Data then
+        onData(s:Read(s.BufferLength))
+      elseif evt == TcpSocket.Events.Closed then
+        linkDown("Gateway closed the connection")
+      elseif evt == TcpSocket.Events.Error then
+        linkDown("Gateway socket error: " .. tostring(err))
+      elseif evt == TcpSocket.Events.Timeout then
+        linkDown("Gateway socket timeout")
+      end
+    end
+  elseif SerialPorts and SerialPorts[1] then
+    SerialPorts[1].EventHandler = function(port, evt, err)
+      if evt == SerialPorts.Events.Connected then
+        setError("")
+        linkUp()
+      elseif evt == SerialPorts.Events.Data then
+        onData(port:Read(port.BufferLength) or "")
+      elseif evt == SerialPorts.Events.Reconnect then
+        link.open = false
+        setStatus()
+      elseif evt == SerialPorts.Events.Closed or evt == SerialPorts.Events.Error or evt == SerialPorts.Events.Timeout then
+        linkDown("Serial port closed: " .. tostring(err or evt))
+      end
+    end
+  end
+
+  mainTimer.EventHandler = function()
+    tick = tick + TICK
+    if inflight and tick - inflight.sentAt > REPLY_TIMEOUT then
+      dbg("all", "no reply to #" .. inflight.cmd)
+      inflight = nil
+      misses = misses + 1
+      if misses >= MISSES_OFFLINE and online then
+        online = false
+        setError("No reply from the amplifier: check power, cable and 9600 8N1")
+        setStatus()
+        render()
+      elseif misses >= MISSES_OFFLINE then
+        queue = {}             -- offline: keep only the next poll going, so retries stay slow
+      end
+      pump()
+    end
+    if link.open and not inflight and #queue == 0 and tick - lastPoll >= (online and POLL or 2) then
+      poll(false)
+    end
+    if TCP and not link.open and tick - link.lastTry >= RECONNECT_EVERY then connect() end
+    if (hold.power and not held("power")) or (hold.mute and not held("mute")) or (hold.source and not held("source")) then
+      if not held("power") then hold.power = nil end
+      if not held("mute") then hold.mute = nil end
+      if not held("source") then hold.source = nil end
+      render()
+    end
+  end
+
+  -- commands ---------------------------------------------------------
+  local function setPower(on)
+    hold.power, hold.powerValue = tick + HOLD, on
+    setError("")
+    enqueue("power", "01,02," .. (on and "1" or "0"), "02")
+    render()
+  end
+
+  local function setMute(on)
+    hold.mute, hold.muteValue = tick + HOLD, on
+    setError("")
+    enqueue("mute", "01,04," .. (on and "1" or "0"), "02")
+    render()
+  end
+
+  local function setSource(code)
+    hold.source, hold.sourceValue = tick + HOLD, code
+    setError("")
+    enqueue("source", string.format("03,04,%02d", code), "04")
+    render()
+  end
+
+  local function stepSource(dir)
+    setError("")
+    hold.source = nil
+    -- next / previous are separate commands; let each press go out
+    table.insert(queue, { key = "step", cmd = dir > 0 and "03,02" or "03,03", expect = "04" })
+    pump()
+  end
+
+  -- controls ---------------------------------------------------------
+  Controls.Power.EventHandler = function(c) setPower(c.Boolean) end
+  Controls.PowerOn.EventHandler = function() setPower(true) end
+  Controls.PowerOff.EventHandler = function() setPower(false) end
+  Controls.Mute.EventHandler = function(c) setMute(c.Boolean) end
+  for i = 1, MAX_SOURCES do
+    Controls.Source[i].EventHandler = function()
+      if LIST[i] then setSource(LIST[i].code) else render() end
+    end
+  end
+  Controls.SourceSelect.EventHandler = function(c)
+    for _, s in ipairs(LIST) do
+      if s.name == c.String then setSource(s.code) ; return end
+    end
+    render()
+  end
+  Controls.SourceNext.EventHandler = function() stepSource(1) end
+  Controls.SourcePrev.EventHandler = function() stepSource(-1) end
+  Controls.Refresh.EventHandler = function() amp.protocol, amp.firmware = nil, nil ; poll(true) end
+  Controls.Connect.EventHandler = function() setError("") ; connect() end
+  Controls.IPAddress.EventHandler = function() setError("") ; connect() end
+  Controls.Port.EventHandler = function() setError("") ; connect() end
+
+  -- startup ----------------------------------------------------------
+  local names = {}
+  for _, s in ipairs(LIST) do table.insert(names, s.name) end
+  Controls.SourceSelect.Choices = names
+  for i = 1, MAX_SOURCES do Controls.Source[i].Legend = LIST[i] and LIST[i].label or "" end
+  setText(Controls.ModelText, MODEL == "CXA81" and "CXA81 / CXA81 Mk II" or MODEL)
+  setText(Controls.LastMessage, "")
+  setError("")
+  linkDown(nil)
+  link.lastTry = -100
+  mainTimer:Start(TICK)
+  connect()
+end

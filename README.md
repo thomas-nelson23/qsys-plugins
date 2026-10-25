@@ -11,6 +11,7 @@ Each plugin lives in its own folder with the `.qplug` file, a README covering se
 | [Philips Hue Bridge](philips-hue/) | 1.1 | Hue lights, rooms, zones and scenes: power, brightness, color, color temperature, scenes, effects | Local Hue API v2 (CLIP), HTTPS port 443 | [Hue.qplug](philips-hue/Hue.qplug?raw=1) |
 | [FlexRadio FLEX-6600](flexradio/) | 1.1 | FLEX-6600 / FLEX-6000 transceivers: slices, frequency, band, mode, filter, AF gain, AGC, noise reduction, squelch, RIT, line out, guarded transmit (MOX, tune, ATU, power, TX audio source), meters | SmartSDR TCP/IP API, TCP port 4992, VITA-49 meters over UDP | [FlexRadio.qplug](flexradio/FlexRadio.qplug?raw=1) |
 | [UniFi Network Monitor](unifi/) | 1.1 | UniFi consoles (UDM Pro and others): scrollable client list with IP, MAC and live bandwidth, internet and network health, WAN throughput, speed test, devices, firmware, ports and PoE, device restart, PoE power cycle, guest authorization | Local UniFi Network API (official Integration v1 plus legacy stats), HTTPS port 443, API key | [Unifi.qplug](unifi/Unifi.qplug?raw=1) |
+| [Cambridge Audio CXA81](cambridge-audio/) | 1.0 | Cambridge Audio CXA81, CXA81 Mk II and CXA61 amplifiers: power, mute, source select with live feedback from the front panel and remote (no volume: the amp's protocol doesn't offer it) | Cambridge Audio serial protocol, RS-232 9600 8N1 (Q-SYS serial port or a serial-to-IP gateway) | [Cambridge_CXA.qplug](cambridge-audio/Cambridge_CXA.qplug?raw=1) |
 
 All plugins share one look, Deep Ocean, taken from the [home-dash](https://github.com/thomas-nelson23/home-dashboard) design system: a deep-blue field, dark glass panels with hairline edges, cyan for the accent and "good", red for small signals and errors, amber only for warnings. The theme is one Lua block, [`design/theme.lua`](design/theme.lua), pasted into each `.qplug`; [`design/README.md`](design/README.md) explains it.
 
@@ -29,4 +30,4 @@ These plugins were tested in a Lua 5.3 harness against simulated devices, not ye
 
 ## Disclaimer
 
-Not affiliated with or endorsed by QSC, Nanoleaf, Signify (Philips Hue), FlexRadio Systems or Ubiquiti. Product names are trademarks of their owners.
+Not affiliated with or endorsed by QSC, Nanoleaf, Signify (Philips Hue), FlexRadio Systems, Ubiquiti or Cambridge Audio. Product names are trademarks of their owners.
