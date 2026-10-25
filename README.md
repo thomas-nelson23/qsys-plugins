@@ -30,4 +30,4 @@ These plugins were tested in a Lua 5.3 harness against simulated devices, not ye
 
 ## Disclaimer
 
-Not affiliated with or endorsed by QSC, Nanoleaf, Signify (Philips Hue), FlexRadio Systems, Ubiquiti or Obsidian (Dynalist Inc.). Product names are trademarks of their owners.
+Not affiliated with or endorsed by QSC, Nanoleaf, Signify (Philips Hue), FlexRadio Systems, Ubiquiti or Obsidian. Product names are trademarks of their owners.
