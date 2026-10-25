@@ -33,8 +33,8 @@
 
 PluginInfo = {
   Name = "Productivity~Obsidian Notes",
-  Version = "1.1",
-  BuildVersion = "1.1.0.0",
+  Version = "1.2",
+  BuildVersion = "1.2.0.0",
   Id = "3cde955b-6b76-48ca-a831-40ce11b3391e",
   Author = "AV Programming",
   Description = "Browse, read, search and edit Obsidian notes and Kanban boards (with Obsidian Sync) through the Local REST API community plugin running on a computer that has the vault open.",
@@ -523,7 +523,7 @@ function GetControlLayout(props)
     ui.field("KbNewText", "Kanban~New Card", 16, 696, 504, 20, { Font = FONT, FontSize = 11 })
     btn("KbAdd", "Add Card", 528, 694, 96, 24, "secondary", "Kanban~Add Card", { FontSize = 11 })
     ui.hide("KbBoardOpen", "Kanban~Open Board")
-    ui.hint("Tap a card, then move it. Tap a lane title to pick where Add Card puts new cards. Changes save at once.", 728)
+    ui.hint("Tap a card, then tap a lane title to move it there. With no card picked, a lane title picks where Add Card goes.", 728)
 
   elseif page == "Notes" then
     ui.section("Vault", 8, 64, 240, 576)
@@ -1839,8 +1839,18 @@ if Controls then
   Controls.KbNewText.EventHandler = function() end
 
   for i = 1, KB_LANES do
+    -- With a card picked, tapping another lane's title moves the card to the end of that
+    -- lane and drops the pick. Otherwise it picks the lane that Add Card fills.
     Controls.KbLane[i].EventHandler = function()
-      if board and board.lanes[laneFirst + i - 1] then kbLane = laneFirst + i - 1 end
+      local li = laneFirst + i - 1
+      if not (board and board.lanes[li]) then renderBoard(); return end
+      kbLane = li
+      if kbSel and kbSel.lane ~= li then
+        moveTo(li)
+        kbSel = nil
+        renderBoard()
+        return
+      end
       renderBoard()
     end
     Controls.KbUp[i].EventHandler = function()

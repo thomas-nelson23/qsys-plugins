@@ -46,9 +46,10 @@ The plugin works with boards from the **Kanban** community plugin by mgmeyers (c
 
 1. The **Kanban** page lists every board in the vault (every note whose frontmatter has `kanban-plugin`). Pick one in **Board**. **Refresh** looks for new boards.
 2. Four lanes show at a time, with eight cards each. **<** and **>** page through more lanes. Each lane's **^** and **v** scroll its cards. The lane title shows the card count, or count/limit when the lane has a WIP limit such as `Doing (3)`.
-3. Tap a card to select it (tap again to deselect). Its text appears in the card box, where you can edit it and press Enter.
-4. **< Move** and **Move >** move the card to the end of the next lane. **Up** and **Down** move it within its lane. **Done** ticks or unticks it. **Archive** (press twice) moves it to the board's Archive, as the Kanban plugin does.
-5. Tap a lane title to pick the lane, type in the new card box and press **Add Card**. New cards go to the end of the lane, or to the top if the board's own **Prepend / append new cards** setting is Prepend. The panel can't see the Kanban plugin's global settings, so set this on the board (board menu > Open board settings) if you want Prepend.
+3. Tap a card to pick it (tap it again to drop the pick). Its text appears in the card box, where you can edit it and press Enter.
+4. **To move a card to another lane, tap the card, then tap that lane's title.** The card goes to the end of that lane and the pick is dropped. Q-SYS controls can't be dragged, so this tap-then-tap takes the place of dragging.
+5. **< Move** and **Move >** move the card to the end of the next lane. **Up** and **Down** move it within its lane. **Done** ticks or unticks it. **Archive** (press twice) moves it to the board's Archive, as the Kanban plugin does.
+6. With no card picked, tap a lane title to pick the lane, type in the new card box and press **Add Card**. New cards go to the end of the lane, or to the top if the board's own **Prepend / append new cards** setting is Prepend. The panel can't see the Kanban plugin's global settings, so set this on the board (board menu > Open board settings) if you want Prepend.
 
 Every change is saved at once, with the same `If-Match` check as notes. If the board changed in Obsidian or on another device first, the plugin reloads it and asks you to try again, so nobody's change is lost. Every Note Refresh seconds the board is re-read, so moves made in Obsidian show up on the panel.
 
@@ -113,7 +114,7 @@ The header on every page shows the host, the Q-SYS status (OK / Fault / Not Pres
 - saving with `If-Match`, a 412 conflict, Overwrite Theirs, and keeping CRLF line endings
 - automatic refresh when the note changes elsewhere, with and without unsaved edits
 - the unsaved-edits guard, Quick Append, the LogAppend pin, search, opening a result, Show on PC, and creating notes (including refusing a bad name and an existing note)
-- Kanban: finding boards, lanes and WIP limits, a byte-identical round trip of a board in the Kanban plugin's format, moving cards between lanes and within a lane, ticking cards when they enter a Complete lane and unticking them when they leave, editing, adding (append and prepend), archiving, multi-line cards and block ids, a 412 when the board changed on another device, refresh from Obsidian, lane paging and card scrolling, refusing a board with text it can't place, and the `KbBoardOpen` pin
+- Kanban: finding boards, lanes and WIP limits, a byte-identical round trip of a board in the Kanban plugin's format, moving cards between lanes and within a lane, ticking cards when they enter a Complete lane and unticking them when they leave, editing, adding (append and prepend), archiving, multi-line cards and block ids, a 412 when the board changed on another device, refresh from Obsidian, lane paging and card scrolling, moving a card by tapping it and then a lane title, refusing a board with text it can't place, and the `KbBoardOpen` pin
 
 The layout previews (`preview_*.png`) are a close rendering, not a Designer screenshot.
 
@@ -129,10 +130,11 @@ Not included:
 - Rendered Markdown (bold, links, images, embeds). Notes are shown as their plain Markdown text.
 - Attachments, canvases, frontmatter editing, heading-targeted PATCH edits, tags, Dataview and other plugins' views.
 - The REST API's event streams (server-sent events), because HttpClient can't hold a streaming connection. Polling is used instead.
-- Kanban: dragging (use the Move buttons), creating, renaming or deleting lanes, the board's table and list views, card dates and times as pickers, card notes, and restoring archived cards. Do those in Obsidian; the panel picks them up.
+- Kanban: dragging (Q-SYS controls report only a press on the control touched, so use tap a card, then tap a lane title), creating, renaming or deleting lanes, the board's table and list views, card dates and times as pickers, card notes, and restoring archived cards. Do those in Obsidian; the panel picks them up.
 - A custom **Authorization header** name in the REST API's advanced settings. Leave it at the default.
 
 ## Changelog
+- 1.2: Kanban: tap a card, then tap a lane title to move the card into that lane.
 - 1.1: Kanban boards (Kanban page and an optional 1280 x 800 Kanban UCI page); no changes to existing controls.
 - 1.0: first release.
 
