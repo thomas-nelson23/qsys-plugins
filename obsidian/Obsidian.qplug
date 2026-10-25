@@ -19,23 +19,25 @@
     POST /vault/<path>              append to the end of a note
     POST /search/simple/?query=...  full-text search
     POST /open/<path>               show the note in Obsidian on the host computer
+    POST /search/  (JsonLogic)      find Kanban boards: notes whose frontmatter has "kanban-plugin"
 
   References:
     Local REST API with MCP, OpenAPI spec (v5.5.2) - https://github.com/coddingtonbear/obsidian-local-rest-api/blob/main/docs/openapi.yaml
     Local REST API interactive docs                - https://coddingtonbear.github.io/obsidian-local-rest-api/
     Obsidian Sync (Obsidian Help)                  - https://help.obsidian.md/sync
     Obsidian Sync security and privacy             - https://help.obsidian.md/sync/security
+    Kanban plugin (mgmeyers), board format v2.0.51 - https://github.com/mgmeyers/obsidian-kanban (src/parsers/formats/list.ts)
     Q-SYS HttpClient                               - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/HttpClient.htm
     Q-SYS plugin reserved functions / layout       - https://help.qsys.com/DeveloperHelp/Content/Standards_Definitions/Reserved_Functions.htm
 ]]
 
 PluginInfo = {
   Name = "Productivity~Obsidian Notes",
-  Version = "1.0",
-  BuildVersion = "1.0.0.0",
+  Version = "1.1",
+  BuildVersion = "1.1.0.0",
   Id = "3cde955b-6b76-48ca-a831-40ce11b3391e",
   Author = "AV Programming",
-  Description = "Browse, read, search and edit Obsidian notes (with Obsidian Sync) through the Local REST API community plugin running on a computer that has the vault open.",
+  Description = "Browse, read, search and edit Obsidian notes and Kanban boards (with Obsidian Sync) through the Local REST API community plugin running on a computer that has the vault open.",
   ShowDebug = true,
 }
 
@@ -336,6 +338,8 @@ function Theme.kit(layout, graphics)
 end
 
 local READ_ROWS = 20  -- reader rows on the Notes page
+local KB_LANES = 4    -- Kanban lanes on screen at once
+local KB_CARDS = 8    -- cards on screen per lane
 
 function GetColor(props)
   return ACCENT
@@ -345,11 +349,15 @@ function GetPrettyName(props)
   return "Obsidian Notes v" .. PluginInfo.Version
 end
 
-local PageNames = { "Notes", "Edit", "Search", "Setup" }
+local function PageNames(props)
+  local names = { "Notes", "Edit", "Search", "Kanban", "Setup" }
+  if props["Kanban UCI Page"] and props["Kanban UCI Page"].Value == "On" then table.insert(names, "Kanban UCI") end
+  return names
+end
 
 function GetPages(props)
   local pages = {}
-  for _, name in ipairs(PageNames) do table.insert(pages, { name = name }) end
+  for _, name in ipairs(PageNames(props)) do table.insert(pages, { name = name }) end
   return pages
 end
 
@@ -359,6 +367,7 @@ function GetProperties()
     { Name = "Note Refresh (s)", Type = "integer", Min = 0, Max = 600, Value = 10 },
     { Name = "Reader Wrap (chars)", Type = "integer", Min = 20, Max = 200, Value = 52 },
     { Name = "Max Note Size (KB)", Type = "integer", Min = 16, Max = 2048, Value = 256 },
+    { Name = "Kanban UCI Page", Type = "enum", Choices = { "Off", "On" }, Value = "Off" },
     { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
   }
 end
@@ -399,6 +408,15 @@ function GetControls(props)
     -- search and new note
     text("SearchQuery"), trig("Search"), ind("SearchCount"), text("ResultList"), ind("ResultContext"),
     text("NewFolder"), text("NewName"), trig("CreateNote"), ind("NewStatus"),
+    -- kanban
+    text("KbBoard"), trig("KbRefresh"), ind("KbStatus"), trig("KbLanesPrev"), trig("KbLanesNext"), ind("KbLanePage"),
+    { Name = "KbLane", ControlType = "Button", ButtonType = "Toggle", Count = KB_LANES, PinStyle = "Both", UserPin = true },
+    { Name = "KbCard", ControlType = "Button", ButtonType = "Toggle", Count = KB_LANES * KB_CARDS, PinStyle = "Both", UserPin = true },
+    { Name = "KbUp", ControlType = "Button", ButtonType = "Trigger", Count = KB_LANES, PinStyle = "Input", UserPin = true },
+    { Name = "KbDown", ControlType = "Button", ButtonType = "Trigger", Count = KB_LANES, PinStyle = "Input", UserPin = true },
+    text("KbCardText"), trig("KbLeft"), trig("KbRight"), trig("KbMoveUp"), trig("KbMoveDown"),
+    trig("KbCheck"), trig("KbArchive"), text("KbNewText"), trig("KbAdd"),
+    text("KbBoardOpen", "Input"),
     -- setup
     text("Host"), text("Port"), text("Protocol"), text("ApiKey"), trig("Connect"),
     ind("LastError"), ind("Service"), ind("PluginVersion"), ind("ObsidianVersion"), ind("AuthState"),
@@ -410,7 +428,7 @@ end
 function GetControlLayout(props)
   local layout, graphics = {}, {}
   local pageNo = props["page_index"].Value
-  local page = PageNames[pageNo]
+  local page = PageNames(props)[pageNo]
   local ui = Theme.kit(layout, graphics)
   local N, S = ui.N, ui.S
 
@@ -432,12 +450,82 @@ function GetControlLayout(props)
     ui.button(name, legend, x, y, w, h, kind, e)
   end
 
-  local H = ({ Notes = 680, Edit = 672, Search = 592, Setup = 536 })[page] or 600
+  -- One Kanban lane: title button (tap to pick the lane for new cards), cards, scroll buttons.
+  local function lane(i, x, y, w, cardH, gap, titleH, scrollAtTop, fontSize)
+    ui.strip(x, y, w, titleH + 12 + KB_CARDS * (cardH + gap) + (scrollAtTop and 0 or 32))
+    local tw = scrollAtTop and (w - 104) or (w - 16)
+    btn("KbLane " .. i, "", x + 8, y + 6, tw, titleH, "pad", "Kanban~Lane " .. i,
+      { ButtonStyle = "Toggle", FontStyle = "SemiBold", FontSize = fontSize, OffColor = N.panel, StrokeColor = N.panel })
+    local sy = scrollAtTop and (y + 6) or (y + titleH + 12 + KB_CARDS * (cardH + gap))
+    local sw = scrollAtTop and 40 or math.floor((w - 24) / 2)
+    local sx = scrollAtTop and (x + w - 96) or (x + 8)
+    btn("KbUp " .. i, "^", sx, sy, sw, scrollAtTop and titleH or 24, "utility", "Kanban~Lane " .. i .. " Up", { FontSize = 11 })
+    btn("KbDown " .. i, "v", sx + sw + 8, sy, sw, scrollAtTop and titleH or 24, "utility", "Kanban~Lane " .. i .. " Down", { FontSize = 11 })
+    for j = 1, KB_CARDS do
+      local n = (i - 1) * KB_CARDS + j
+      btn("KbCard " .. n, "", x + 8, y + titleH + 12 + (j - 1) * (cardH + gap), w - 16, cardH, "pad",
+        "Kanban~Lane " .. i .. " Card " .. j, { ButtonStyle = "Toggle", FontSize = fontSize - 1, FontStyle = "Regular",
+        HTextAlign = "Left", Padding = 8 })
+    end
+  end
+
+  if page == "Kanban UCI" then
+    -- 1280 x 800 for a TSC-101-G3 (16:10, landscape): copy this page onto a UCI with Ctrl+A.
+    table.insert(graphics, { Type = "GroupBox", Fill = N.bg, StrokeColor = N.bg, StrokeWidth = 0, CornerRadius = 0,
+      Position = { 0, 0 }, Size = { 1280, 800 } })
+    ui.section(nil, 16, 16, 1248, 64)
+    ui.edge(32, 16, 1216, N.stroke)
+    ui.cube(32, 28, 40)
+    ui.label("OBSIDIAN", 84, 30, 120, 36, "Left", 16, N.white, "SemiBold")
+    ui.label("KANBAN", 192, 30, 100, 36, "Left", 16, S.fault, "SemiBold")
+    ui.combo("KbBoard", "Kanban~Board", 304, 30, 360, 36, { FontSize = 14 })
+    btn("KbRefresh", "Refresh", 676, 30, 112, 36, "secondary", "Kanban~Refresh", { FontSize = 13 })
+    btn("KbLanesPrev", "<", 808, 30, 48, 36, "utility", "Kanban~Lanes Back", { FontSize = 14 })
+    ui.value("KbLanePage", "Kanban~Lane Page", 860, 32, 148, 32, { FontSize = 12, TextColor = N.sub, HTextAlign = "Center" })
+    btn("KbLanesNext", ">", 1012, 30, 48, 36, "utility", "Kanban~Lanes Next", { FontSize = 14 })
+    ui.value("KbStatus", "Kanban~Status", 1072, 22, 148, 52, { FontSize = 10, TextColor = N.sub, WordWrap = true })
+    ui.led("Online", "Online", 1228, 38, 20, "ok")
+    for i = 1, KB_LANES do lane(i, 16 + (i - 1) * 314, 92, 306, 56, 6, 44, true, 14) end
+    ui.section(nil, 16, 672, 1248, 112)
+    ui.field("KbCardText", "Kanban~Card Text", 32, 684, 720, 40, { Font = FONT, FontSize = 14 })
+    ui.field("KbNewText", "Kanban~New Card", 32, 732, 560, 40, { Font = FONT, FontSize = 14 })
+    btn("KbAdd", "Add Card", 600, 732, 152, 40, "secondary", "Kanban~Add Card", { FontSize = 14 })
+    local acts = { { "KbLeft", "< Move" }, { "KbRight", "Move >" }, { "KbCheck", "Done" },
+                   { "KbMoveUp", "Up" }, { "KbMoveDown", "Down" }, { "KbArchive", "Archive", "warn" } }
+    for k, a in ipairs(acts) do
+      local col, row = (k - 1) % 3, math.floor((k - 1) / 3)
+      btn(a[1], a[2], 768 + col * 160, 684 + row * 48, 152, 40, a[3] or "utility", "Kanban~" .. a[2], { FontSize = 14 })
+    end
+    return layout, graphics
+  end
+
+  local H = ({ Notes = 680, Edit = 672, Search = 592, Kanban = 760, Setup = 536 })[page] or 600
   ui.page(H)
   ui.header("OBSID|IAN", page, "HostName", "Status", "Online", pageNo)
   layout["HostName"].PrettyName = "Host Name"
 
-  if page == "Notes" then
+  if page == "Kanban" then
+    ui.section("Board", 8, 64, 624, 64)
+    ui.combo("KbBoard", "Kanban~Board", 16, 96, 248, 24)
+    btn("KbRefresh", "Refresh", 272, 94, 80, 28, "secondary", "Kanban~Refresh", { FontSize = 11 })
+    btn("KbLanesPrev", "<", 360, 94, 32, 28, "utility", "Kanban~Lanes Back")
+    ui.value("KbLanePage", "Kanban~Lane Page", 392, 98, 104, 20, { FontSize = 10, TextColor = N.sub, HTextAlign = "Center" })
+    btn("KbLanesNext", ">", 496, 94, 32, 28, "utility", "Kanban~Lanes Next")
+    ui.value("KbStatus", "Kanban~Status", 532, 92, 96, 32, { FontSize = 9, TextColor = N.sub, WordWrap = true })
+    for i = 1, KB_LANES do lane(i, 8 + (i - 1) * 156, 136, 152, 44, 4, 28, false, 11) end
+    ui.section("Card", 8, 600, 624, 120)
+    ui.field("KbCardText", "Kanban~Card Text", 16, 632, 608, 28, { Font = FONT, FontSize = 12 })
+    local acts = { { "KbLeft", "< Move" }, { "KbRight", "Move >" }, { "KbMoveUp", "Up" }, { "KbMoveDown", "Down" },
+                   { "KbCheck", "Done" }, { "KbArchive", "Archive", "warn" } }
+    for k, a in ipairs(acts) do
+      btn(a[1], a[2], 16 + (k - 1) * 102, 668, 94, 24, a[3] or "utility", "Kanban~" .. a[2], { FontSize = 11 })
+    end
+    ui.field("KbNewText", "Kanban~New Card", 16, 696, 504, 20, { Font = FONT, FontSize = 11 })
+    btn("KbAdd", "Add Card", 528, 694, 96, 24, "secondary", "Kanban~Add Card", { FontSize = 11 })
+    ui.hide("KbBoardOpen", "Kanban~Open Board")
+    ui.hint("Tap a card, then move it. Tap a lane title to pick where Add Card puts new cards. Changes save at once.", 728)
+
+  elseif page == "Notes" then
     ui.section("Vault", 8, 64, 240, 576)
     ui.readout("FolderPath", "Vault~Folder", 16, 96, 224, 24, { FontSize = 11 })
     btn("FolderUp", "Up", 16, 128, 64, 28, "utility", "Vault~Up")
@@ -584,7 +672,8 @@ if Controls then
   local remoteChanged = false
   local lastNoteCheck = 0
   local armed = {}
-  local pendingOpen = nil         -- { path, t } second press opens and discards unsaved edits
+  local pendingOpen = nil
+  local kb = {}                   -- Kanban hooks, filled in by the Kanban section below         -- { path, t } second press opens and discards unsaved edits
 
   -- helpers ----------------------------------------------------------
   local function now() return os.clock() end
@@ -1023,8 +1112,10 @@ if Controls then
               firstConnect = false
               listFolder(folder)
               if trim(Controls.NoteOpen.String) ~= "" then requestOpen(trim(Controls.NoteOpen.String)) end
-            elseif NOTE_REFRESH > 0 and note and now() - lastNoteCheck >= NOTE_REFRESH then
-              checkNote()
+              kb.discover()
+            else
+              if NOTE_REFRESH > 0 and note and now() - lastNoteCheck >= NOTE_REFRESH then checkNote() end
+              kb.tick()
             end
           else
             Controls.AuthState.String = "Refused"
@@ -1384,6 +1475,406 @@ if Controls then
   Controls.ReadScrollUp.EventHandler = function() readOffset = readOffset - (READ_ROWS - 2); renderReader() end
   Controls.ReadScrollDown.EventHandler = function() readOffset = readOffset + (READ_ROWS - 2); renderReader() end
 
+  ---------------------------------------------------------------------
+  -- Kanban boards (the community "Kanban" plugin by mgmeyers)
+  --
+  -- A board is a Markdown note whose frontmatter has a "kanban-plugin" key.
+  -- Each heading is a lane, each "- [ ] text" item under it is a card, a
+  -- "**Complete**" line marks a lane whose cards are checked off, and the board
+  -- ends with an optional "***" + "## Archive" section and a
+  -- "%% kanban:settings" block. Writes use the layout the Kanban plugin's own
+  -- boardToMd() produces, so Obsidian shows the board unchanged.
+  ---------------------------------------------------------------------
+  local board = nil            -- { path, header, lanes, archive, settings, eol, finalNl, version, prepend }
+  local boardMap = {}          -- KbBoard display text -> path
+  local laneFirst = 1          -- first lane on screen
+  local laneOff = {}           -- lane index -> first card on screen
+  local kbSel = nil            -- { lane, card } selected card
+  local kbLane = 1             -- lane that Add Card goes into
+  local kbSaving, kbPending = false, false
+  local lastBoardCheck = 0
+
+  local function kbStatus(msg) Controls.KbStatus.String = msg or "" end
+
+  local function isItem(l) return l:match("^[-*+] %[(.)%] ?(.*)$") end
+
+  local function parseBoard(path, content)
+    local lines, eol, finalNl = splitLines(content)
+    local b = { path = path, header = {}, lanes = {}, archive = nil, settings = nil, eol = eol, finalNl = finalNl }
+    local cur, item, mode = nil, nil, "header"
+    local i = 1
+    while i <= #lines do
+      local l = lines[i]
+      if l:match("^%%%% kanban:settings") then
+        b.settings = {}
+        for k = i, #lines do table.insert(b.settings, lines[k]) end
+        break
+      end
+      local hashes, title = l:match("^(#+) (.*)$")
+      if l:match("^%*%*%*%s*$") and mode ~= "header" then
+        mode, cur, item = "break", nil, nil
+      elseif hashes and mode == "break" and trim(title) == "Archive" then
+        b.archive = { items = {} }
+        mode, cur, item = "archive", b.archive, nil
+      elseif hashes then
+        cur = { hashes = hashes, title = title, complete = false, items = {} }
+        table.insert(b.lanes, cur)
+        mode, item = "lane", nil
+      elseif mode == "header" then
+        table.insert(b.header, l)
+      else
+        local check, text = isItem(l)
+        if check and cur then
+          item = { check = check, text = text, more = {} }
+          table.insert(cur.items, item)
+        elseif item and l:match("^%s+%S") then
+          table.insert(item.more, l)
+        elseif mode == "lane" and trim(l) == "**Complete**" then
+          cur.complete = true
+          item = nil
+        elseif trim(l) == "" then
+          item = nil
+        else
+          return nil, "line " .. i .. " is not a card (\"" .. cut(trim(l), 30) .. "\")"
+        end
+      end
+      i = i + 1
+    end
+    local isBoard = false
+    for _, h in ipairs(b.header) do if h:match("^kanban%-plugin:") then isBoard = true end end
+    if not isBoard then return nil, "not a Kanban board (no kanban-plugin frontmatter)" end
+    local js = b.settings and table.concat(b.settings, "\n"):match("```%s*(%b{})") or nil
+    if js then
+      local ok, t = pcall(rapidjson.decode, js)
+      if ok and type(t) == "table" then
+        local m = str(t["new-card-insertion-method"])
+        b.prepend = m:sub(1, 7) == "prepend"
+      end
+    end
+    return b
+  end
+
+  local function boardToMd(b)
+    local out = {}
+    local header = {}
+    for _, h in ipairs(b.header) do table.insert(header, h) end
+    while #header > 0 and trim(header[#header]) == "" do table.remove(header) end
+    local s = table.concat(header, "\n") .. "\n\n"
+    for _, lane in ipairs(b.lanes) do
+      local ls = { lane.hashes .. " " .. lane.title, "" }
+      if lane.complete then table.insert(ls, "**Complete**") end
+      for _, it in ipairs(lane.items) do
+        table.insert(ls, "- [" .. it.check .. "] " .. it.text)
+        for _, m in ipairs(it.more) do table.insert(ls, m) end
+      end
+      table.insert(ls, ""); table.insert(ls, ""); table.insert(ls, "")
+      table.insert(out, table.concat(ls, "\n"))
+    end
+    s = s .. table.concat(out)
+    if b.archive and #b.archive.items > 0 then
+      local as = { "***", "", "## Archive", "" }
+      for _, it in ipairs(b.archive.items) do
+        table.insert(as, "- [" .. it.check .. "] " .. it.text)
+        for _, m in ipairs(it.more) do table.insert(as, m) end
+      end
+      s = s .. table.concat(as, "\n")
+    end
+    if b.settings then s = s .. "\n\n" .. table.concat(b.settings, "\n") end
+    if b.finalNl then s = s .. "\n" end
+    if b.eol ~= "\n" then s = s:gsub("\n", b.eol) end
+    return s
+  end
+
+  -- What a card shows: the first line without its block id, "[x]" in front when done.
+  local function cardLabel(it)
+    local t = trim((it.text:gsub("%s*%^[%w%-]+$", "")))
+    return ((it.check ~= " ") and "[x] " or "") .. cut(t, 70)
+  end
+
+  local function renderBoard()
+    local n = board and #board.lanes or 0
+    laneFirst = math.max(1, math.min(laneFirst, math.max(1, n - KB_LANES + 1)))
+    Controls.KbLanePage.String = (n == 0) and "" or
+      (n <= KB_LANES and (n .. (n == 1 and " lane" or " lanes")) or
+       string.format("Lanes %d-%d of %d", laneFirst, math.min(n, laneFirst + KB_LANES - 1), n))
+    Controls.KbLanesPrev.IsDisabled = laneFirst <= 1
+    Controls.KbLanesNext.IsDisabled = laneFirst + KB_LANES - 1 >= n
+    for i = 1, KB_LANES do
+      local li = laneFirst + i - 1
+      local lane = board and board.lanes[li]
+      local lc = Controls.KbLane[i]
+      if lane then
+        local count = #lane.items
+        -- "Doing (3)" is the Kanban plugin's WIP limit: shown as "Doing  2/3"
+        local name, wip = trim(lane.title):match("^(.-)%s*%((%d+)%)$")
+        lc.Legend = wip and (name .. "  " .. count .. "/" .. wip) or (trim(lane.title) .. "  " .. count)
+        lc.Boolean = (li == kbLane)
+        lc.IsInvisible = false
+        local off = laneOff[li] or 0
+        off = math.max(0, math.min(off, count - KB_CARDS))
+        laneOff[li] = off
+        Controls.KbUp[i].IsDisabled = off <= 0
+        Controls.KbDown[i].IsDisabled = off + KB_CARDS >= count
+        for j = 1, KB_CARDS do
+          local c = Controls.KbCard[(i - 1) * KB_CARDS + j]
+          local it = lane.items[off + j]
+          c.Legend = it and cardLabel(it) or ""
+          c.Boolean = it ~= nil and kbSel ~= nil and kbSel.lane == li and kbSel.card == off + j
+          c.IsInvisible = it == nil
+        end
+      else
+        lc.Legend, lc.Boolean, lc.IsInvisible = "", false, board ~= nil
+        Controls.KbUp[i].IsDisabled, Controls.KbDown[i].IsDisabled = true, true
+        for j = 1, KB_CARDS do
+          local c = Controls.KbCard[(i - 1) * KB_CARDS + j]
+          c.Legend, c.Boolean, c.IsInvisible = "", false, true
+        end
+      end
+    end
+    local it = kbSel and board and board.lanes[kbSel.lane] and board.lanes[kbSel.lane].items[kbSel.card]
+    if not it then kbSel = nil end
+    Controls.KbCardText.String = it and it.text or ""
+    for _, nm in ipairs({ "KbLeft", "KbRight", "KbMoveUp", "KbMoveDown", "KbCheck", "KbArchive", "KbCardText" }) do
+      Controls[nm].IsDisabled = it == nil
+    end
+    Controls.KbAdd.IsDisabled = board == nil
+  end
+
+  -- Keep the selected card on screen after it moves.
+  local function showSel()
+    if not kbSel then return end
+    if kbSel.lane < laneFirst then laneFirst = kbSel.lane
+    elseif kbSel.lane > laneFirst + KB_LANES - 1 then laneFirst = kbSel.lane - KB_LANES + 1 end
+    local off = laneOff[kbSel.lane] or 0
+    if kbSel.card <= off then off = kbSel.card - 1
+    elseif kbSel.card > off + KB_CARDS then off = kbSel.card - KB_CARDS end
+    laneOff[kbSel.lane] = off
+  end
+
+  local openBoard
+
+  local function saveBoard()
+    if not board or not online then return end
+    if kbSaving then kbPending = true; return end
+    kbSaving, kbPending = true, false
+    local path = board.path
+    local headers = {}
+    if board.version then headers["If-Match"] = board.version end
+    kbStatus("Saving...")
+    enqueue({ method = "PUT", path = "/vault/" .. encPath(path), data = boardToMd(board), headers = headers, json = false,
+      callback = function(code, t, resp, err, hdrs)
+        kbSaving = false
+        if not board or board.path ~= path then return end
+        if code == 200 or code == 204 then
+          board.version = header(hdrs, "etag")
+          kbStatus("Saved " .. os.date("%H:%M:%S"))
+          if kbPending then saveBoard()
+          elseif not board.version then openBoard(path, true) end
+        elseif code == 412 then
+          kbPending = false
+          kbStatus("Changed elsewhere. Reloaded; try again.")
+          openBoard(path, true, true)
+        else
+          kbPending = false
+          httpError("Save board", code, resp, err)
+          kbStatus("Not saved (" .. (code and ("HTTP " .. code) or "no response") .. ")")
+          openBoard(path, true, true)
+        end
+      end }, true)
+  end
+
+  openBoard = function(path, keepView, keepStatus)
+    enqueue({ method = "GET", path = "/vault/" .. encPath(path), accept = NOTE_JSON, key = "board",
+      callback = function(code, t, resp, err, hdrs)
+        if httpError("Open board " .. path, code, resp, err) then kbStatus("Could not open board"); return end
+        if not t then return end
+        local b, why = parseBoard(path, str(t.content))
+        if not b then
+          board = nil
+          kbStatus("Can't show: " .. why)
+          renderBoard()
+          return
+        end
+        b.version = etagOf(t, hdrs)
+        b.mtime = type(t.stat) == "table" and t.stat.mtime or nil
+        if not keepView then laneFirst, laneOff, kbSel, kbLane = 1, {}, nil, 1 end
+        board = b
+        lastBoardCheck = now()
+        if not keepStatus then kbStatus("") end
+        local label = baseName(path)
+        for k, v in pairs(boardMap) do if v == path then label = k end end
+        Controls.KbBoard.String = label
+        renderBoard()
+      end })
+  end
+
+  local function checkBoard()
+    if not board or kbSaving or busy or #queue > 0 then return end
+    lastBoardCheck = now()
+    local path = board.path
+    enqueue({ method = "GET", path = "/vault/" .. encPath(path), accept = NOTE_JSON, key = "kbcheck",
+      callback = function(code, t, resp, err, hdrs)
+        if not board or board.path ~= path or kbSaving or code ~= 200 or not t then return end
+        local v = etagOf(t, hdrs)
+        if v and board.version and v == board.version then return end
+        local b = parseBoard(path, str(t.content))
+        if not b then return end
+        b.version = v
+        board = b
+        renderBoard()
+      end })
+  end
+
+  -- Boards are the notes whose frontmatter has a kanban-plugin key (JsonLogic search).
+  local function findBoards()
+    enqueue({ method = "POST", path = "/search/", data = '{"var": "frontmatter.kanban-plugin"}',
+      contentType = "application/vnd.olrapi.jsonlogic+json", key = "boards",
+      callback = function(code, t, resp, err)
+        if httpError("Find Kanban boards", code, resp, err) then kbStatus("Board search failed"); return end
+        local names = {}
+        boardMap = {}
+        for _, r in ipairs(type(t) == "table" and t or {}) do
+          local f = str(r.filename)
+          if f ~= "" then
+            local label = f:gsub("%.md$", "")
+            boardMap[label] = f
+            table.insert(names, label)
+          end
+        end
+        table.sort(names, function(a, b) return a:lower() < b:lower() end)
+        Controls.KbBoard.Choices = names
+        if #names == 0 then kbStatus("No Kanban boards found") end
+        local want = trim(Controls.KbBoardOpen.String)
+        if want ~= "" then
+          openBoard(boardMap[want] or notePath(want))
+        elseif board then
+          openBoard(board.path, true)
+        elseif boardMap[Controls.KbBoard.String] then
+          openBoard(boardMap[Controls.KbBoard.String])
+        end
+      end })
+  end
+
+  kb.discover = findBoards
+  kb.tick = function()
+    if NOTE_REFRESH > 0 and board and now() - lastBoardCheck >= NOTE_REFRESH then checkBoard() end
+  end
+  kb.reset = function() board, kbSaving, kbPending = nil, false, false; renderBoard() end
+
+  local function selItem()
+    if not (board and kbSel) then return nil end
+    local lane = board.lanes[kbSel.lane]
+    return lane and lane.items[kbSel.card], lane
+  end
+
+  -- Checked state follows the Kanban plugin: moving into a "Complete" lane checks a card,
+  -- moving out of one unchecks it.
+  local function moveTo(li, pos)
+    local it, from = selItem()
+    local to = board.lanes[li]
+    if not it or not to then return end
+    table.remove(from.items, kbSel.card)
+    if to.complete and not from.complete then it.check = "x"
+    elseif from.complete and not to.complete then it.check = " " end
+    pos = math.max(1, math.min(pos or (#to.items + 1), #to.items + 1))
+    table.insert(to.items, pos, it)
+    kbSel = { lane = li, card = pos }
+    showSel()
+    renderBoard()
+    saveBoard()
+  end
+
+  Controls.KbLeft.EventHandler = function() if kbSel and kbSel.lane > 1 then moveTo(kbSel.lane - 1) end end
+  Controls.KbRight.EventHandler = function() if kbSel and board and kbSel.lane < #board.lanes then moveTo(kbSel.lane + 1) end end
+  Controls.KbMoveUp.EventHandler = function() if kbSel and kbSel.card > 1 then moveTo(kbSel.lane, kbSel.card - 1) end end
+  Controls.KbMoveDown.EventHandler = function()
+    local it, lane = selItem()
+    if it and kbSel.card < #lane.items then moveTo(kbSel.lane, kbSel.card + 1) end
+  end
+  Controls.KbCheck.EventHandler = function()
+    local it = selItem()
+    if not it then return end
+    it.check = (it.check == " ") and "x" or " "
+    renderBoard()
+    saveBoard()
+  end
+  Controls.KbArchive.EventHandler = function()
+    local it, lane = selItem()
+    if not it then return end
+    local t = armed.kbarchive
+    if not (t and now() - t < CONFIRM) then
+      armed = { kbarchive = now() }
+      kbStatus("Press Archive again to archive the card")
+      return
+    end
+    armed = {}
+    table.remove(lane.items, kbSel.card)
+    board.archive = board.archive or { items = {} }
+    table.insert(board.archive.items, it)
+    kbSel = nil
+    renderBoard()
+    saveBoard()
+  end
+  Controls.KbCardText.EventHandler = function(c)
+    local it = selItem()
+    local text = trim((c.String:gsub("\r?\n", " ")))
+    if not it or text == "" or text == it.text then renderBoard(); return end
+    it.text = text
+    renderBoard()
+    saveBoard()
+  end
+  Controls.KbAdd.EventHandler = function()
+    local text = trim((Controls.KbNewText.String:gsub("\r?\n", " ")))
+    local lane = board and board.lanes[kbLane]
+    if text == "" or not lane then return end
+    local it = { check = lane.complete and "x" or " ", text = text, more = {} }
+    local pos = board.prepend and 1 or (#lane.items + 1)
+    table.insert(lane.items, pos, it)
+    Controls.KbNewText.String = ""
+    kbSel = { lane = kbLane, card = pos }
+    showSel()
+    renderBoard()
+    saveBoard()
+  end
+  Controls.KbNewText.EventHandler = function() end
+
+  for i = 1, KB_LANES do
+    Controls.KbLane[i].EventHandler = function()
+      if board and board.lanes[laneFirst + i - 1] then kbLane = laneFirst + i - 1 end
+      renderBoard()
+    end
+    Controls.KbUp[i].EventHandler = function()
+      local li = laneFirst + i - 1
+      laneOff[li] = (laneOff[li] or 0) - (KB_CARDS - 1); renderBoard()
+    end
+    Controls.KbDown[i].EventHandler = function()
+      local li = laneFirst + i - 1
+      laneOff[li] = (laneOff[li] or 0) + (KB_CARDS - 1); renderBoard()
+    end
+    for j = 1, KB_CARDS do
+      Controls.KbCard[(i - 1) * KB_CARDS + j].EventHandler = function()
+        local li = laneFirst + i - 1
+        local idx = (laneOff[li] or 0) + j
+        if kbSel and kbSel.lane == li and kbSel.card == idx then kbSel = nil   -- second tap deselects
+        elseif board and board.lanes[li] and board.lanes[li].items[idx] then kbSel = { lane = li, card = idx }; kbLane = li end
+        renderBoard()
+      end
+    end
+  end
+  Controls.KbLanesPrev.EventHandler = function() laneFirst = laneFirst - KB_LANES; renderBoard() end
+  Controls.KbLanesNext.EventHandler = function() laneFirst = laneFirst + KB_LANES; renderBoard() end
+  Controls.KbBoard.EventHandler = function(c)
+    local p = boardMap[c.String]
+    if p and online then openBoard(p) end
+  end
+  Controls.KbBoardOpen.EventHandler = function(c)
+    local want = trim(c.String)
+    if want ~= "" and online then openBoard(boardMap[want] or notePath(want)) end
+  end
+  Controls.KbRefresh.EventHandler = function()
+    if online then findBoards() end
+  end
+
   -- setup -----------------------------------------------------------
   Controls.Protocol.EventHandler = function(c)
     -- switching mode moves to that mode's default port when the port was the other default
@@ -1407,6 +1898,8 @@ if Controls then
   Controls.FolderPath.String = "/"
   Controls.FileList.Choices = {}
   Controls.ResultList.Choices = {}
+  Controls.KbBoard.Choices = {}
+  kb.reset()
   renderAll()
   restart()
 end
