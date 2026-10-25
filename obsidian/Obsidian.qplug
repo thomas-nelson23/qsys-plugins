@@ -1,0 +1,1905 @@
+--[[ Obsidian notes plugin for Q-SYS
+  Browse, read, search and edit the notes in an Obsidian vault from a Q-SYS
+  Core or touch panel.
+
+  Obsidian Sync has no public API and its remote vaults are end-to-end
+  encrypted, so a Core cannot read them directly. This plugin talks instead to
+  the community plugin "Local REST API with MCP" (Adam Coddington) running
+  inside the Obsidian desktop app on a computer that has the vault open and
+  synced with Obsidian Sync. Edits made here are saved into that local vault,
+  and Obsidian Sync carries them to every other device.
+
+  Endpoints used (all with "Authorization: Bearer <API key>"):
+    GET  /                          server status, versions, whether the key is accepted
+    GET  /vault/<folder>/           folder listing ({ files = { "note.md", "sub/" } })
+    GET  /vault/<path>              a note as application/vnd.olrapi.note+json (content, stat, version)
+    PUT  /vault/<path>              save the whole note (If-Match: <ETag> so changes from
+                                    another device are never overwritten silently;
+                                    If-None-Match: * to create a note without overwriting)
+    POST /vault/<path>              append to the end of a note
+    POST /search/simple/?query=...  full-text search
+    POST /open/<path>               show the note in Obsidian on the host computer
+    POST /search/  (JsonLogic)      find Kanban boards: notes whose frontmatter has "kanban-plugin"
+
+  References:
+    Local REST API with MCP, OpenAPI spec (v5.5.2) - https://github.com/coddingtonbear/obsidian-local-rest-api/blob/main/docs/openapi.yaml
+    Local REST API interactive docs                - https://coddingtonbear.github.io/obsidian-local-rest-api/
+    Obsidian Sync (Obsidian Help)                  - https://help.obsidian.md/sync
+    Obsidian Sync security and privacy             - https://help.obsidian.md/sync/security
+    Kanban plugin (mgmeyers), board format v2.0.51 - https://github.com/mgmeyers/obsidian-kanban (src/parsers/formats/list.ts)
+    Q-SYS HttpClient                               - https://help.qsys.com/Content/Control_Scripting/Using_Lua_in_Q-Sys/HttpClient.htm
+    Q-SYS plugin reserved functions / layout       - https://help.qsys.com/DeveloperHelp/Content/Standards_Definitions/Reserved_Functions.htm
+]]
+
+PluginInfo = {
+  Name = "Productivity~Obsidian Notes",
+  Version = "1.1",
+  BuildVersion = "1.1.0.0",
+  Id = "3cde955b-6b76-48ca-a831-40ce11b3391e",
+  Author = "AV Programming",
+  Description = "Browse, read, search and edit Obsidian notes and Kanban boards (with Obsidian Sync) through the Local REST API community plugin running on a computer that has the vault open.",
+  ShowDebug = true,
+}
+
+local ACCENT = { 124, 58, 237 }  -- Obsidian purple (schematic block color only; pages use the shared theme)
+
+--[[ Deep Ocean theme for Q-SYS plugins, v2.0 (2026-10-15)
+     The home-dash design system (thomas-nelson23/home-dashboard, web/src/styles.css + theme.css)
+     translated into what GetControlLayout can draw. Paste this block into a .qplug above
+     GetControlLayout, then:
+
+       function GetControlLayout(props)
+         local layout, graphics = {}, {}
+         local ui = Theme.kit(layout, graphics)
+         ui.page(600)
+         ui.header("PHILIPS|HUE", "Control", "BridgeName", "Status", "Online", 1)
+         ui.section("Power", 8, 64, 200, 160)
+         ui.button("Power", "POWER", 24, 96, 168, 48, "power")
+         ...
+         ui.hint("Pick a room, then use the pads.", 568)
+         return layout, graphics
+       end
+
+     Every property used here is a documented GetControlLayout property:
+     https://help.qsys.com/DeveloperHelp/Content/Standards_Definitions/Reserved_Functions.htm
+     Guide: design/README.md in thomas-nelson23/qsys-plugins.
+]]
+local Theme = {}
+
+Theme.W = 640   -- page width; every page is 640 wide
+Theme.GRID = 8  -- positions and sizes snap to 8 (4 for fine alignment inside a row)
+
+-- home-dash tokens. Glass and hairline colors are pre-blended over the panel or the
+-- field, because Q-SYS draws solid fills (comments give the CSS each one comes from).
+Theme.N = {
+  bg      = { 2, 29, 46 },     -- --field #021d2e: the one flat deep-blue field
+  panel   = { 6, 18, 27 },     -- .panel/.tile: rgba(--ink 4,12,18, .62-.93) glass over the field
+  strip   = { 8, 27, 37 },     -- --surface-hi rgba(cyan, .045): a tile or row inside a panel
+  rowAlt  = { 12, 24, 33 },    -- rgba(255,255,255,.025): alternate list row
+  well    = { 4, 13, 19 },     -- .field input rgba(0,0,0,.3): readouts, fields, meters, hint bar
+  stroke  = { 25, 41, 50 },    -- --glass-edge rgba(200,245,255,.1): panel and input edges
+  hair    = { 20, 31, 40 },    -- --hair rgba(255,255,255,.055): dividers
+  line    = { 10, 37, 50 },    -- --line rgba(cyan,.1)
+  lineStrong = { 16, 72, 91 }, -- --line-strong rgba(cyan,.28): button and field outlines
+  btn     = { 12, 24, 33 },    -- .btn background rgba(255,255,255,.025)
+  btnOn   = { 25, 41, 50 },    -- .btn:hover, lifted
+  ledOff  = { 0, 0, 0, 0 },    -- .led-off: hollow, only the ring shows
+  white   = { 255, 255, 255 }, -- headings and big values (#fff)
+  text    = { 217, 238, 242 }, -- --text #d9eef2
+  sub     = { 156, 199, 207 }, -- --text-soft #9cc7cf: labels, secondary values
+  dim     = { 95, 114, 122 },  -- --text-dim #5f727a: section titles, notes, units
+  off     = { 58, 70, 80 },    -- --off #3a4650
+  ink     = { 11, 15, 28 },    -- #0b0f1c: text on a solid cyan or white fill
+}
+
+-- Semantic colors: same meaning in every plugin. Cyan is also the only accent.
+Theme.S = {
+  ok    = { 42, 212, 255 },  -- --cyan #2ad4ff (Deep Ocean): good, online, on, the accent
+  warn  = { 255, 176, 32 },  -- --warn #ffb020: attention only, always with a label
+  fault = { 255, 42, 79 },   -- --red #ff2a4f: bad/offline, destructive actions, small signals
+}
+
+function Theme.mix(a, b, t)  -- t = 0 gives a, t = 1 gives b
+  return { math.floor(a[1] + (b[1] - a[1]) * t + 0.5),
+           math.floor(a[2] + (b[2] - a[2]) * t + 0.5),
+           math.floor(a[3] + (b[3] - a[3]) * t + 0.5) }
+end
+
+-- home-dash has one accent, cyan. Theme.brand keeps the v1 field names so plugin code that
+-- reads ui.B still works; the accent argument is accepted and ignored.
+function Theme.brand()
+  local cyan, panel = Theme.S.ok, Theme.N.panel
+  return {
+    accent = cyan,                        -- fader/knob/meter fill, on state of solid controls
+    on     = Theme.mix(panel, cyan, 0.45), -- lit button fill (cyan at 45% over the panel)
+    soft   = Theme.mix(panel, cyan, 0.08), -- --cyan-soft: .btn-accent and pad off state
+    edge   = Theme.mix(panel, cyan, 0.45), -- rgba(cyan,.45): .btn-accent border
+    dim    = Theme.mix(panel, cyan, 0.08), -- v1 name for soft
+    pad    = Theme.mix(panel, cyan, 0.08), -- v1 name for soft
+    ink    = cyan,                        -- cyan text (.lcd-inline, .bar-rest)
+  }
+end
+
+-- Fonts. Q-SYS ships a fixed font list; these are the closest stand-ins for home-dash's
+-- Sora (text), JetBrains Mono (numbers, ids) and Michroma (wordmark, display).
+local FONT, MONO, DISPLAY = "Poppins", "Roboto Mono", "Montserrat"
+
+local CUBE_SVG = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0xMDAgLTEwMCAyMDAgMjAwIj48ZyBm"
+  .. "aWxsPSJub25lIiBzdHJva2U9IiMyYWQ0ZmYiIHN0cm9rZS13aWR0aD0iNy4wIiBzdHJva2UtbGluZWNhcD0icm91bmQiPjxw"
+  .. "YXRoIHN0cm9rZS1vcGFjaXR5PSIwLjE3NiIgZD0iTS0wLjAsODAuM0wtNzAuNyw0Mi4xTS0wLjAsODAuM0w3MC43LDQyLjFN"
+  .. "MjMuNiw2Ny41TC00Ny4xLDI5LjNNLTIzLjYsNjcuNUw0Ny4xLDI5LjNNNDcuMSw1NC44TC0yMy42LDE2LjZNLTQ3LjEsNTQu"
+  .. "OEwyMy42LDE2LjZNNzAuNyw0Mi4xTDAuMCwzLjlNLTcwLjcsNDIuMUwwLjAsMy45TTcwLjcsNDIuMUw3MC43LC00Mi4xTTcw"
+  .. "LjcsNDIuMUwwLjAsMy45TTQ3LjEsMjkuM0w0Ny4xLC01NC44TTcwLjcsMTQuMEwwLjAsLTI0LjJNMjMuNiwxNi42TDIzLjYs"
+  .. "LTY3LjVNNzAuNywtMTQuMEwwLjAsLTUyLjJNMC4wLDMuOUwwLjAsLTgwLjNNNzAuNywtNDIuMUwwLjAsLTgwLjNNLTcwLjcs"
+  .. "NDIuMUwtNzAuNywtNDIuMU0tNzAuNyw0Mi4xTDAuMCwzLjlNLTQ3LjEsMjkuM0wtNDcuMSwtNTQuOE0tNzAuNywxNC4wTDAu"
+  .. "MCwtMjQuMk0tMjMuNiwxNi42TC0yMy42LC02Ny41TS03MC43LC0xNC4wTDAuMCwtNTIuMk0wLjAsMy45TDAuMCwtODAuM00t"
+  .. "NzAuNywtNDIuMUwwLjAsLTgwLjMiLz48cGF0aCBzdHJva2Utb3BhY2l0eT0iMC44IiBkPSJNLTAuMCwtMy45TC03MC43LC00"
+  .. "Mi4xTS0wLjAsLTMuOUw3MC43LC00Mi4xTTIzLjYsLTE2LjZMLTQ3LjEsLTU0LjhNLTIzLjYsLTE2LjZMNDcuMSwtNTQuOE00"
+  .. "Ny4xLC0yOS4zTC0yMy42LC02Ny41TS00Ny4xLC0yOS4zTDIzLjYsLTY3LjVNNzAuNywtNDIuMUwwLjAsLTgwLjNNLTcwLjcs"
+  .. "LTQyLjFMMC4wLC04MC4zTS0wLjAsODAuM0wtMC4wLC0zLjlNLTAuMCw4MC4zTC03MC43LDQyLjFNLTIzLjYsNjcuNUwtMjMu"
+  .. "NiwtMTYuNk0tMC4wLDUyLjJMLTcwLjcsMTQuME0tNDcuMSw1NC44TC00Ny4xLC0yOS4zTS0wLjAsMjQuMkwtNzAuNywtMTQu"
+  .. "ME0tNzAuNyw0Mi4xTC03MC43LC00Mi4xTS0wLjAsLTMuOUwtNzAuNywtNDIuMU0tMC4wLDgwLjNMLTAuMCwtMy45TS0wLjAs"
+  .. "ODAuM0w3MC43LDQyLjFNMjMuNiw2Ny41TDIzLjYsLTE2LjZNLTAuMCw1Mi4yTDcwLjcsMTQuME00Ny4xLDU0LjhMNDcuMSwt"
+  .. "MjkuM00tMC4wLDI0LjJMNzAuNywtMTQuME03MC43LDQyLjFMNzAuNywtNDIuMU0tMC4wLC0zLjlMNzAuNywtNDIuMSIvPjwv"
+  .. "Zz48L3N2Zz4="
+
+local function merge(t, extra)
+  for k, v in pairs(extra or {}) do t[k] = v end
+  return t
+end
+
+function Theme.kit(layout, graphics)
+  local N, S, B = Theme.N, Theme.S, Theme.brand()
+  local ui = { N = N, S = S, B = B }
+
+  local function g(t) table.insert(graphics, t) end
+  local function box(x, y, w, h, fill, stroke, radius)
+    g({ Type = "GroupBox", Fill = fill, StrokeColor = stroke or fill, StrokeWidth = stroke and 1 or 0,
+        CornerRadius = radius or 0, Position = { x, y }, Size = { w, h } })
+  end
+
+  -- Static text. size: 10 hint/title, 11 label, 12 body, 13 emphasis
+  function ui.label(text, x, y, w, h, align, size, color, style)
+    g({ Type = "Label", Text = text, Font = FONT, FontStyle = style or "Regular", FontSize = size or 11,
+        HTextAlign = align or "Right", Color = color or N.sub, Position = { x, y }, Size = { w, h or 20 } })
+  end
+
+  -- Page background: one flat field, no glows. Call first so it sits behind everything.
+  function ui.page(h)
+    box(0, 0, Theme.W, h, N.bg)
+  end
+
+  -- The wireframe cube from home-dash's backdrop, frozen at its starting pose
+  -- (the frame home-dash shows when motion is reduced). s = size in px.
+  function ui.cube(x, y, s)
+    g({ Type = "Svg", Image = CUBE_SVG, Position = { x, y }, Size = { s, s } })
+  end
+  ui.sun = ui.cube  -- v1 name
+
+  -- The front window's top edge: transparent > cyan > red > transparent, in 24 px steps.
+  function ui.edge(x, y, w, base)
+    local n = math.floor(w / 24)
+    for i = 0, n - 1 do
+      local t = (i + 0.5) / n
+      local c
+      if t < 0.25 then c = Theme.mix(base, S.ok, t / 0.25)
+      elseif t < 0.75 then c = Theme.mix(S.ok, S.fault, (t - 0.25) / 0.5)
+      else c = Theme.mix(S.fault, base, (t - 0.75) / 0.25) end
+      box(x + i * 24, y, (i == n - 1) and (w - i * 24) or 24, 1, c)
+    end
+  end
+
+  -- Top bar: cube, wordmark (Michroma stand-in; text after "|" is red, like "home|dash"),
+  -- page number (red, mono) and page name like the numbered menu, device name, Status, Online LED.
+  function ui.header(wordmark, pageName, nameCtl, statusCtl, ledCtl, pageNo)
+    box(8, 8, 624, 48, N.panel, N.stroke, 8)
+    ui.edge(16, 8, 608, N.stroke)
+    ui.cube(18, 16, 32)
+    local a, b = wordmark:match("^(.-)|(.*)$")
+    a, b = string.upper(a or wordmark), string.upper(b or "")
+    -- Q-SYS can't measure text, so the white part is right-aligned and the red part
+    -- left-aligned on one seam; only the seam position is estimated (caps ~8.5 px at 13 px).
+    local seam = 58 + math.floor(#a * 8.5 + 0.5)
+    g({ Type = "Label", Text = a, Font = DISPLAY, FontStyle = "Medium", FontSize = 13, HTextAlign = "Right",
+        Color = N.white, Position = { seam - 104, 20 }, Size = { 104, 24 }, Padding = 0 })
+    if b ~= "" then
+      g({ Type = "Label", Text = b, Font = DISPLAY, FontStyle = "Medium", FontSize = 13, HTextAlign = "Left",
+          Color = S.fault, Position = { seam, 20 }, Size = { 104, 24 }, Padding = 0 })
+    end
+    if pageNo then
+      g({ Type = "Label", Text = string.format("%02d", pageNo), Font = MONO, FontSize = 10, HTextAlign = "Left",
+          Color = S.fault, Position = { 160, 22 }, Size = { 20, 20 } })
+    end
+    g({ Type = "Label", Text = string.upper(pageName), Font = FONT, FontStyle = "Medium", FontSize = 10,
+        HTextAlign = "Left", Color = N.white, Position = { 180, 22 }, Size = { 96, 20 } })
+    if nameCtl then ui.value(nameCtl, nil, 280, 20, 164, 24, { Color = N.panel, TextColor = N.sub, FontSize = 12 }) end
+    if statusCtl then
+      layout[statusCtl] = { PrettyName = "Status", Style = "Text", Position = { 452, 20 }, Size = { 140, 24 },
+        Font = FONT, FontSize = 11, CornerRadius = 12 }
+    end
+    if ledCtl then ui.led(ledCtl, "Online", 602, 24, 16, "ok") end
+  end
+
+  -- Panel: glass card with a hairline edge, a small red signal, an uppercase dim title
+  -- and a hairline under the title. Content starts 32 px below y.
+  function ui.section(title, x, y, w, h)
+    box(x, y, w, h, N.panel, N.stroke, 8)
+    if title and title ~= "" then
+      g({ Type = "GroupBox", StrokeColor = S.fault, StrokeWidth = 1, CornerRadius = 4,
+          Position = { x + 12, y + 10 }, Size = { 8, 8 } })
+      ui.label(string.upper(title), x + 26, y + 4, w - 38, 20, "Left", 10, N.dim, "SemiBold")
+      box(x + 1, y + 27, w - 2, 1, N.hair)
+    end
+  end
+
+  -- Tile inside a panel.
+  function ui.strip(x, y, w, h)
+    box(x, y, w, h, N.strip, N.hair, 8)
+  end
+
+  -- List row: every other row gets the faint lift.
+  function ui.row(x, y, w, h, i)
+    box(x, y, w, h, (i % 2 == 0) and N.rowAlt or N.strip, nil, 4)
+  end
+
+  -- Hint bar: one line of help per page, at the bottom.
+  function ui.hint(text, y)
+    g({ Type = "Label", Text = text, Font = FONT, FontSize = 10, HTextAlign = "Left", Color = N.dim, Fill = N.well,
+        StrokeColor = N.hair, StrokeWidth = 1, CornerRadius = 8, Margin = 0, Padding = 8,
+        Position = { 8, y }, Size = { 624, 24 } })
+  end
+
+  -- Buttons. kind (home-dash class in brackets):
+  --   "primary"   toggle; dark pill, cyan when on            (.btn / .seg-btn.on)
+  --   "secondary" cyan-tinted pill, cyan legend              (.btn-accent)
+  --   "utility"   plain pill, soft legend                    (.btn)
+  --   "pad"       preset tile, 8 px corners, cyan when on    (.tile-layouts button)
+  --   "power"     the page's main action, bold               (.btn-accent, larger)
+  --   "warn" / "danger" / "ok"  semantic tint and legend     (.banner-warn / .btn-danger)
+  -- Pass ButtonStyle ("Toggle", "Momentary", "Trigger"...) in extra to match the control's ButtonType.
+  local function tint(c, a) return Theme.mix(N.panel, c, a) end
+  local KINDS = {
+    primary   = { on = B.on, off = N.btn, text = N.text, stroke = N.lineStrong, pill = true, style = "SemiBold" },
+    secondary = { on = B.on, off = B.soft, text = S.ok, stroke = B.edge, pill = true, style = "SemiBold" },
+    utility   = { on = N.btnOn, off = N.btn, text = N.sub, stroke = N.lineStrong, pill = true, style = "SemiBold" },
+    pad       = { on = B.on, off = N.strip, text = N.text, stroke = N.line, pill = false, style = "Medium" },
+    power     = { on = B.on, off = N.btn, text = N.white, stroke = B.edge, pill = true, style = "Bold", size = 16 },
+    warn      = { on = tint(S.warn, 0.25), off = tint(S.warn, 0.06), text = S.warn, stroke = tint(S.warn, 0.3), pill = true, style = "SemiBold" },
+    danger    = { on = tint(S.fault, 0.25), off = tint(S.fault, 0.1), text = S.fault, stroke = tint(S.fault, 0.45), pill = true, style = "SemiBold" },
+    ok        = { on = tint(S.ok, 0.25), off = B.soft, text = S.ok, stroke = B.edge, pill = true, style = "SemiBold" },
+  }
+  function ui.button(name, legend, x, y, w, h, kind, extra)
+    local k = KINDS[kind or "primary"] or KINDS.primary
+    h = h or 28
+    layout[name] = merge({ PrettyName = name, Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h },
+      Color = k.on, OffColor = k.off, UnlinkOffColor = true, TextColor = k.text, StrokeColor = k.stroke, StrokeWidth = 1,
+      Font = FONT, FontStyle = k.style, FontSize = k.size or 12,
+      CornerRadius = k.pill and math.floor(math.min(w, h) / 2) or 8, ButtonVisualStyle = "Flat", Margin = 0, WordWrap = true }, extra)
+  end
+
+  -- Read-only readout: dark well, mono digits, no outline.
+  function ui.readout(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = MONO, FontStyle = "Regular", FontSize = 12, HTextAlign = "Left",
+      CornerRadius = 8, StrokeColor = N.well, StrokeWidth = 0, Padding = 4 }, extra)
+  end
+
+  -- Editable field: same well, plus the cyan-tinted outline so it reads as typeable.
+  function ui.field(name, pretty, x, y, w, h, extra)
+    ui.readout(name, pretty, x, y, w, h, merge({ StrokeColor = N.lineStrong, StrokeWidth = 1 }, extra))
+  end
+
+  -- Plain value text on the panel (names, secondary info). No well.
+  function ui.value(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Text", Position = { x, y }, Size = { w, h or 20 },
+      Color = N.panel, TextColor = N.text, Font = FONT, FontSize = 12, HTextAlign = "Left", StrokeWidth = 0,
+      TextBoxStyle = "NoBackground" }, extra)
+  end
+
+  function ui.combo(name, pretty, x, y, w, h, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "ComboBox", Position = { x, y }, Size = { w, h or 24 },
+      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 12, StrokeColor = N.stroke, StrokeWidth = 1,
+      CornerRadius = 8 }, extra)
+  end
+
+  -- Fader: horizontal when w > h, vertical when h > w. Cyan unless the color is the content.
+  function ui.fader(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Fader", Position = { x, y }, Size = { w, h },
+      Color = color or B.accent }, extra)
+  end
+
+  -- Knob: secondary parameters only (trim, fade time, step). 36 or 48 square.
+  function ui.knob(name, pretty, x, y, s, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Knob", Position = { x, y }, Size = { s or 36, s or 36 },
+      Color = color or B.accent }, extra)
+  end
+
+  -- Status dot. kind: "ok" | "warn" | "fault" | "accent" | an RGB table (e.g. a color swatch).
+  -- Off is hollow: only the dim ring shows (.led-off).
+  function ui.led(name, pretty, x, y, s, kind, extra)
+    local c = type(kind) == "table" and kind or (kind == "accent" and B.accent) or S[kind or "ok"] or S.ok
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Led", Position = { x, y }, Size = { s or 16, s or 16 },
+      Color = c, OffColor = N.ledOff, UnlinkOffColor = true, StrokeColor = N.dim, StrokeWidth = 1, Margin = 3 }, extra)
+  end
+
+  -- Meter: thin cyan bar on a faint track, no built-in text box (put a readout next to it).
+  function ui.meter(name, pretty, x, y, w, h, color, extra)
+    layout[name] = merge({ PrettyName = pretty or name, Style = "Meter", MeterStyle = "Standard", Position = { x, y },
+      Size = { w, h }, Color = color or B.accent, BackgroundColor = Theme.mix(N.panel, N.white, 0.06), CornerRadius = 2,
+      ShowTextbox = false, StrokeWidth = 0 }, extra)
+  end
+
+  -- Hide a control but keep its pins.
+  function ui.hide(name, pretty)
+    layout[name] = { PrettyName = pretty or name, Style = "None", Position = { 0, 0 }, Size = { 0, 0 } }
+  end
+
+  return ui
+end
+
+local READ_ROWS = 20  -- reader rows on the Notes page
+local KB_LANES = 4    -- Kanban lanes on screen at once
+local KB_CARDS = 8    -- cards on screen per lane
+
+function GetColor(props)
+  return ACCENT
+end
+
+function GetPrettyName(props)
+  return "Obsidian Notes v" .. PluginInfo.Version
+end
+
+local function PageNames(props)
+  local names = { "Notes", "Edit", "Search", "Kanban", "Setup" }
+  if props["Kanban UCI Page"] and props["Kanban UCI Page"].Value == "On" then table.insert(names, "Kanban UCI") end
+  return names
+end
+
+function GetPages(props)
+  local pages = {}
+  for _, name in ipairs(PageNames(props)) do table.insert(pages, { name = name }) end
+  return pages
+end
+
+function GetProperties()
+  return {
+    { Name = "Poll Interval (s)", Type = "integer", Min = 2, Max = 120, Value = 5 },
+    { Name = "Note Refresh (s)", Type = "integer", Min = 0, Max = 600, Value = 10 },
+    { Name = "Reader Wrap (chars)", Type = "integer", Min = 20, Max = 200, Value = 52 },
+    { Name = "Max Note Size (KB)", Type = "integer", Min = 16, Max = 2048, Value = 256 },
+    { Name = "Kanban UCI Page", Type = "enum", Choices = { "Off", "On" }, Value = "Off" },
+    { Name = "Debug Print", Type = "enum", Choices = { "None", "Errors", "All" }, Value = "Errors" },
+  }
+end
+
+function RectifyProperties(props)
+  return props
+end
+
+function GetControls(props)
+  local function ind(name, count) return { Name = name, ControlType = "Indicator", IndicatorType = "Text", Count = count, PinStyle = "Output", UserPin = true } end
+  local function led(name) return { Name = name, ControlType = "Indicator", IndicatorType = "Led", PinStyle = "Output", UserPin = true } end
+  local function trig(name) return { Name = name, ControlType = "Button", ButtonType = "Trigger", PinStyle = "Input", UserPin = true } end
+  local function text(name, pin) return { Name = name, ControlType = "Text", PinStyle = pin or "Both", UserPin = true } end
+  local function scroll(name) return { Name = name, ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, DefaultValue = 100, PinStyle = "None", UserPin = false } end
+
+  return {
+    -- header
+    { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output", UserPin = true },
+    led("Online"), ind("HostName"),
+    -- notes: vault browser
+    ind("FolderPath"), trig("FolderUp"), trig("FolderRoot"), trig("Refresh"),
+    text("FileList"),
+    -- notes: reader
+    ind("NoteTitle"), ind("NoteInfo"), ind("NotePath"),
+    ind("ReadLine", READ_ROWS),
+    scroll("ReadScroll"), trig("ReadScrollUp"), trig("ReadScrollDown"),
+    trig("Reload"), trig("ShowOnPC"), led("RemoteChanged"), ind("NoteState"),
+    text("NoteOpen", "Input"),
+    -- edit
+    ind("EditTitle"), text("LineList"), ind("LineNo"), text("LineText"),
+    trig("InsertAbove"), trig("InsertBelow"), trig("DeleteLine"), trig("DuplicateLine"),
+    trig("MoveUp"), trig("MoveDown"), trig("ToggleTask"), trig("ToggleBullet"),
+    trig("Undo"), trig("Revert"), trig("Save"), trig("Overwrite"),
+    led("Unsaved"), ind("SaveStatus"),
+    text("AppendText"),
+    { Name = "AppendStamp", ControlType = "Button", ButtonType = "Toggle", PinStyle = "Both", UserPin = true },
+    trig("Append"), ind("AppendStatus"),
+    -- search and new note
+    text("SearchQuery"), trig("Search"), ind("SearchCount"), text("ResultList"), ind("ResultContext"),
+    text("NewFolder"), text("NewName"), trig("CreateNote"), ind("NewStatus"),
+    -- kanban
+    text("KbBoard"), trig("KbRefresh"), ind("KbStatus"), trig("KbLanesPrev"), trig("KbLanesNext"), ind("KbLanePage"),
+    { Name = "KbLane", ControlType = "Button", ButtonType = "Toggle", Count = KB_LANES, PinStyle = "Both", UserPin = true },
+    { Name = "KbCard", ControlType = "Button", ButtonType = "Toggle", Count = KB_LANES * KB_CARDS, PinStyle = "Both", UserPin = true },
+    { Name = "KbUp", ControlType = "Button", ButtonType = "Trigger", Count = KB_LANES, PinStyle = "Input", UserPin = true },
+    { Name = "KbDown", ControlType = "Button", ButtonType = "Trigger", Count = KB_LANES, PinStyle = "Input", UserPin = true },
+    text("KbCardText"), trig("KbLeft"), trig("KbRight"), trig("KbMoveUp"), trig("KbMoveDown"),
+    trig("KbCheck"), trig("KbArchive"), text("KbNewText"), trig("KbAdd"),
+    text("KbBoardOpen", "Input"),
+    -- setup
+    text("Host"), text("Port"), text("Protocol"), text("ApiKey"), trig("Connect"),
+    ind("LastError"), ind("Service"), ind("PluginVersion"), ind("ObsidianVersion"), ind("AuthState"),
+    ind("CertInfo"), ind("LastUpdate"),
+    text("LogNote"), text("LogAppend", "Input"), ind("LogStatus"),
+  }
+end
+
+function GetControlLayout(props)
+  local layout, graphics = {}, {}
+  local pageNo = props["page_index"].Value
+  local page = PageNames(props)[pageNo]
+  local ui = Theme.kit(layout, graphics)
+  local N, S = ui.N, ui.S
+
+  local function listbox(name, pretty, x, y, w, h, extra)
+    local t = { PrettyName = pretty, Style = "ListBox", Position = { x, y }, Size = { w, h },
+      Color = N.well, TextColor = N.text, Font = FONT, FontSize = 11, StrokeColor = N.stroke, StrokeWidth = 1,
+      CornerRadius = 8 }
+    for k, v in pairs(extra or {}) do t[k] = v end
+    layout[name] = t
+  end
+  local function scrollbar(prefix, pretty, x, y, h)
+    ui.button(prefix .. "ScrollUp", "^", x, y, 20, 20, "utility", { FontSize = 11, PrettyName = pretty .. "~Scroll Up" })
+    ui.fader(prefix .. "Scroll", pretty .. "~Scroll", x, y + 24, 20, h - 48, nil, { ShowTextbox = false })
+    ui.button(prefix .. "ScrollDown", "v", x, y + h - 20, 20, 20, "utility", { FontSize = 11, PrettyName = pretty .. "~Scroll Down" })
+  end
+  local function btn(name, legend, x, y, w, h, kind, pretty, extra)
+    local e = { PrettyName = pretty }
+    for k, v in pairs(extra or {}) do e[k] = v end
+    ui.button(name, legend, x, y, w, h, kind, e)
+  end
+
+  -- One Kanban lane: title button (tap to pick the lane for new cards), cards, scroll buttons.
+  local function lane(i, x, y, w, cardH, gap, titleH, scrollAtTop, fontSize)
+    ui.strip(x, y, w, titleH + 12 + KB_CARDS * (cardH + gap) + (scrollAtTop and 0 or 32))
+    local tw = scrollAtTop and (w - 104) or (w - 16)
+    btn("KbLane " .. i, "", x + 8, y + 6, tw, titleH, "pad", "Kanban~Lane " .. i,
+      { ButtonStyle = "Toggle", FontStyle = "SemiBold", FontSize = fontSize, OffColor = N.panel, StrokeColor = N.panel })
+    local sy = scrollAtTop and (y + 6) or (y + titleH + 12 + KB_CARDS * (cardH + gap))
+    local sw = scrollAtTop and 40 or math.floor((w - 24) / 2)
+    local sx = scrollAtTop and (x + w - 96) or (x + 8)
+    btn("KbUp " .. i, "^", sx, sy, sw, scrollAtTop and titleH or 24, "utility", "Kanban~Lane " .. i .. " Up", { FontSize = 11 })
+    btn("KbDown " .. i, "v", sx + sw + 8, sy, sw, scrollAtTop and titleH or 24, "utility", "Kanban~Lane " .. i .. " Down", { FontSize = 11 })
+    for j = 1, KB_CARDS do
+      local n = (i - 1) * KB_CARDS + j
+      btn("KbCard " .. n, "", x + 8, y + titleH + 12 + (j - 1) * (cardH + gap), w - 16, cardH, "pad",
+        "Kanban~Lane " .. i .. " Card " .. j, { ButtonStyle = "Toggle", FontSize = fontSize - 1, FontStyle = "Regular",
+        HTextAlign = "Left", Padding = 8 })
+    end
+  end
+
+  if page == "Kanban UCI" then
+    -- 1280 x 800 for a TSC-101-G3 (16:10, landscape): copy this page onto a UCI with Ctrl+A.
+    table.insert(graphics, { Type = "GroupBox", Fill = N.bg, StrokeColor = N.bg, StrokeWidth = 0, CornerRadius = 0,
+      Position = { 0, 0 }, Size = { 1280, 800 } })
+    ui.section(nil, 16, 16, 1248, 64)
+    ui.edge(32, 16, 1216, N.stroke)
+    ui.cube(32, 28, 40)
+    ui.label("OBSIDIAN", 84, 30, 120, 36, "Left", 16, N.white, "SemiBold")
+    ui.label("KANBAN", 192, 30, 100, 36, "Left", 16, S.fault, "SemiBold")
+    ui.combo("KbBoard", "Kanban~Board", 304, 30, 360, 36, { FontSize = 14 })
+    btn("KbRefresh", "Refresh", 676, 30, 112, 36, "secondary", "Kanban~Refresh", { FontSize = 13 })
+    btn("KbLanesPrev", "<", 808, 30, 48, 36, "utility", "Kanban~Lanes Back", { FontSize = 14 })
+    ui.value("KbLanePage", "Kanban~Lane Page", 860, 32, 148, 32, { FontSize = 12, TextColor = N.sub, HTextAlign = "Center" })
+    btn("KbLanesNext", ">", 1012, 30, 48, 36, "utility", "Kanban~Lanes Next", { FontSize = 14 })
+    ui.value("KbStatus", "Kanban~Status", 1072, 22, 148, 52, { FontSize = 10, TextColor = N.sub, WordWrap = true })
+    ui.led("Online", "Online", 1228, 38, 20, "ok")
+    for i = 1, KB_LANES do lane(i, 16 + (i - 1) * 314, 92, 306, 56, 6, 44, true, 14) end
+    ui.section(nil, 16, 672, 1248, 112)
+    ui.field("KbCardText", "Kanban~Card Text", 32, 684, 720, 40, { Font = FONT, FontSize = 14 })
+    ui.field("KbNewText", "Kanban~New Card", 32, 732, 560, 40, { Font = FONT, FontSize = 14 })
+    btn("KbAdd", "Add Card", 600, 732, 152, 40, "secondary", "Kanban~Add Card", { FontSize = 14 })
+    local acts = { { "KbLeft", "< Move" }, { "KbRight", "Move >" }, { "KbCheck", "Done" },
+                   { "KbMoveUp", "Up" }, { "KbMoveDown", "Down" }, { "KbArchive", "Archive", "warn" } }
+    for k, a in ipairs(acts) do
+      local col, row = (k - 1) % 3, math.floor((k - 1) / 3)
+      btn(a[1], a[2], 768 + col * 160, 684 + row * 48, 152, 40, a[3] or "utility", "Kanban~" .. a[2], { FontSize = 14 })
+    end
+    return layout, graphics
+  end
+
+  local H = ({ Notes = 680, Edit = 672, Search = 592, Kanban = 760, Setup = 536 })[page] or 600
+  ui.page(H)
+  ui.header("OBSID|IAN", page, "HostName", "Status", "Online", pageNo)
+  layout["HostName"].PrettyName = "Host Name"
+
+  if page == "Kanban" then
+    ui.section("Board", 8, 64, 624, 64)
+    ui.combo("KbBoard", "Kanban~Board", 16, 96, 248, 24)
+    btn("KbRefresh", "Refresh", 272, 94, 80, 28, "secondary", "Kanban~Refresh", { FontSize = 11 })
+    btn("KbLanesPrev", "<", 360, 94, 32, 28, "utility", "Kanban~Lanes Back")
+    ui.value("KbLanePage", "Kanban~Lane Page", 392, 98, 104, 20, { FontSize = 10, TextColor = N.sub, HTextAlign = "Center" })
+    btn("KbLanesNext", ">", 496, 94, 32, 28, "utility", "Kanban~Lanes Next")
+    ui.value("KbStatus", "Kanban~Status", 532, 92, 96, 32, { FontSize = 9, TextColor = N.sub, WordWrap = true })
+    for i = 1, KB_LANES do lane(i, 8 + (i - 1) * 156, 136, 152, 44, 4, 28, false, 11) end
+    ui.section("Card", 8, 600, 624, 120)
+    ui.field("KbCardText", "Kanban~Card Text", 16, 632, 608, 28, { Font = FONT, FontSize = 12 })
+    local acts = { { "KbLeft", "< Move" }, { "KbRight", "Move >" }, { "KbMoveUp", "Up" }, { "KbMoveDown", "Down" },
+                   { "KbCheck", "Done" }, { "KbArchive", "Archive", "warn" } }
+    for k, a in ipairs(acts) do
+      btn(a[1], a[2], 16 + (k - 1) * 102, 668, 94, 24, a[3] or "utility", "Kanban~" .. a[2], { FontSize = 11 })
+    end
+    ui.field("KbNewText", "Kanban~New Card", 16, 696, 504, 20, { Font = FONT, FontSize = 11 })
+    btn("KbAdd", "Add Card", 528, 694, 96, 24, "secondary", "Kanban~Add Card", { FontSize = 11 })
+    ui.hide("KbBoardOpen", "Kanban~Open Board")
+    ui.hint("Tap a card, then move it. Tap a lane title to pick where Add Card puts new cards. Changes save at once.", 728)
+
+  elseif page == "Notes" then
+    ui.section("Vault", 8, 64, 240, 576)
+    ui.readout("FolderPath", "Vault~Folder", 16, 96, 224, 24, { FontSize = 11 })
+    btn("FolderUp", "Up", 16, 128, 64, 28, "utility", "Vault~Up")
+    btn("FolderRoot", "Root", 88, 128, 64, 28, "utility", "Vault~Root")
+    btn("Refresh", "Refresh", 160, 128, 80, 28, "secondary", "Vault~Refresh")
+    listbox("FileList", "Vault~Files", 16, 164, 224, 468)
+
+    ui.section("Note", 256, 64, 376, 576)
+    ui.value("NoteTitle", "Note~Title", 268, 92, 352, 22, { FontSize = 13, FontStyle = "SemiBold", TextColor = N.white })
+    ui.value("NoteInfo", "Note~Info", 268, 114, 352, 20, { FontSize = 10, TextColor = N.dim })
+    ui.strip(264, 138, 336, 446)
+    for i = 1, READ_ROWS do
+      ui.value("ReadLine " .. i, "Note~Line " .. i, 272, 142 + (i - 1) * 22, 324, 22, { FontSize = 11 })
+    end
+    scrollbar("Read", "Note", 606, 138, 446)
+    btn("Reload", "Reload", 264, 596, 88, 28, "utility", "Note~Reload")
+    btn("ShowOnPC", "Show on PC", 360, 596, 104, 28, "utility", "Note~Show on PC")
+    ui.led("RemoteChanged", "Note~Changed Elsewhere", 476, 602, 16, "warn")
+    ui.value("NoteState", "Note~State", 496, 600, 128, 20, { FontSize = 10, TextColor = N.sub })
+    ui.hide("NotePath", "Note~Path")
+    ui.hide("NoteOpen", "Note~Open Path")
+    ui.hint("Pick a note on the left to read it here. Edit it on the Edit page; Obsidian Sync carries saves to your other devices.", 648)
+
+  elseif page == "Edit" then
+    ui.section("Lines", 8, 64, 376, 464)
+    ui.value("EditTitle", "Edit~Note", 20, 92, 352, 22, { FontSize = 13, FontStyle = "SemiBold", TextColor = N.white })
+    listbox("LineList", "Edit~Lines", 16, 118, 360, 402, { Font = MONO, FontSize = 10 })
+
+    ui.section("Edit Line", 392, 64, 240, 464)
+    ui.label("Line", 400, 96, 40, 20, "Left")
+    ui.readout("LineNo", "Edit~Line Number", 440, 94, 64, 24, { HTextAlign = "Center" })
+    ui.field("LineText", "Edit~Line Text", 400, 124, 224, 72,
+      { Font = FONT, FontSize = 12, WordWrap = true, VTextAlign = "Top" })
+    local grid = {
+      { "InsertAbove", "Insert Above" }, { "InsertBelow", "Insert Below" },
+      { "DuplicateLine", "Duplicate" },  { "DeleteLine", "Delete Line", "danger" },
+      { "MoveUp", "Move Up" },           { "MoveDown", "Move Down" },
+      { "ToggleTask", "Task [ ]" },      { "ToggleBullet", "Bullet -" },
+      { "Undo", "Undo" },                { "Revert", "Revert", "warn" },
+    }
+    for i, b in ipairs(grid) do
+      local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+      btn(b[1], b[2], 400 + col * 116, 204 + row * 36, 108, 28, b[3] or "utility", "Edit~" .. b[2])
+    end
+    btn("Save", "SAVE", 400, 392, 224, 40, "power", "Edit~Save")
+    ui.led("Unsaved", "Edit~Unsaved", 400, 444, 16, "warn")
+    ui.value("SaveStatus", "Edit~Save Status", 420, 440, 204, 44, { FontSize = 10, TextColor = N.sub, WordWrap = true, VTextAlign = "Top" })
+    btn("Overwrite", "Overwrite Theirs", 400, 488, 224, 28, "danger", "Edit~Overwrite")
+
+    ui.section("Quick Append", 8, 536, 624, 96)
+    ui.field("AppendText", "Append~Text", 16, 568, 392, 28, { Font = FONT, FontSize = 12 })
+    btn("AppendStamp", "Time Stamp", 416, 568, 96, 28, "primary", "Append~Time Stamp", { ButtonStyle = "Toggle", FontSize = 11 })
+    btn("Append", "Append", 520, 568, 96, 28, "secondary", "Append~Append")
+    ui.value("AppendStatus", "Append~Status", 16, 602, 600, 20, { FontSize = 10, TextColor = N.sub })
+    ui.hint("Pick a line, change it in the box and press Enter. Nothing is written to the vault until you press Save.", 640)
+
+  elseif page == "Search" then
+    ui.section("Search Vault", 8, 64, 624, 72)
+    ui.field("SearchQuery", "Search~Query", 16, 96, 488, 28, { Font = FONT, FontSize = 12 })
+    btn("Search", "Search", 512, 96, 104, 28, "secondary", "Search~Search")
+
+    ui.section("Results", 8, 144, 624, 304)
+    ui.value("SearchCount", "Search~Count", 424, 148, 200, 20, { FontSize = 10, TextColor = N.dim, HTextAlign = "Right" })
+    listbox("ResultList", "Search~Results", 16, 176, 600, 228)
+    ui.value("ResultContext", "Search~Context", 16, 410, 600, 32, { FontSize = 10, TextColor = N.sub, WordWrap = true, VTextAlign = "Top" })
+
+    ui.section("New Note", 8, 456, 624, 96)
+    ui.label("Folder", 16, 490, 56, 20)
+    ui.field("NewFolder", "New Note~Folder", 80, 488, 200, 24, { Font = FONT, FontSize = 11 })
+    ui.label("Name", 288, 490, 48, 20)
+    ui.field("NewName", "New Note~Name", 344, 488, 272, 24, { Font = FONT, FontSize = 12 })
+    ui.value("NewStatus", "New Note~Status", 16, 522, 480, 20, { FontSize = 10, TextColor = N.sub })
+    btn("CreateNote", "Create", 504, 518, 112, 28, "secondary", "New Note~Create")
+    ui.hint("Pick a result to open it on the Notes and Edit pages. New notes never replace an existing one.", 560)
+
+  elseif page == "Setup" then
+    ui.section("Obsidian Host", 8, 64, 624, 136)
+    ui.label("Host", 16, 98, 64, 20)
+    ui.field("Host", "Setup~Host", 88, 96, 200, 24)
+    ui.label("Port", 288, 98, 48, 20)
+    ui.field("Port", "Setup~Port", 344, 96, 72, 24, { HTextAlign = "Center" })
+    ui.label("Mode", 416, 98, 56, 20)
+    ui.combo("Protocol", "Setup~Mode", 480, 96, 136, 24)
+    ui.label("API Key", 16, 130, 64, 20)
+    ui.field("ApiKey", "Setup~API Key", 88, 128, 528, 24, { FontSize = 10 })
+    btn("Connect", "Connect", 88, 162, 120, 28, "secondary", "Setup~Connect")
+    ui.value("LastError", "Setup~Last Error", 216, 166, 400, 20, { FontSize = 10, TextColor = S.fault })
+
+    ui.section("Server", 8, 208, 624, 128)
+    local info = { { "Service", "Service" }, { "PluginVersion", "Plugin" }, { "ObsidianVersion", "Obsidian" },
+                   { "AuthState", "API Key" }, { "CertInfo", "Certificate" }, { "LastUpdate", "Last Update" } }
+    for i, f in ipairs(info) do
+      local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+      local x, y = 16 + col * 308, 240 + row * 30
+      ui.label(f[2], x, y + 2, 80, 20)
+      ui.readout(f[1], "Server~" .. f[2], x + 88, y, 208, 24, { FontSize = 11 })
+    end
+
+    ui.section("Log Note", 8, 344, 624, 144)
+    ui.label("Note", 16, 378, 64, 20)
+    ui.field("LogNote", "Log Note~Path", 88, 376, 528, 24, { Font = FONT, FontSize = 11 })
+    ui.label("Each text sent to the LogAppend pin is added to this note as a time-stamped line,", 16, 410, 600, 20, "Left", 11, N.sub)
+    ui.label("for example from a control script or a UCI button. Leave it empty to turn this off.", 16, 430, 600, 20, "Left", 11, N.sub)
+    ui.value("LogStatus", "Log Note~Status", 16, 458, 600, 20, { FontSize = 10, TextColor = N.sub })
+    ui.hide("LogAppend", "Log Note~Append")
+    ui.hint("On the host, set Binding host (Local REST API > Advanced settings) to its LAN address. See the README.", 496)
+  end
+
+  return layout, graphics
+end
+
+--=====================================================================
+-- Runtime
+--=====================================================================
+if Controls then
+  local rapidjson = require("rapidjson")
+
+  local POLL = Properties["Poll Interval (s)"].Value
+  local NOTE_REFRESH = Properties["Note Refresh (s)"].Value
+  local WRAP = Properties["Reader Wrap (chars)"].Value
+  local MAX_BYTES = Properties["Max Note Size (KB)"].Value * 1024
+  local DEBUG = Properties["Debug Print"].Value
+  local NOTE_JSON = "application/vnd.olrapi.note+json"
+  local MAX_UNDO = 30
+  local CONFIRM = 5
+  local LIST_CHARS = 90           -- line list entries are cut to this many characters
+
+  local function dbg(level, ...)
+    if DEBUG == "All" or (DEBUG == "Errors" and level == "err") then print(...) end
+  end
+
+  -- state ------------------------------------------------------------
+  local server = nil              -- last GET / answer
+  local online = false
+  local folder = ""               -- current folder, "" = vault root, else "a/b/"
+  local fileMap = {}              -- FileList display text -> { path, dir }
+  local note = nil                -- { path, lines = {}, eol, finalNl, version, mtime, size, readonly }
+  local dirty = false
+  local undo = {}
+  local sel = nil                 -- selected line number on the Edit page
+  local rows = {}                 -- wrapped reader rows
+  local readOffset = 0
+  local resultMap = {}            -- ResultList display text -> { path, context }
+  local remoteChanged = false
+  local lastNoteCheck = 0
+  local armed = {}
+  local pendingOpen = nil
+  local kb = {}                   -- Kanban hooks, filled in by the Kanban section below         -- { path, t } second press opens and discards unsaved edits
+
+  -- helpers ----------------------------------------------------------
+  local function now() return os.clock() end
+  local function trim(s) return ((s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+  local function str(v)
+    if type(v) == "string" then return v elseif type(v) == "number" then return tostring(v) end
+    return ""
+  end
+  local function round(v) return math.floor(v + 0.5) end
+
+  local function ulen(s)
+    local ok, n = pcall(utf8.len, s)
+    return (ok and n) or #s
+  end
+  -- first n characters of s, never splitting a UTF-8 sequence
+  local function usub(s, n)
+    if ulen(s) <= n then return s end
+    local ok, cut = pcall(utf8.offset, s, n + 1)
+    if ok and cut then return s:sub(1, cut - 1) end
+    return s:sub(1, n)
+  end
+  local function cut(s, n)
+    if ulen(s) <= n then return s end
+    return usub(s, n - 3) .. "..."
+  end
+
+  local function setStatus(code, msg)
+    Controls.Status.Value = code
+    Controls.Status.String = msg or ""
+  end
+
+  local function setError(msg)
+    Controls.LastError.String = (msg or "") ~= "" and (os.date("%H:%M:%S ") .. msg) or ""
+    if msg and msg ~= "" then dbg("err", "Obsidian: " .. msg) end
+  end
+
+  local function host() return trim(Controls.Host.String) end
+  local function apiKey() return trim(Controls.ApiKey.String) end
+  local function secure() return Controls.Protocol.String ~= "HTTP" end
+  local function port()
+    local p = tonumber(trim(Controls.Port.String))
+    if p then return math.floor(p) end
+    return secure() and 27124 or 27123
+  end
+  local function configured() return host() ~= "" and apiKey() ~= "" end
+
+  local function header(hdrs, name)
+    if type(hdrs) ~= "table" then return nil end
+    for k, v in pairs(hdrs) do
+      if string.lower(k) == name then
+        if type(v) == "table" then return v[1] end
+        return v
+      end
+    end
+    return nil
+  end
+
+  local function apiMessage(resp)
+    local ok, t = pcall(rapidjson.decode, resp or "")
+    if ok and type(t) == "table" and type(t.message) == "string" then return t.message end
+    return nil
+  end
+
+  -- Percent-encode one path segment (RFC 3986 unreserved characters stay as they are).
+  local function encSeg(s)
+    return (s:gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", string.byte(c)) end))
+  end
+  -- Vault paths keep their real "/" separators, as the API requires.
+  local function encPath(p)
+    local out = {}
+    for seg in (p .. "/"):gmatch("(.-)/") do table.insert(out, encSeg(seg)) end
+    return table.concat(out, "/")
+  end
+  local function encQuery(s) return encSeg(s) end
+
+  local function baseName(p)
+    local b = p:match("([^/]+)/?$") or p
+    return (b:gsub("%.md$", ""))
+  end
+
+  -- HTTP queue -------------------------------------------------------
+  -- One request in flight at a time, as in the other plugins in this repo.
+  local queue = {}
+  local busy = false
+  local generation = 0
+  local sendNext
+
+  local function enqueue(job, front)
+    if job.key then
+      for i, q in ipairs(queue) do
+        if q.key == job.key then queue[i] = job; return end
+      end
+    end
+    if front then table.insert(queue, 1, job) else table.insert(queue, job) end
+    sendNext()
+  end
+
+  sendNext = function()
+    if busy or #queue == 0 then return end
+    local job = table.remove(queue, 1)
+    busy = true
+    local gen = generation
+    local url = (secure() and "https://" or "http://") .. host() .. ":" .. port() .. job.path
+    local headers = { ["Authorization"] = "Bearer " .. apiKey(), ["Accept"] = job.accept or "application/json" }
+    for k, v in pairs(job.headers or {}) do headers[k] = v end
+    if job.data then headers["Content-Type"] = job.contentType or "text/markdown; charset=utf-8" end
+    dbg("All", job.method .. " " .. url .. (job.data and (" (" .. #job.data .. " bytes)") or ""))
+    local function done(tbl, code, resp, err, hdrs)
+      if gen ~= generation then return end   -- answer to a request from before a restart
+      busy = false
+      local decoded = nil
+      if code == 200 and resp and resp ~= "" and (job.json ~= false) then
+        local ok, t = pcall(rapidjson.decode, resp)
+        if ok and type(t) == "table" then decoded = t end
+      end
+      local handled, msg = pcall(job.callback or function() end, code, decoded, resp, err, hdrs)
+      if not handled then setError("Script error handling " .. job.path .. ": " .. tostring(msg)) end
+      sendNext()
+    end
+    if job.method == "GET" then
+      HttpClient.Download { Url = url, Headers = headers, Timeout = job.timeout or 8, EventHandler = done }
+    else
+      HttpClient.Upload { Url = url, Method = job.method, Data = job.data or "", Headers = headers, Timeout = job.timeout or 8, EventHandler = done }
+    end
+  end
+
+  -- Common error text. Returns true when the reply was an error.
+  local function httpError(what, code, resp, err)
+    if code == 401 then
+      setStatus(2, "API key refused")
+      Controls.AuthState.String = "Refused"
+      setError(what .. ": HTTP 401. Check the API key (Obsidian > Settings > Local REST API with MCP).")
+      return true
+    elseif code == 429 then
+      setStatus(2, "Too many wrong keys")
+      setError(what .. ": HTTP 429. Too many wrong API keys from this Core; the server waits a minute.")
+      return true
+    elseif code == nil or code == 0 then
+      setError(what .. ": " .. tostring(err or "no response (check host, port, Binding host and the HTTPS mode)"))
+      return true
+    elseif code >= 400 then
+      local m = apiMessage(resp)
+      setError(string.format("%s: HTTP %d%s", what, code, m and (" " .. m) or ""))
+      return true
+    end
+    return false
+  end
+
+  ---------------------------------------------------------------------
+  -- Rendering
+  ---------------------------------------------------------------------
+  local function scrollTo(ctl, offset, total, n)
+    local maxOff = math.max(0, total - n)
+    offset = math.max(0, math.min(maxOff, offset))
+    ctl.Value = (maxOff == 0) and 100 or (100 - offset / maxOff * 100)
+    return offset
+  end
+  local function offsetFromScroll(ctl, total, n)
+    local maxOff = math.max(0, total - n)
+    return round((100 - ctl.Value) / 100 * maxOff)
+  end
+
+  -- Wrap one note line into reader rows of at most WRAP characters, at spaces where possible.
+  local function wrapLine(line, out)
+    line = line:gsub("\t", "    ")
+    if line == "" then table.insert(out, ""); return end
+    local indent = line:match("^(%s*)") or ""
+    if #indent > WRAP / 2 then indent = "" end
+    local first = true
+    while ulen(line) > WRAP do
+      local chunk = usub(line, WRAP)
+      local brk = chunk:match("^.*()%s")
+      if brk and brk > #indent + 1 then chunk = line:sub(1, brk - 1) end
+      table.insert(out, chunk)
+      line = indent .. trim(line:sub(#chunk + 1))
+      first = false
+    end
+    table.insert(out, line)
+  end
+
+  local function buildRows()
+    rows = {}
+    if not note then return end
+    for _, l in ipairs(note.lines) do wrapLine(l, rows) end
+  end
+
+  local function renderReader()
+    readOffset = scrollTo(Controls.ReadScroll, readOffset, #rows, READ_ROWS)
+    for i = 1, READ_ROWS do
+      Controls.ReadLine[i].String = rows[readOffset + i] or ""
+    end
+  end
+
+  local function fmtTime(ms)
+    local t = tonumber(ms)
+    if not t then return "" end
+    return os.date("%Y-%m-%d %H:%M", math.floor(t / 1000))
+  end
+
+  local function renderNoteInfo()
+    if not note then
+      Controls.NoteTitle.String = "No note open"
+      Controls.NoteInfo.String = ""
+      Controls.EditTitle.String = "No note open"
+      Controls.NotePath.String = ""
+      Controls.NoteState.String = ""
+      Controls.RemoteChanged.Boolean = false
+      return
+    end
+    local title = baseName(note.path)
+    Controls.NoteTitle.String = title
+    Controls.EditTitle.String = title .. (dirty and "  *" or "")
+    Controls.NotePath.String = note.path
+    local parts = { note.path }
+    if note.mtime then table.insert(parts, "modified " .. fmtTime(note.mtime)) end
+    table.insert(parts, #note.lines .. " lines")
+    Controls.NoteInfo.String = table.concat(parts, "  |  ")
+    Controls.RemoteChanged.Boolean = remoteChanged
+    if remoteChanged then Controls.NoteState.String = "Changed elsewhere"
+    elseif note.readonly then Controls.NoteState.String = "Read only (large)"
+    elseif dirty then Controls.NoteState.String = "Unsaved edits"
+    else Controls.NoteState.String = "Up to date" end
+    Controls.Unsaved.Boolean = dirty
+  end
+
+  local function lineChoice(i, l)
+    return string.format("%3d  %s", i, cut((l:gsub("\t", "  ")), LIST_CHARS))
+  end
+
+  local function renderEditor()
+    local choices = {}
+    if note then
+      for i, l in ipairs(note.lines) do choices[i] = lineChoice(i, l) end
+    end
+    Controls.LineList.Choices = choices
+    if note and sel and note.lines[sel] then
+      Controls.LineList.String = choices[sel]
+      Controls.LineNo.String = tostring(sel)
+      Controls.LineText.String = note.lines[sel]
+    else
+      sel = nil
+      Controls.LineList.String = ""
+      Controls.LineNo.String = ""
+      Controls.LineText.String = ""
+    end
+    local can = note ~= nil and not note.readonly
+    for _, n in ipairs({ "InsertAbove", "InsertBelow", "DeleteLine", "DuplicateLine", "MoveUp", "MoveDown",
+                         "ToggleTask", "ToggleBullet", "LineText" }) do
+      Controls[n].IsDisabled = not (can and sel ~= nil)
+    end
+    Controls.InsertBelow.IsDisabled = not can   -- with no line picked it adds a line at the end
+    Controls.Undo.IsDisabled = #undo == 0
+    Controls.Save.IsDisabled = not (can and dirty)
+    Controls.Revert.IsDisabled = not (note and dirty)
+    renderNoteInfo()
+  end
+
+  local function renderAll()
+    buildRows()
+    renderReader()
+    renderEditor()
+  end
+
+  ---------------------------------------------------------------------
+  -- Notes
+  ---------------------------------------------------------------------
+  local function splitLines(s)
+    local eol = s:find("\r\n", 1, true) and "\r\n" or "\n"
+    local finalNl = s:sub(-#eol) == eol
+    local body = finalNl and s:sub(1, -#eol - 1) or s
+    local lines = {}
+    if body ~= "" or not finalNl then
+      for l in (body .. eol):gmatch("(.-)" .. (eol == "\r\n" and "\r\n" or "\n")) do table.insert(lines, l) end
+    else
+      lines = { "" }
+    end
+    if #lines == 0 then lines = { "" } end
+    return lines, eol, finalNl
+  end
+
+  local function joinLines()
+    local s = table.concat(note.lines, note.eol)
+    if note.finalNl then s = s .. note.eol end
+    return s
+  end
+
+  local function etagOf(t, hdrs)
+    local e = header(hdrs, "etag")
+    if e and e ~= "" then return e end
+    if t and type(t.version) == "string" and t.version ~= "" then return '"' .. t.version .. '"' end
+    return nil
+  end
+
+  local function setNote(path, t, hdrs, keepView)
+    local content = str(t.content)
+    local lines, eol, finalNl = splitLines(content)
+    local stat = type(t.stat) == "table" and t.stat or {}
+    note = { path = path, lines = lines, eol = eol, finalNl = finalNl, version = etagOf(t, hdrs),
+             mtime = stat.mtime, size = stat.size or #content, readonly = #content > MAX_BYTES }
+    dirty, undo, remoteChanged = false, {}, false
+    if not keepView then readOffset, sel = 0, nil end
+    lastNoteCheck = now()
+    renderAll()
+  end
+
+  local function openNote(path, keepView)
+    enqueue({ method = "GET", path = "/vault/" .. encPath(path), accept = NOTE_JSON, key = "open",
+      callback = function(code, t, resp, err, hdrs)
+        if code == 404 then
+          Controls.SaveStatus.String = "Note not found: " .. path
+          setError("Note not found: " .. path)
+          return
+        end
+        if httpError("Open " .. path, code, resp, err) then return end
+        if not t then setError("Open " .. path .. ": the server did not send note JSON"); return end
+        setNote(str(t.path) ~= "" and str(t.path) or path, t, hdrs, keepView)
+        Controls.SaveStatus.String = note.readonly and "This note is larger than Max Note Size, so it opens read only." or ""
+        setError("")
+      end })
+  end
+
+  -- Asks for a second press before an action would throw away unsaved edits.
+  local function guardDirty(key, what)
+    if not dirty then return true end
+    local t = armed[key]
+    if t and now() - t < CONFIRM then armed = {}; return true end
+    armed = { [key] = now() }
+    Controls.SaveStatus.String = "Unsaved edits. Press again within 5 s to " .. what .. " and lose them."
+    Controls.NoteState.String = "Press again to discard"
+    return false
+  end
+
+  local function requestOpen(path)
+    if note and note.path == path and not dirty then openNote(path, true); return end
+    if not guardDirty("open " .. path, "open " .. baseName(path)) then return end
+    openNote(path)
+  end
+
+  -- Re-reads the open note. Unchanged edits are refreshed; with unsaved edits only the LED is set.
+  local function checkNote()
+    if not note or busy or #queue > 0 then return end
+    lastNoteCheck = now()
+    local path = note.path
+    enqueue({ method = "GET", path = "/vault/" .. encPath(path), accept = NOTE_JSON, key = "check",
+      callback = function(code, t, resp, err, hdrs)
+        if not note or note.path ~= path or code ~= 200 or not t then return end
+        local v = etagOf(t, hdrs)
+        local stat = type(t.stat) == "table" and t.stat or {}
+        local changed = (v and note.version and v ~= note.version) or (not v and stat.mtime ~= note.mtime)
+        if not changed then return end
+        if dirty then
+          remoteChanged = true
+          renderNoteInfo()
+        else
+          setNote(path, t, hdrs, true)
+        end
+      end })
+  end
+
+  ---------------------------------------------------------------------
+  -- Vault browser
+  ---------------------------------------------------------------------
+  local function listFolder(path)
+    enqueue({ method = "GET", path = "/vault/" .. encPath(path), key = "list",
+      callback = function(code, t, resp, err)
+        if code == 404 and path ~= "" then folder = ""; Controls.FolderPath.String = "/"; return end
+        if httpError("List folder", code, resp, err) then return end
+        local files = (t and type(t.files) == "table") and t.files or {}
+        local dirs, notes = {}, {}
+        for _, f in ipairs(files) do
+          f = str(f)
+          if f:sub(-1) == "/" then table.insert(dirs, f)
+          elseif f:lower():match("%.md$") then table.insert(notes, f) end
+        end
+        local function ci(a, b) return a:lower() < b:lower() end
+        table.sort(dirs, ci); table.sort(notes, ci)
+        local choices = {}
+        fileMap = {}
+        for _, d in ipairs(dirs) do
+          table.insert(choices, d)
+          fileMap[d] = { path = path .. d, dir = true }
+        end
+        for _, n in ipairs(notes) do
+          local label = n:gsub("%.md$", "")
+          if fileMap[label] then label = n end
+          table.insert(choices, label)
+          fileMap[label] = { path = path .. n, dir = false }
+        end
+        folder = path
+        Controls.FolderPath.String = "/" .. path
+        Controls.FileList.Choices = choices
+        Controls.FileList.String = ""
+        for label, e in pairs(fileMap) do
+          if note and e.path == note.path then Controls.FileList.String = label end
+        end
+        Controls.NewFolder.String = path   -- new notes go into the folder being browsed
+      end })
+  end
+
+  ---------------------------------------------------------------------
+  -- Server status
+  ---------------------------------------------------------------------
+  local firstConnect = true
+
+  local function markOffline(msg)
+    online = false
+    Controls.Online.Boolean = false
+    setStatus(2, msg)
+  end
+
+  local function poll()
+    if not configured() then
+      setStatus(3, "Enter host and API key")
+      Controls.Online.Boolean = false
+      return
+    end
+    if busy or #queue > 0 then return end
+    enqueue({ method = "GET", path = "/", key = "status", timeout = 5,
+      callback = function(code, t, resp, err)
+        if code == 200 and t then
+          server = t
+          Controls.Service.String = str(t.service)
+          local v = type(t.versions) == "table" and t.versions or {}
+          Controls.PluginVersion.String = str(v.self)
+          Controls.ObsidianVersion.String = str(v.obsidian)
+          local ci = type(t.certificateInfo) == "table" and t.certificateInfo or nil
+          Controls.CertInfo.String = secure() and (ci and (str(ci.validityDays) .. " days left") or "") or "HTTP (not encrypted)"
+          Controls.LastUpdate.String = os.date("%H:%M:%S")
+          if t.authenticated == true then
+            Controls.AuthState.String = "Accepted"
+            online = true
+            Controls.Online.Boolean = true
+            setStatus(0, "")
+            if Controls.LastError.String:find("no response", 1, true) or Controls.LastError.String:find("HTTP 401", 1, true) then setError("") end
+            if firstConnect then
+              firstConnect = false
+              listFolder(folder)
+              if trim(Controls.NoteOpen.String) ~= "" then requestOpen(trim(Controls.NoteOpen.String)) end
+              kb.discover()
+            else
+              if NOTE_REFRESH > 0 and note and now() - lastNoteCheck >= NOTE_REFRESH then checkNote() end
+              kb.tick()
+            end
+          else
+            Controls.AuthState.String = "Refused"
+            markOffline("API key refused")
+            setError("The server answered but did not accept the API key. Copy it again from Obsidian > Settings > Local REST API with MCP.")
+          end
+        elseif code == 429 then
+          markOffline("Too many wrong keys")
+          httpError("Status", code, resp, err)
+        else
+          markOffline("Offline")
+          httpError("Status", code, resp, err)
+        end
+      end })
+  end
+
+  local pollTimer = Timer.New()
+  pollTimer.EventHandler = poll
+
+  local function restart()
+    generation = generation + 1
+    queue, busy = {}, false
+    pollTimer:Stop()
+    online, firstConnect, server = false, true, nil
+    Controls.Online.Boolean = false
+    Controls.HostName.String = host() ~= "" and (host() .. ":" .. port()) or ""
+    Controls.Port.String = tostring(port())
+    for _, n in ipairs({ "Service", "PluginVersion", "ObsidianVersion", "AuthState", "CertInfo" }) do Controls[n].String = "" end
+    setError("")
+    if not configured() then
+      setStatus(3, "Enter host and API key")
+      return
+    end
+    setStatus(5, "Connecting")
+    poll()
+    pollTimer:Start(POLL)
+  end
+
+  ---------------------------------------------------------------------
+  -- Editing
+  ---------------------------------------------------------------------
+  local function snapshot()
+    local copy = {}
+    for i, l in ipairs(note.lines) do copy[i] = l end
+    table.insert(undo, { lines = copy, sel = sel })
+    if #undo > MAX_UNDO then table.remove(undo, 1) end
+  end
+
+  local function edited()
+    dirty = true
+    Controls.SaveStatus.String = ""
+    renderAll()
+  end
+
+  local function editable()
+    return note ~= nil and not note.readonly
+  end
+
+  Controls.LineList.EventHandler = function(c)
+    local n = tonumber(c.String:match("^%s*(%d+)"))
+    if note and n and note.lines[n] then sel = n end
+    renderEditor()
+  end
+
+  Controls.LineText.EventHandler = function(c)
+    if not editable() or not sel then renderEditor(); return end
+    local text = c.String:gsub("\r?\n", " ")
+    if text == note.lines[sel] then return end
+    snapshot()
+    note.lines[sel] = text
+    edited()
+  end
+
+  Controls.InsertAbove.EventHandler = function()
+    if not editable() or not sel then return end
+    snapshot(); table.insert(note.lines, sel, ""); edited()
+  end
+  Controls.InsertBelow.EventHandler = function()
+    if not editable() then return end
+    snapshot()
+    sel = (sel or #note.lines) + 1
+    table.insert(note.lines, sel, "")
+    edited()
+  end
+  Controls.DuplicateLine.EventHandler = function()
+    if not editable() or not sel then return end
+    snapshot(); table.insert(note.lines, sel + 1, note.lines[sel]); sel = sel + 1; edited()
+  end
+  Controls.DeleteLine.EventHandler = function()
+    if not editable() or not sel then return end
+    snapshot()
+    table.remove(note.lines, sel)
+    if #note.lines == 0 then note.lines = { "" } end
+    sel = math.min(sel, #note.lines)
+    edited()
+  end
+  local function move(d)
+    if not editable() or not sel then return end
+    local j = sel + d
+    if j < 1 or j > #note.lines then return end
+    snapshot()
+    note.lines[sel], note.lines[j] = note.lines[j], note.lines[sel]
+    sel = j
+    edited()
+  end
+  Controls.MoveUp.EventHandler = function() move(-1) end
+  Controls.MoveDown.EventHandler = function() move(1) end
+
+  -- Markdown tasks: "- [ ] x" <-> "- [x] x"; any other line becomes an open task.
+  Controls.ToggleTask.EventHandler = function()
+    if not editable() or not sel then return end
+    local l = note.lines[sel]
+    local ind, mark, rest = l:match("^(%s*[-*+] )%[(.)%] ?(.*)$")
+    local new
+    if ind then
+      new = ind .. ((mark == " ") and "[x] " or "[ ] ") .. rest
+    else
+      local i2, body = l:match("^(%s*)[-*+] (.*)$")
+      if i2 then new = i2 .. "- [ ] " .. body
+      else
+        local i3, b3 = l:match("^(%s*)(.*)$")
+        new = i3 .. "- [ ] " .. b3
+      end
+    end
+    snapshot(); note.lines[sel] = new; edited()
+  end
+  Controls.ToggleBullet.EventHandler = function()
+    if not editable() or not sel then return end
+    local l = note.lines[sel]
+    local i1, body = l:match("^(%s*)[-*+] (.*)$")
+    local new
+    if i1 then new = i1 .. body
+    else
+      local i3, b3 = l:match("^(%s*)(.*)$")
+      new = i3 .. "- " .. b3
+    end
+    snapshot(); note.lines[sel] = new; edited()
+  end
+
+  Controls.Undo.EventHandler = function()
+    if not note or #undo == 0 then return end
+    local u = table.remove(undo)
+    note.lines, sel = u.lines, u.sel
+    dirty = true
+    renderAll()
+  end
+
+  Controls.Revert.EventHandler = function()
+    if not note or not dirty then return end
+    if not guardDirty("revert", "revert") then return end
+    Controls.SaveStatus.String = "Reloading from the vault..."
+    openNote(note.path, true)
+  end
+
+  local function save(force)
+    if not editable() or not online then
+      if not online then Controls.SaveStatus.String = "Not connected; nothing was saved." end
+      return
+    end
+    local path = note.path
+    local headers = {}
+    if note.version and not force then headers["If-Match"] = note.version end
+    Controls.SaveStatus.String = "Saving..."
+    enqueue({ method = "PUT", path = "/vault/" .. encPath(path), data = joinLines(), headers = headers, json = false,
+      callback = function(code, t, resp, err, hdrs)
+        if not note or note.path ~= path then return end
+        if code == 200 or code == 204 then
+          dirty, remoteChanged = false, false
+          note.version = header(hdrs, "etag") or nil
+          Controls.SaveStatus.String = "Saved " .. os.date("%H:%M:%S") .. ". Obsidian Sync will carry it to your other devices."
+          setError("")
+          renderEditor()
+          if not note.version then openNote(path, true) end   -- older plugin versions send no ETag
+        elseif code == 412 then
+          remoteChanged = true
+          Controls.SaveStatus.String = "Not saved: the note changed on another device. Revert loads theirs; Overwrite Theirs keeps yours."
+          renderNoteInfo()
+        else
+          httpError("Save " .. path, code, resp, err)
+          Controls.SaveStatus.String = "Not saved (" .. (code and ("HTTP " .. code) or "no response") .. ")."
+        end
+      end }, true)
+  end
+
+  Controls.Save.EventHandler = function() save(false) end
+  Controls.Overwrite.EventHandler = function()
+    if not editable() then return end
+    local t = armed.overwrite
+    if t and now() - t < CONFIRM then armed = {}; save(true); return end
+    armed = { overwrite = now() }
+    Controls.SaveStatus.String = "Press Overwrite Theirs again within 5 s to replace the vault copy with yours."
+  end
+
+  ---------------------------------------------------------------------
+  -- Append, log note, new note
+  ---------------------------------------------------------------------
+  local function appendTo(path, text, statusCtl, after)
+    enqueue({ method = "POST", path = "/vault/" .. encPath(path), data = text, json = false,
+      callback = function(code, t, resp, err)
+        if code == 200 or code == 204 then
+          statusCtl.String = "Added to " .. baseName(path) .. " at " .. os.date("%H:%M:%S")
+          if after then after() end
+        else
+          httpError("Append to " .. path, code, resp, err)
+          statusCtl.String = "Not added (" .. (code and ("HTTP " .. code) or "no response") .. ")."
+        end
+      end }, true)
+  end
+
+  local function stamped(text, on)
+    return on and (os.date("%Y-%m-%d %H:%M ") .. text) or text
+  end
+
+  Controls.Append.EventHandler = function()
+    local text = trim(Controls.AppendText.String)
+    if text == "" then return end
+    if not note then Controls.AppendStatus.String = "Open a note first."; return end
+    if dirty then Controls.AppendStatus.String = "Save or revert your edits first, then append."; return end
+    if not online then Controls.AppendStatus.String = "Not connected."; return end
+    local path = note.path
+    appendTo(path, stamped(text, Controls.AppendStamp.Boolean), Controls.AppendStatus, function()
+      Controls.AppendText.String = ""
+      if note and note.path == path and not dirty then openNote(path, true) end
+    end)
+  end
+  Controls.AppendText.EventHandler = function() end
+
+  local function notePath(p)
+    p = trim(p):gsub("^/+", "")
+    if p ~= "" and not p:lower():match("%.md$") then p = p .. ".md" end
+    return p
+  end
+
+  Controls.LogAppend.EventHandler = function(c)
+    local text = trim(c.String)
+    local path = notePath(Controls.LogNote.String)
+    if text == "" or path == "" then return end
+    if not online then Controls.LogStatus.String = "Not connected; log line dropped: " .. cut(text, 60); return end
+    appendTo(path, "- " .. stamped(text, true), Controls.LogStatus, function()
+      if note and note.path == path and not dirty then openNote(path, true) end
+    end)
+    c.String = ""
+  end
+
+  -- Obsidian refuses these characters in file names.
+  local BAD_NAME = '[\\/:%*%?"<>|#%^%[%]]'
+
+  Controls.CreateNote.EventHandler = function()
+    local name = trim(Controls.NewName.String)
+    local dir = trim(Controls.NewFolder.String):gsub("^/+", "")
+    if name == "" then Controls.NewStatus.String = "Type a name for the new note."; return end
+    if name:find(BAD_NAME) then Controls.NewStatus.String = 'A note name can\'t contain \\ / : * ? " < > | # ^ [ ]'; return end
+    if dir ~= "" and dir:sub(-1) ~= "/" then dir = dir .. "/" end
+    if dir:find("%.%.") then Controls.NewStatus.String = "The folder can't contain .."; return end
+    if not online then Controls.NewStatus.String = "Not connected."; return end
+    if not guardDirty("create", "open the new note") then Controls.NewStatus.String = "Unsaved edits on the Edit page. Press Create again to discard them."; return end
+    local path = notePath(dir .. name)
+    enqueue({ method = "PUT", path = "/vault/" .. encPath(path), data = "# " .. name .. "\n\n",
+      headers = { ["If-None-Match"] = "*" }, json = false,
+      callback = function(code, t, resp, err)
+        if code == 200 or code == 204 then
+          Controls.NewStatus.String = "Created " .. path
+          Controls.NewName.String = ""
+          dirty = false
+          openNote(path)
+          listFolder(dir)
+        elseif code == 412 then
+          Controls.NewStatus.String = "A note called " .. name .. " already exists there. Nothing was changed."
+        else
+          httpError("Create " .. path, code, resp, err)
+          Controls.NewStatus.String = "Not created (" .. (code and ("HTTP " .. code) or "no response") .. ")."
+        end
+      end }, true)
+  end
+
+  ---------------------------------------------------------------------
+  -- Search
+  ---------------------------------------------------------------------
+  Controls.Search.EventHandler = function()
+    local q = trim(Controls.SearchQuery.String)
+    if q == "" then return end
+    if not online then Controls.SearchCount.String = "Not connected"; return end
+    Controls.SearchCount.String = "Searching..."
+    local path = "/search/simple/?query=" .. encQuery(q) .. "&contextLength=60&maxResults=100&maxMatchesPerFile=1"
+    enqueue({ method = "POST", path = path, data = "", contentType = "text/plain", key = "search",
+      callback = function(code, t, resp, err, hdrs)
+        if httpError("Search", code, resp, err) then Controls.SearchCount.String = ""; return end
+        local list = type(t) == "table" and t or {}
+        local choices = {}
+        resultMap = {}
+        for _, r in ipairs(list) do
+          local f = str(r.filename)
+          if f ~= "" then
+            local ctx = ""
+            if type(r.matches) == "table" and type(r.matches[1]) == "table" then ctx = str(r.matches[1].context) end
+            local label = f:gsub("%.md$", "")
+            if not resultMap[label] then
+              table.insert(choices, label)
+              resultMap[label] = { path = f, context = trim((ctx:gsub("%s+", " "))) }
+            end
+          end
+        end
+        local total = tonumber(header(hdrs, "total-results")) or #choices
+        Controls.ResultList.Choices = choices
+        Controls.ResultList.String = ""
+        Controls.ResultContext.String = ""
+        Controls.SearchCount.String = (total == 1) and "1 note" or (total .. " notes")
+      end })
+  end
+  Controls.SearchQuery.EventHandler = Controls.Search.EventHandler
+
+  Controls.ResultList.EventHandler = function(c)
+    local r = resultMap[c.String]
+    if not r then return end
+    Controls.ResultContext.String = r.context ~= "" and ("..." .. r.context .. "...") or ""
+    requestOpen(r.path)
+  end
+
+  ---------------------------------------------------------------------
+  -- Browser and reader controls
+  ---------------------------------------------------------------------
+  Controls.FileList.EventHandler = function(c)
+    local e = fileMap[c.String]
+    if not e then return end
+    if e.dir then listFolder(e.path) else requestOpen(e.path) end
+  end
+  Controls.FolderUp.EventHandler = function()
+    if folder == "" then return end
+    listFolder(folder:gsub("[^/]+/$", ""))
+  end
+  Controls.FolderRoot.EventHandler = function() listFolder("") end
+  Controls.Refresh.EventHandler = function()
+    listFolder(folder)
+    if note and not dirty then openNote(note.path, true) end
+  end
+  Controls.Reload.EventHandler = function()
+    if not note then return end
+    if not guardDirty("reload", "reload") then return end
+    openNote(note.path, true)
+  end
+  Controls.ShowOnPC.EventHandler = function()
+    if not note or not online then return end
+    enqueue({ method = "POST", path = "/open/" .. encPath(note.path), data = "", contentType = "text/plain", json = false,
+      callback = function(code, t, resp, err)
+        if code == 200 or code == 204 then Controls.NoteState.String = "Shown in Obsidian"
+        else httpError("Show on PC", code, resp, err) end
+      end }, true)
+  end
+  Controls.NoteOpen.EventHandler = function(c)
+    local p = notePath(c.String)
+    if p ~= "" and online then requestOpen(p) end
+  end
+
+  Controls.ReadScroll.EventHandler = function(c)
+    readOffset = offsetFromScroll(c, #rows, READ_ROWS); renderReader()
+  end
+  Controls.ReadScrollUp.EventHandler = function() readOffset = readOffset - (READ_ROWS - 2); renderReader() end
+  Controls.ReadScrollDown.EventHandler = function() readOffset = readOffset + (READ_ROWS - 2); renderReader() end
+
+  ---------------------------------------------------------------------
+  -- Kanban boards (the community "Kanban" plugin by mgmeyers)
+  --
+  -- A board is a Markdown note whose frontmatter has a "kanban-plugin" key.
+  -- Each heading is a lane, each "- [ ] text" item under it is a card, a
+  -- "**Complete**" line marks a lane whose cards are checked off, and the board
+  -- ends with an optional "***" + "## Archive" section and a
+  -- "%% kanban:settings" block. Writes use the layout the Kanban plugin's own
+  -- boardToMd() produces, so Obsidian shows the board unchanged.
+  ---------------------------------------------------------------------
+  local board = nil            -- { path, header, lanes, archive, settings, eol, finalNl, version, prepend }
+  local boardMap = {}          -- KbBoard display text -> path
+  local laneFirst = 1          -- first lane on screen
+  local laneOff = {}           -- lane index -> first card on screen
+  local kbSel = nil            -- { lane, card } selected card
+  local kbLane = 1             -- lane that Add Card goes into
+  local kbSaving, kbPending = false, false
+  local lastBoardCheck = 0
+
+  local function kbStatus(msg) Controls.KbStatus.String = msg or "" end
+
+  local function isItem(l) return l:match("^[-*+] %[(.)%] ?(.*)$") end
+
+  local function parseBoard(path, content)
+    local lines, eol, finalNl = splitLines(content)
+    local b = { path = path, header = {}, lanes = {}, archive = nil, settings = nil, eol = eol, finalNl = finalNl }
+    local cur, item, mode = nil, nil, "header"
+    local i = 1
+    while i <= #lines do
+      local l = lines[i]
+      if l:match("^%%%% kanban:settings") then
+        b.settings = {}
+        for k = i, #lines do table.insert(b.settings, lines[k]) end
+        break
+      end
+      local hashes, title = l:match("^(#+) (.*)$")
+      if l:match("^%*%*%*%s*$") and mode ~= "header" then
+        mode, cur, item = "break", nil, nil
+      elseif hashes and mode == "break" and trim(title) == "Archive" then
+        b.archive = { items = {} }
+        mode, cur, item = "archive", b.archive, nil
+      elseif hashes then
+        cur = { hashes = hashes, title = title, complete = false, items = {} }
+        table.insert(b.lanes, cur)
+        mode, item = "lane", nil
+      elseif mode == "header" then
+        table.insert(b.header, l)
+      else
+        local check, text = isItem(l)
+        if check and cur then
+          item = { check = check, text = text, more = {} }
+          table.insert(cur.items, item)
+        elseif item and l:match("^%s+%S") then
+          table.insert(item.more, l)
+        elseif mode == "lane" and trim(l) == "**Complete**" then
+          cur.complete = true
+          item = nil
+        elseif trim(l) == "" then
+          item = nil
+        else
+          return nil, "line " .. i .. " is not a card (\"" .. cut(trim(l), 30) .. "\")"
+        end
+      end
+      i = i + 1
+    end
+    local isBoard = false
+    for _, h in ipairs(b.header) do if h:match("^kanban%-plugin:") then isBoard = true end end
+    if not isBoard then return nil, "not a Kanban board (no kanban-plugin frontmatter)" end
+    local js = b.settings and table.concat(b.settings, "\n"):match("```%s*(%b{})") or nil
+    if js then
+      local ok, t = pcall(rapidjson.decode, js)
+      if ok and type(t) == "table" then
+        local m = str(t["new-card-insertion-method"])
+        b.prepend = m:sub(1, 7) == "prepend"
+      end
+    end
+    return b
+  end
+
+  local function boardToMd(b)
+    local out = {}
+    local header = {}
+    for _, h in ipairs(b.header) do table.insert(header, h) end
+    while #header > 0 and trim(header[#header]) == "" do table.remove(header) end
+    local s = table.concat(header, "\n") .. "\n\n"
+    for _, lane in ipairs(b.lanes) do
+      local ls = { lane.hashes .. " " .. lane.title, "" }
+      if lane.complete then table.insert(ls, "**Complete**") end
+      for _, it in ipairs(lane.items) do
+        table.insert(ls, "- [" .. it.check .. "] " .. it.text)
+        for _, m in ipairs(it.more) do table.insert(ls, m) end
+      end
+      table.insert(ls, ""); table.insert(ls, ""); table.insert(ls, "")
+      table.insert(out, table.concat(ls, "\n"))
+    end
+    s = s .. table.concat(out)
+    if b.archive and #b.archive.items > 0 then
+      local as = { "***", "", "## Archive", "" }
+      for _, it in ipairs(b.archive.items) do
+        table.insert(as, "- [" .. it.check .. "] " .. it.text)
+        for _, m in ipairs(it.more) do table.insert(as, m) end
+      end
+      s = s .. table.concat(as, "\n")
+    end
+    if b.settings then s = s .. "\n\n" .. table.concat(b.settings, "\n") end
+    if b.finalNl then s = s .. "\n" end
+    if b.eol ~= "\n" then s = s:gsub("\n", b.eol) end
+    return s
+  end
+
+  -- What a card shows: the first line without its block id, "[x]" in front when done.
+  local function cardLabel(it)
+    local t = trim((it.text:gsub("%s*%^[%w%-]+$", "")))
+    return ((it.check ~= " ") and "[x] " or "") .. cut(t, 70)
+  end
+
+  local function renderBoard()
+    local n = board and #board.lanes or 0
+    laneFirst = math.max(1, math.min(laneFirst, math.max(1, n - KB_LANES + 1)))
+    Controls.KbLanePage.String = (n == 0) and "" or
+      (n <= KB_LANES and (n .. (n == 1 and " lane" or " lanes")) or
+       string.format("Lanes %d-%d of %d", laneFirst, math.min(n, laneFirst + KB_LANES - 1), n))
+    Controls.KbLanesPrev.IsDisabled = laneFirst <= 1
+    Controls.KbLanesNext.IsDisabled = laneFirst + KB_LANES - 1 >= n
+    for i = 1, KB_LANES do
+      local li = laneFirst + i - 1
+      local lane = board and board.lanes[li]
+      local lc = Controls.KbLane[i]
+      if lane then
+        local count = #lane.items
+        -- "Doing (3)" is the Kanban plugin's WIP limit: shown as "Doing  2/3"
+        local name, wip = trim(lane.title):match("^(.-)%s*%((%d+)%)$")
+        lc.Legend = wip and (name .. "  " .. count .. "/" .. wip) or (trim(lane.title) .. "  " .. count)
+        lc.Boolean = (li == kbLane)
+        lc.IsInvisible = false
+        local off = laneOff[li] or 0
+        off = math.max(0, math.min(off, count - KB_CARDS))
+        laneOff[li] = off
+        Controls.KbUp[i].IsDisabled = off <= 0
+        Controls.KbDown[i].IsDisabled = off + KB_CARDS >= count
+        for j = 1, KB_CARDS do
+          local c = Controls.KbCard[(i - 1) * KB_CARDS + j]
+          local it = lane.items[off + j]
+          c.Legend = it and cardLabel(it) or ""
+          c.Boolean = it ~= nil and kbSel ~= nil and kbSel.lane == li and kbSel.card == off + j
+          c.IsInvisible = it == nil
+        end
+      else
+        lc.Legend, lc.Boolean, lc.IsInvisible = "", false, board ~= nil
+        Controls.KbUp[i].IsDisabled, Controls.KbDown[i].IsDisabled = true, true
+        for j = 1, KB_CARDS do
+          local c = Controls.KbCard[(i - 1) * KB_CARDS + j]
+          c.Legend, c.Boolean, c.IsInvisible = "", false, true
+        end
+      end
+    end
+    local it = kbSel and board and board.lanes[kbSel.lane] and board.lanes[kbSel.lane].items[kbSel.card]
+    if not it then kbSel = nil end
+    Controls.KbCardText.String = it and it.text or ""
+    for _, nm in ipairs({ "KbLeft", "KbRight", "KbMoveUp", "KbMoveDown", "KbCheck", "KbArchive", "KbCardText" }) do
+      Controls[nm].IsDisabled = it == nil
+    end
+    Controls.KbAdd.IsDisabled = board == nil
+  end
+
+  -- Keep the selected card on screen after it moves.
+  local function showSel()
+    if not kbSel then return end
+    if kbSel.lane < laneFirst then laneFirst = kbSel.lane
+    elseif kbSel.lane > laneFirst + KB_LANES - 1 then laneFirst = kbSel.lane - KB_LANES + 1 end
+    local off = laneOff[kbSel.lane] or 0
+    if kbSel.card <= off then off = kbSel.card - 1
+    elseif kbSel.card > off + KB_CARDS then off = kbSel.card - KB_CARDS end
+    laneOff[kbSel.lane] = off
+  end
+
+  local openBoard
+
+  local function saveBoard()
+    if not board or not online then return end
+    if kbSaving then kbPending = true; return end
+    kbSaving, kbPending = true, false
+    local path = board.path
+    local headers = {}
+    if board.version then headers["If-Match"] = board.version end
+    kbStatus("Saving...")
+    enqueue({ method = "PUT", path = "/vault/" .. encPath(path), data = boardToMd(board), headers = headers, json = false,
+      callback = function(code, t, resp, err, hdrs)
+        kbSaving = false
+        if not board or board.path ~= path then return end
+        if code == 200 or code == 204 then
+          board.version = header(hdrs, "etag")
+          kbStatus("Saved " .. os.date("%H:%M:%S"))
+          if kbPending then saveBoard()
+          elseif not board.version then openBoard(path, true) end
+        elseif code == 412 then
+          kbPending = false
+          kbStatus("Changed elsewhere. Reloaded; try again.")
+          openBoard(path, true, true)
+        else
+          kbPending = false
+          httpError("Save board", code, resp, err)
+          kbStatus("Not saved (" .. (code and ("HTTP " .. code) or "no response") .. ")")
+          openBoard(path, true, true)
+        end
+      end }, true)
+  end
+
+  openBoard = function(path, keepView, keepStatus)
+    enqueue({ method = "GET", path = "/vault/" .. encPath(path), accept = NOTE_JSON, key = "board",
+      callback = function(code, t, resp, err, hdrs)
+        if httpError("Open board " .. path, code, resp, err) then kbStatus("Could not open board"); return end
+        if not t then return end
+        local b, why = parseBoard(path, str(t.content))
+        if not b then
+          board = nil
+          kbStatus("Can't show: " .. why)
+          renderBoard()
+          return
+        end
+        b.version = etagOf(t, hdrs)
+        b.mtime = type(t.stat) == "table" and t.stat.mtime or nil
+        if not keepView then laneFirst, laneOff, kbSel, kbLane = 1, {}, nil, 1 end
+        board = b
+        lastBoardCheck = now()
+        if not keepStatus then kbStatus("") end
+        local label = baseName(path)
+        for k, v in pairs(boardMap) do if v == path then label = k end end
+        Controls.KbBoard.String = label
+        renderBoard()
+      end })
+  end
+
+  local function checkBoard()
+    if not board or kbSaving or busy or #queue > 0 then return end
+    lastBoardCheck = now()
+    local path = board.path
+    enqueue({ method = "GET", path = "/vault/" .. encPath(path), accept = NOTE_JSON, key = "kbcheck",
+      callback = function(code, t, resp, err, hdrs)
+        if not board or board.path ~= path or kbSaving or code ~= 200 or not t then return end
+        local v = etagOf(t, hdrs)
+        if v and board.version and v == board.version then return end
+        local b = parseBoard(path, str(t.content))
+        if not b then return end
+        b.version = v
+        board = b
+        renderBoard()
+      end })
+  end
+
+  -- Boards are the notes whose frontmatter has a kanban-plugin key (JsonLogic search).
+  local function findBoards()
+    enqueue({ method = "POST", path = "/search/", data = '{"var": "frontmatter.kanban-plugin"}',
+      contentType = "application/vnd.olrapi.jsonlogic+json", key = "boards",
+      callback = function(code, t, resp, err)
+        if httpError("Find Kanban boards", code, resp, err) then kbStatus("Board search failed"); return end
+        local names = {}
+        boardMap = {}
+        for _, r in ipairs(type(t) == "table" and t or {}) do
+          local f = str(r.filename)
+          if f ~= "" then
+            local label = f:gsub("%.md$", "")
+            boardMap[label] = f
+            table.insert(names, label)
+          end
+        end
+        table.sort(names, function(a, b) return a:lower() < b:lower() end)
+        Controls.KbBoard.Choices = names
+        if #names == 0 then kbStatus("No Kanban boards found") end
+        local want = trim(Controls.KbBoardOpen.String)
+        if want ~= "" then
+          openBoard(boardMap[want] or notePath(want))
+        elseif board then
+          openBoard(board.path, true)
+        elseif boardMap[Controls.KbBoard.String] then
+          openBoard(boardMap[Controls.KbBoard.String])
+        end
+      end })
+  end
+
+  kb.discover = findBoards
+  kb.tick = function()
+    if NOTE_REFRESH > 0 and board and now() - lastBoardCheck >= NOTE_REFRESH then checkBoard() end
+  end
+  kb.reset = function() board, kbSaving, kbPending = nil, false, false; renderBoard() end
+
+  local function selItem()
+    if not (board and kbSel) then return nil end
+    local lane = board.lanes[kbSel.lane]
+    return lane and lane.items[kbSel.card], lane
+  end
+
+  -- Checked state follows the Kanban plugin: moving into a "Complete" lane checks a card,
+  -- moving out of one unchecks it.
+  local function moveTo(li, pos)
+    local it, from = selItem()
+    local to = board.lanes[li]
+    if not it or not to then return end
+    table.remove(from.items, kbSel.card)
+    if to.complete and not from.complete then it.check = "x"
+    elseif from.complete and not to.complete then it.check = " " end
+    pos = math.max(1, math.min(pos or (#to.items + 1), #to.items + 1))
+    table.insert(to.items, pos, it)
+    kbSel = { lane = li, card = pos }
+    showSel()
+    renderBoard()
+    saveBoard()
+  end
+
+  Controls.KbLeft.EventHandler = function() if kbSel and kbSel.lane > 1 then moveTo(kbSel.lane - 1) end end
+  Controls.KbRight.EventHandler = function() if kbSel and board and kbSel.lane < #board.lanes then moveTo(kbSel.lane + 1) end end
+  Controls.KbMoveUp.EventHandler = function() if kbSel and kbSel.card > 1 then moveTo(kbSel.lane, kbSel.card - 1) end end
+  Controls.KbMoveDown.EventHandler = function()
+    local it, lane = selItem()
+    if it and kbSel.card < #lane.items then moveTo(kbSel.lane, kbSel.card + 1) end
+  end
+  Controls.KbCheck.EventHandler = function()
+    local it = selItem()
+    if not it then return end
+    it.check = (it.check == " ") and "x" or " "
+    renderBoard()
+    saveBoard()
+  end
+  Controls.KbArchive.EventHandler = function()
+    local it, lane = selItem()
+    if not it then return end
+    local t = armed.kbarchive
+    if not (t and now() - t < CONFIRM) then
+      armed = { kbarchive = now() }
+      kbStatus("Press Archive again to archive the card")
+      return
+    end
+    armed = {}
+    table.remove(lane.items, kbSel.card)
+    board.archive = board.archive or { items = {} }
+    table.insert(board.archive.items, it)
+    kbSel = nil
+    renderBoard()
+    saveBoard()
+  end
+  Controls.KbCardText.EventHandler = function(c)
+    local it = selItem()
+    local text = trim((c.String:gsub("\r?\n", " ")))
+    if not it or text == "" or text == it.text then renderBoard(); return end
+    it.text = text
+    renderBoard()
+    saveBoard()
+  end
+  Controls.KbAdd.EventHandler = function()
+    local text = trim((Controls.KbNewText.String:gsub("\r?\n", " ")))
+    local lane = board and board.lanes[kbLane]
+    if text == "" or not lane then return end
+    local it = { check = lane.complete and "x" or " ", text = text, more = {} }
+    local pos = board.prepend and 1 or (#lane.items + 1)
+    table.insert(lane.items, pos, it)
+    Controls.KbNewText.String = ""
+    kbSel = { lane = kbLane, card = pos }
+    showSel()
+    renderBoard()
+    saveBoard()
+  end
+  Controls.KbNewText.EventHandler = function() end
+
+  for i = 1, KB_LANES do
+    Controls.KbLane[i].EventHandler = function()
+      if board and board.lanes[laneFirst + i - 1] then kbLane = laneFirst + i - 1 end
+      renderBoard()
+    end
+    Controls.KbUp[i].EventHandler = function()
+      local li = laneFirst + i - 1
+      laneOff[li] = (laneOff[li] or 0) - (KB_CARDS - 1); renderBoard()
+    end
+    Controls.KbDown[i].EventHandler = function()
+      local li = laneFirst + i - 1
+      laneOff[li] = (laneOff[li] or 0) + (KB_CARDS - 1); renderBoard()
+    end
+    for j = 1, KB_CARDS do
+      Controls.KbCard[(i - 1) * KB_CARDS + j].EventHandler = function()
+        local li = laneFirst + i - 1
+        local idx = (laneOff[li] or 0) + j
+        if kbSel and kbSel.lane == li and kbSel.card == idx then kbSel = nil   -- second tap deselects
+        elseif board and board.lanes[li] and board.lanes[li].items[idx] then kbSel = { lane = li, card = idx }; kbLane = li end
+        renderBoard()
+      end
+    end
+  end
+  Controls.KbLanesPrev.EventHandler = function() laneFirst = laneFirst - KB_LANES; renderBoard() end
+  Controls.KbLanesNext.EventHandler = function() laneFirst = laneFirst + KB_LANES; renderBoard() end
+  Controls.KbBoard.EventHandler = function(c)
+    local p = boardMap[c.String]
+    if p and online then openBoard(p) end
+  end
+  Controls.KbBoardOpen.EventHandler = function(c)
+    local want = trim(c.String)
+    if want ~= "" and online then openBoard(boardMap[want] or notePath(want)) end
+  end
+  Controls.KbRefresh.EventHandler = function()
+    if online then findBoards() end
+  end
+
+  -- setup -----------------------------------------------------------
+  Controls.Protocol.EventHandler = function(c)
+    -- switching mode moves to that mode's default port when the port was the other default
+    local p = tonumber(Controls.Port.String)
+    if c.String == "HTTP" and p == 27124 then Controls.Port.String = "27123"
+    elseif c.String ~= "HTTP" and p == 27123 then Controls.Port.String = "27124" end
+    restart()
+  end
+  Controls.Connect.EventHandler = restart
+  Controls.Host.EventHandler = restart
+  Controls.Port.EventHandler = restart
+  Controls.ApiKey.EventHandler = restart
+
+  -- startup ----------------------------------------------------------
+  Controls.Protocol.Choices = { "HTTPS", "HTTP" }
+  if Controls.Protocol.String ~= "HTTP" then Controls.Protocol.String = "HTTPS" end
+  if trim(Controls.Port.String) == "" then Controls.Port.String = tostring(port()) end
+  for _, n in ipairs({ "SaveStatus", "AppendStatus", "NewStatus", "LogStatus", "SearchCount", "ResultContext" }) do
+    Controls[n].String = ""
+  end
+  Controls.FolderPath.String = "/"
+  Controls.FileList.Choices = {}
+  Controls.ResultList.Choices = {}
+  Controls.KbBoard.Choices = {}
+  kb.reset()
+  renderAll()
+  restart()
+end
