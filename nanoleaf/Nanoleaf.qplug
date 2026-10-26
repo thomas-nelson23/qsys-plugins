@@ -1,5 +1,5 @@
 --[[ Nanoleaf Open API control plugin for Q-SYS
-  Controls Nanoleaf Light Panels (Aurora), Canvas, Shapes, Elements and Lines
+  Controls Nanoleaf Light Panels (Aurora), Canvas, Shapes, Elements, Lines and Skylight
   over the local Nanoleaf Open API (HTTP, port 16021).
 
   References:
@@ -9,8 +9,8 @@
 
 PluginInfo = {
   Name = "Lighting~Nanoleaf Open API",
-  Version = "1.1",
-  BuildVersion = "1.1.0.0",
+  Version = "1.2",
+  BuildVersion = "1.2.0.0",
   Id = "8ad083e0-b14d-4387-8671-9b4053ac46a4",
   Author = "AV Programming",
   Description = "Control Nanoleaf lights (power, brightness, color, color temperature, effects, rhythm, per-panel color) over the local Nanoleaf Open API.",
@@ -571,7 +571,7 @@ function GetControlLayout(props)
     end
     note("Port and poll interval are", 436, 236, 184)
     note("set in the plugin Properties.", 436, 252, 184)
-    ui.hint("To pair, hold the power button 5-7 s until the LEDs flash, then press Pair within 30 s.", 360)
+    ui.hint("Pair: hold power 5-7 s (Skylight: app > Device Settings > Connect to API), then press Pair.", 360)
   end
 
   return layout, graphics
@@ -690,6 +690,7 @@ if Controls then
   local queue = {}     -- ordered list of { key, method, path, body }
   local busy = false
   local Poll           -- forward declaration
+  local pairing = false -- true while Pair is waiting for the pairing window
 
   local function sendNext()
     if busy or #queue == 0 then return end
@@ -897,7 +898,7 @@ if Controls then
   Poll = function()
     if not configured() then
       if Controls.IPAddress.String == "" then setStatus(3, "Enter IP address")
-      else setStatus(3, "Not paired - press Pair") end
+      elseif not pairing then setStatus(3, "Not paired - press Pair") end
       Controls.Online.Boolean = false
       return
     end
@@ -943,13 +944,38 @@ if Controls then
   end
 
   -- pairing ----------------------------------------------------------
-  Controls.Pair.EventHandler = function()
-    if Controls.IPAddress.String:gsub("%s", "") == "" then setError("Enter the IP address first"); return end
-    setStatus(5, "Pairing...")
-    enqueue({ method = "POST", path = "/new", noToken = true, callback = function(code, resp, err)
+  -- POST /api/v1/new only succeeds while the controller's 30 s pairing window is
+  -- open. That window is opened by holding the power button 5-7 s, or, on devices
+  -- with no button (Skylight), by Device Settings > Connect to API in the Nanoleaf
+  -- app. Pair therefore keeps retrying for PAIR_WINDOW seconds, so it can be
+  -- pressed before or after the window is opened. Pressing it again cancels.
+  local PAIR_WINDOW, PAIR_RETRY = 30, 2
+  local pairTimer = Timer.New()
+  local pairDeadline = 0
+
+  local function stopPairing()
+    pairing = false
+    pairTimer:Stop()
+    Controls.Pair.Legend = "Pair"
+  end
+
+  local function tryPair()
+    if not pairing then return end
+    local left = pairDeadline - os.time()
+    if left <= 0 then
+      stopPairing()
+      setError("Pairing timed out: open the pairing window (power button 5-7 s, or app > Connect to API), then press Pair")
+      setStatus(2, "Pairing timed out")
+      return
+    end
+    setStatus(5, string.format("Waiting to pair... %d s", left))
+    for _, q in ipairs(queue) do if q.key == "pair" then return end end
+    enqueue({ key = "pair", method = "POST", path = "/new", noToken = true, callback = function(code, resp, err)
+      if not pairing then return end
       if code == 200 and resp then
         local ok, t = pcall(rapidjson.decode, resp)
         if ok and t and t.auth_token then
+          stopPairing()
           Controls.AuthToken.String = t.auth_token
           setError("")
           print("Nanoleaf: paired, auth token = " .. t.auth_token)
@@ -957,13 +983,26 @@ if Controls then
           return
         end
       end
-      if code == 403 then
-        setError("Pairing refused (403): hold the power button 5-7 s until LEDs flash, then press Pair")
-      else
-        setError("Pairing failed: " .. (err and tostring(err) or ("HTTP " .. tostring(code))))
+      if code ~= 403 then
+        -- 403 just means the pairing window is not open yet; keep waiting
+        setError("Pairing attempt failed: " .. ((code == nil or code == 0) and "no response from device" or ("HTTP " .. tostring(code))))
       end
-      setStatus(2, "Pairing failed")
     end })
+  end
+  pairTimer.EventHandler = tryPair
+
+  Controls.Pair.EventHandler = function()
+    if pairing then
+      stopPairing()
+      setStatus(3, "Pairing cancelled")
+      return
+    end
+    if Controls.IPAddress.String:gsub("%s", "") == "" then setError("Enter the IP address first"); return end
+    pairing, pairDeadline = true, os.time() + PAIR_WINDOW
+    Controls.Pair.Legend = "Cancel"
+    setError("")
+    tryPair()
+    pairTimer:Start(PAIR_RETRY)
   end
 
   Controls.Unpair.EventHandler = function()
