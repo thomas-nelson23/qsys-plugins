@@ -14,6 +14,7 @@ Each plugin lives in its own folder with the `.qplug` file, a README covering se
 | [Obsidian Notes](obsidian/) | 1.2 | Obsidian vaults synced with Obsidian Sync: browse folders, read, search, edit line by line with conflict-safe saves, quick append, new notes, a log note fed from a pin, Kanban boards (move, tick, add, edit and archive cards) with an optional 1280 x 800 TSC-101 UCI page | Local REST API with MCP community plugin on a computer running Obsidian, HTTPS port 27124 (or HTTP 27123), API key | [Obsidian.qplug](obsidian/Obsidian.qplug?raw=1) |
 | [Hermes Agent](hermes-agent/) | 1.0 | A Hermes Agent (Nous Research) running on a local computer: send prompts and presets, conversation view, stop, add guidance mid-turn, approve or deny tool calls | Hermes Agent API server (Runs API), HTTP port 8642, API key | [Hermes.qplug](hermes-agent/Hermes.qplug?raw=1) |
 | [Cambridge Audio CXA81](cambridge-audio/) | 2.0 | Cambridge Audio CXA81, CXA81 Mk II and CXA61 amplifiers over any mix of RS-232, IR and 12 V trigger with automatic fallback: power, mute, source with live feedback, volume up / down, speakers A/B, display brightness | Cambridge Audio serial protocol (RS-232 9600 8N1, Q-SYS serial port or serial-to-IP gateway); RC-5 IR via a Global Caché iTach, TCP 4998; 12 V trigger via GPIO | [Cambridge_CXA.qplug](cambridge-audio/Cambridge_CXA.qplug?raw=1) |
+| [Newline DV Series](newline-dv/) | 1.0 | Newline DV-18023W (also DV-12023W, DV-15023W) all-in-one LED displays: power, input (HDMI 1, HDMI 2, Android home), volume and backlight brightness with faders that step to the level, mute, polled feedback | Newline DV Series RS-232 codes (115200 8N1, binary), Q-SYS serial port or serial-to-IP gateway | [Newline_DV.qplug](newline-dv/Newline_DV.qplug?raw=1) |
 
 All plugins share one look, Deep Ocean, taken from the [home-dash](https://github.com/thomas-nelson23/home-dashboard) design system: a deep-blue field, dark glass panels with hairline edges, cyan for the accent and "good", red for small signals and errors, amber only for warnings. The theme is one Lua block, [`design/theme.lua`](design/theme.lua), pasted into each `.qplug`; [`design/README.md`](design/README.md) explains it.
 
@@ -32,4 +33,4 @@ These plugins were tested in a Lua 5.3 harness against simulated devices, not ye
 
 ## Disclaimer
 
-Not affiliated with or endorsed by QSC, Nanoleaf, Signify (Philips Hue), FlexRadio Systems, Ubiquiti, Obsidian, Nous Research, Cambridge Audio or Global Caché. Product names are trademarks of their owners.
+Not affiliated with or endorsed by QSC, Nanoleaf, Signify (Philips Hue), FlexRadio Systems, Ubiquiti, Obsidian, Nous Research, Cambridge Audio, Global Caché or Newline Interactive. Product names are trademarks of their owners.
